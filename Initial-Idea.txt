@@ -48,7 +48,7 @@ To ban someone from a room it requires 10 or 11 bans if im right
 
 
 in order to ban it requires certain time played in the account, I have 13 accounts here, you only need 10 or 11 im not completely sure feel free to replace one if it doenst work
-
+I need to be able to use this bot in every pc and be able to modify the code, and also we able to send to someone just the .exe (bot) So he cant know the code behind it
 
 xthuglifex7@gmail.com:0rgmrjjq
 willmaryb@hotmail.com:atelier801
