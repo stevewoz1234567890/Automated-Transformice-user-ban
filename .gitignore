@@ -16,11 +16,7 @@ build/
 .pytest_cache/
 .mypy_cache/
 
-# Local secrets (copy from bot/config.example.py)
-bot/config.py
+# Local secrets (per project spec: real accounts live in config.py)
 config.py
 .env
 *.log
-
-# Local reference clone (optional)
-_ref_transformice-bot/
