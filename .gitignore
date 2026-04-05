@@ -1,0 +1,22 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Tests / typing
+.pytest_cache/
+.mypy_cache/
+
+# Local secrets (per project spec: real accounts live in config.py)
+config.py
+.env
+*.log
