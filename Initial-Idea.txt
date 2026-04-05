@@ -1,0 +1,33 @@
+I want to analyze the difficulty of doing this project
+
+
+Project Specifications: Automated CMD Tool
+I want a CMD-based program (no graphical interface) with the following functionality:
+
+1. Configuration (config.py)
+The program should use a config.py file containing 11 Transformice accounts, each with a username and password. Each account must be assigned a unique IP address (the IP cannot be repeated across accounts).
+
+2. User Input & Startup
+When the program is launched, it should prompt the user for two pieces of information:
+
+Target Room: The name of the room where all accounts will go upon logging in.
+
+Example: If I enter *Racing1, all accounts should automatically execute the command /room *Racing1.
+
+Target User: The nickname of the player to be banned.
+
+Example: adrian#8912.
+
+3. Execution Logic
+Once the accounts have logged in and moved to the specified room, they must perform the following actions:
+
+Command Execution: Each account will type the command /ban [nickname].
+
+Timing: To avoid detection or rate-limiting, the accounts should not execute the command simultaneously. There should be a random delay of 1 to 2 seconds between each account’s command.
+
+Speed: Despite the small delays, the overall process should be optimized for high speed.
+
+4. Feedback & Confirmation
+The program must provide a confirmation message for each ban command sent.
+
+Once all 11 accounts have finished executing the command, a final message should appear stating that the process has been successfully completed.
