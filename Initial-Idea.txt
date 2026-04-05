@@ -31,3 +31,38 @@ Speed: Despite the small delays, the overall process should be optimized for hig
 The program must provide a confirmation message for each ban command sent.
 
 Once all 11 accounts have finished executing the command, a final message should appear stating that the process has been successfully completed.
+
+
+
+when someone is banned from the room, theres a message saying so in the transformice chat
+
+
+Once its done there will be a loop it will ask again until you say no, "do you want to ban someone else" yes or not
+If yes it asks for the room again and the user
+You can use what you learnt from the previous project
+show a message of "OK" once the acc is correctly logged
+
+You can use proxifier
+
+To ban someone from a room it requires 10 or 11 bans if im right
+
+
+in order to ban it requires certain time played in the account, I have 13 accounts here, you only need 10 or 11 im not completely sure feel free to replace one if it doenst work
+
+
+xthuglifex7@gmail.com:0rgmrjjq
+willmaryb@hotmail.com:atelier801
+elvira#8407:syntony1
+[05/04/2026 18:20] L: samytaba algerie09
+[05/04/2026 18:20] L: r0cknr0ll momomomo141
+[05/04/2026 18:20] L: bartbakerxxl momomomo141
+[05/04/2026 18:20] L: ge0rge#1313 momomomo141
+
+[05/04/2026 18:21] L: drpoussin   123456789m
+frikasete zarzuela54
+Carlosholos#5008 hola1234
+
+Speius_mono#1753 carlosholos77
+
+USERNAME:  ficaputonao#3830
+PASSWORD:  Dougl@sd92884892
