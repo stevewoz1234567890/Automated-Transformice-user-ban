@@ -1,3 +1,3 @@
-# CLI / future networking & automation
-requests>=2.31.0
+# Transformice ban bot (caseus local proxy; same stack as github.com/stevewoz1234567890/transformice-bot)
+caseus @ git+https://github.com/friedkeenan/caseus.git
 colorama>=0.4.6
