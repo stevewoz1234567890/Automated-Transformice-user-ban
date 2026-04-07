@@ -22,7 +22,7 @@ from pathlib import Path
 from colorama import init as colorama_init
 
 from .ban_proxy import BanBotProxy, ensure_flash_trust_config
-from .portutil import ensure_port_free_or_kill_same_bot
+from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,32 @@ logger = logging.getLogger(__name__)
 # (main + satellite + policy) must be disjoint across slots (see _assign_listen_ports).
 SATELLITE_PORT_OFFSET = 10_000
 SOCKET_POLICY_PORT_OFFSET = 10_000
+_PORT_SCAN_SPAN = 50_000
+_MIN_AUX_PORT = 1024
+
+
+def _pick_free_port(preferred: int, used: set[int], *, role: str, label: str) -> int:
+    """Use ``preferred`` if unused and free; otherwise scan forward (Windows may occupy derived ports)."""
+    start = max(_MIN_AUX_PORT, preferred)
+    for p in range(start, start + _PORT_SCAN_SPAN):
+        if p in used:
+            continue
+        if tcp_port_is_free(p):
+            if p != preferred:
+                logger.info(
+                    "Slot %s: %s port %s was busy or reserved; using %s",
+                    label,
+                    role,
+                    preferred,
+                    p,
+                )
+            return p
+    msg = (
+        f"Slot {label}: no free {role} TCP port in [{start}, {start + _PORT_SCAN_SPAN}). "
+        "Close other programs or change proxy_port values in config."
+    )
+    logger.error(msg)
+    raise SystemExit(msg)
 
 
 def _repo_root() -> Path:
@@ -83,27 +109,25 @@ class SlotState:
 
 
 def _assign_listen_ports(states: list[SlotState]) -> None:
-    """Set satellite and Flash socket-policy ports from each main ``proxy_port``; validate."""
+    """Set satellite and Flash socket-policy ports; prefer main±offset, else next free port."""
+    used: set[int] = {s.port for s in states}
+
     for s in states:
-        sat = s.port + SATELLITE_PORT_OFFSET
-        pol = s.port - SOCKET_POLICY_PORT_OFFSET
-        if pol < 1024:
-            msg = (
-                f"Slot {s.label}: derived socket-policy port {pol} < 1024; "
-                "use a larger proxy_port in config."
-            )
-            logger.error(msg)
-            raise SystemExit(msg)
-        s.satellite_port = sat
-        s.policy_port = pol
+        preferred_sat = s.port + SATELLITE_PORT_OFFSET
+        s.satellite_port = _pick_free_port(preferred_sat, used, role="satellite", label=s.label)
+        used.add(s.satellite_port)
+
+        preferred_pol = s.port - SOCKET_POLICY_PORT_OFFSET
+        s.policy_port = _pick_free_port(preferred_pol, used, role="policy", label=s.label)
+        used.add(s.policy_port)
 
     triples = [(s.port, s.satellite_port, s.policy_port) for s in states]
     flat = [p for t in triples for p in t]
     if len(flat) != len(set(flat)):
         dup = [p for p, n in Counter(flat).items() if n > 1]
         msg = (
-            "Listen port collision: each slot needs unique main, satellite, and policy ports. "
-            f"Adjust proxy_port values in config (derived duplicates: {dup!r})."
+            "Listen port collision after assignment (should not happen). "
+            f"Duplicates: {dup!r}"
         )
         logger.error(msg)
         raise SystemExit(msg)

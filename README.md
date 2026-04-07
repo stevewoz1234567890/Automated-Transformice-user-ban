@@ -21,7 +21,7 @@ python -m venv venv
 .\venv\Scripts\pip install -r requirements.txt
 ```
 
-Create or edit **`bot/config.py`** (gitignored if you keep secrets there): one row per client — unique **`proxy_port`** (this is the **main** port for tfm-proxy-loader), optional **`label`**, and a **distinct `bind_ip`** string for your own tracking (must be unique when present). For each slot the bot also binds **satellite** (`proxy_port + 10000`) and **Flash socket-policy** (`proxy_port − 10000`) ports; those must not collide with each other or with any other `proxy_port` (the tool exits with an error if they do).
+Create or edit **`bot/config.py`** (gitignored if you keep secrets there): one row per client — unique **`proxy_port`** (this is the **main** port for tfm-proxy-loader), optional **`label`**, and a **distinct `bind_ip`** string for your own tracking (must be unique when present). For each slot the bot also binds **satellite** (prefers `proxy_port + 10000`) and **Flash socket-policy** (prefers `proxy_port − 10000`) ports. If a preferred port is already in use, the next free port is chosen automatically and logged.
 
 ### Build `ban_bot.exe` (optional)
 
