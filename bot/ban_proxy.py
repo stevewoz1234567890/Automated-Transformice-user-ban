@@ -86,7 +86,8 @@ class BanBotProxy(Proxy):
         self._own_username: str | None = None
 
     async def startup(self):
-        ensure_flash_trust_config()
+        # Flash trust is applied once in ban_cli.start_all_slots (not here — avoids 12 threads
+        # racing on the same TFMProxyLoader.cfg and WinError 32/5).
         self.main_srv = await self.open_main_server()
         self.satellite_srv = await self.open_satellite_server()
         if self.host_socket_policy_port is not None:

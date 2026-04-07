@@ -1,2 +1,0 @@
-# One-time / CI: build ban_bot.exe (python build_exe.py)
-pyinstaller>=6.0

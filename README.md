@@ -21,14 +21,13 @@ python -m venv venv
 .\venv\Scripts\pip install -r requirements.txt
 ```
 
-Create or edit **`bot/config.py`** (gitignored if you keep secrets there): one row per client — unique **`proxy_port`**, optional **`label`**, and a **distinct `bind_ip`** string for your own tracking (must be unique when present).
+Create or edit **`bot/config.py`** (gitignored if you keep secrets there): one row per client — unique **`proxy_port`** (this is the **main** port for tfm-proxy-loader), optional **`label`**, and a **distinct `bind_ip`** string for your own tracking (must be unique when present). For each slot the bot also binds **satellite** (`proxy_port + 10000`) and **Flash socket-policy** (`proxy_port − 10000`) ports; those must not collide with each other or with any other `proxy_port` (the tool exits with an error if they do).
 
 ### Build `ban_bot.exe` (optional)
 
-From the repo root, with the same venv and runtime deps installed:
+After **`pip install -r requirements.txt`** (see Install above), from the repo root:
 
 ```powershell
-.\venv\Scripts\pip install -r requirements-build.txt
 .\venv\Scripts\python.exe build_exe.py
 ```
 
@@ -92,7 +91,7 @@ Use only in line with **Transformice’s terms** and applicable law. This reposi
 |------|------|
 | `bot/` | Ban CLI + local proxy (`python -m bot`) |
 | `bot/config.py` | Per-client `proxy_port` / `bind_ip` / accounts (local; gitignored by default) |
-| `ban_bot.spec`, `build_exe.py`, `requirements-build.txt` | Build **`ban_bot.exe`** in the repo root |
+| `ban_bot.spec`, `build_exe.py`, `requirements.txt` | Build **`ban_bot.exe`** in the repo root |
 | `ban_bot.exe` | Frozen Windows app (build output; gitignored) |
 | `Initial-Idea.txt` | Original feature / difficulty notes |
 | `Transformice*.swf`, `Transformice.exe`, `TFMProxyLoader.swf` | Client / loader assets (as committed) |

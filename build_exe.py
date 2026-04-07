@@ -4,7 +4,7 @@ Build ``ban_bot.exe`` in the repository root (PyInstaller one-file console app).
 Uses ``tmp/`` for process TMP/TEMP during the build so stray ``*.tmp`` files stay out of the repo root.
 The frozen exe extracts to ``tmp/`` at runtime (see ``runtime_tmpdir`` in ``ban_bot.spec``).
 
-Requires: pip install -r requirements-build.txt
+Requires: pip install -r requirements.txt
 """
 from __future__ import annotations
 

@@ -15,7 +15,8 @@ import random
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 from colorama import init as colorama_init
@@ -24,6 +25,13 @@ from .ban_proxy import BanBotProxy, ensure_flash_trust_config
 from .portutil import ensure_port_free_or_kill_same_bot
 
 logger = logging.getLogger(__name__)
+
+# caseus.Proxy defaults use main 11801, satellite 12801, policy 10801 (+1000 / -1000).
+# Those defaults are shared by every slot unless overridden — only one process can bind.
+# Use larger offsets so derived ports stay unique for typical proxy_port ranges; all values
+# (main + satellite + policy) must be disjoint across slots (see _assign_listen_ports).
+SATELLITE_PORT_OFFSET = 10_000
+SOCKET_POLICY_PORT_OFFSET = 10_000
 
 
 def _repo_root() -> Path:
@@ -66,10 +74,39 @@ def _load_accounts_module():
 class SlotState:
     label: str
     port: int
+    satellite_port: int = 0
+    policy_port: int = 0
     proxy: BanBotProxy | None = None
     loop: asyncio.AbstractEventLoop | None = None
     thread: threading.Thread | None = None
     error: str | None = None
+
+
+def _assign_listen_ports(states: list[SlotState]) -> None:
+    """Set satellite and Flash socket-policy ports from each main ``proxy_port``; validate."""
+    for s in states:
+        sat = s.port + SATELLITE_PORT_OFFSET
+        pol = s.port - SOCKET_POLICY_PORT_OFFSET
+        if pol < 1024:
+            msg = (
+                f"Slot {s.label}: derived socket-policy port {pol} < 1024; "
+                "use a larger proxy_port in config."
+            )
+            logger.error(msg)
+            raise SystemExit(msg)
+        s.satellite_port = sat
+        s.policy_port = pol
+
+    triples = [(s.port, s.satellite_port, s.policy_port) for s in states]
+    flat = [p for t in triples for p in t]
+    if len(flat) != len(set(flat)):
+        dup = [p for p, n in Counter(flat).items() if n > 1]
+        msg = (
+            "Listen port collision: each slot needs unique main, satellite, and policy ports. "
+            f"Adjust proxy_port values in config (derived duplicates: {dup!r})."
+        )
+        logger.error(msg)
+        raise SystemExit(msg)
 
 
 def _configure_logging() -> None:
@@ -94,7 +131,12 @@ def _configure_logging() -> None:
 def _run_slot_async(state: SlotState) -> None:
     async def _run():
         try:
-            proxy = BanBotProxy(host_main_port=state.port, slot_label=state.label)
+            proxy = BanBotProxy(
+                host_main_port=state.port,
+                host_satellite_port=state.satellite_port,
+                host_socket_policy_port=state.policy_port,
+                slot_label=state.label,
+            )
             state.proxy = proxy
             await proxy.startup()
             state.loop = asyncio.get_running_loop()
@@ -111,12 +153,18 @@ def _run_slot_async(state: SlotState) -> None:
 
 def start_all_slots(states: list[SlotState], *, this_exe: Path, allow_kill: bool) -> None:
     for s in states:
-        if not ensure_port_free_or_kill_same_bot(s.port, this_exe=this_exe, allow_kill=allow_kill):
-            msg = (
-                f"Port {s.port} (slot {s.label}) is in use. Free it or change proxy_port in config."
-            )
-            logger.error(msg)
-            raise SystemExit(msg)
+        for role, p in (
+            ("main", s.port),
+            ("satellite", s.satellite_port),
+            ("policy", s.policy_port),
+        ):
+            if not ensure_port_free_or_kill_same_bot(p, this_exe=this_exe, allow_kill=allow_kill):
+                msg = (
+                    f"{role} port {p} (slot {s.label}) is in use. "
+                    "Free it or change proxy_port in config."
+                )
+                logger.error(msg)
+                raise SystemExit(msg)
 
     ensure_flash_trust_config()
 
@@ -240,10 +288,15 @@ def main(argv: list[str] | None = None) -> None:
         label = str(row.get("label", i + 1))
         states.append(SlotState(label=label, port=port))
 
+    _assign_listen_ports(states)
+
     this_exe = Path(sys.executable).resolve()
     allow_kill = not args.no_kill_stale
 
-    logger.info("Ban bot — ports: %s", ", ".join(str(s.port) for s in states))
+    logger.info(
+        "Ban bot — main ports: %s",
+        ", ".join(str(s.port) for s in states),
+    )
     start_all_slots(states, this_exe=this_exe, allow_kill=allow_kill)
     _wait_for_game_clients(states)
 
