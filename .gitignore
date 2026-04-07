@@ -16,7 +16,18 @@ build/
 .pytest_cache/
 .mypy_cache/
 
-# Local secrets (per project spec: real accounts live in config.py)
+# Local overrides / secrets
+bot/config.py
 config.py
 .env
 *.log
+log.txt
+
+# PyInstaller output in repo root
+ban_bot.exe
+
+# Temp dir (onefile extract + PyInstaller build cwd)
+tmp/
+
+# Linker/tool scratch files sometimes dropped in repo root during exe build
+*.tmp
