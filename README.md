@@ -37,17 +37,23 @@ That writes **`ban_bot.exe`** in the **repository root**. Run it from that folde
 
 ## How to use the bot
 
-1. **Start the bot** from the repo root: either run **`ban_bot.exe`**, or (after install):
+**Option A** — packet login from the proxy (no Flash UI automation) — is spelled out in root [`method.md`](method.md). The proxy always sends **`LoginPacket`** after **`SystemInformationPacket`** using each row’s **`username`** / **`password`** in `bot/config.py`. Run with **`--no-launch-flash`** if you do not want the bot to start Flash Player + `TFMProxyLoader.swf`.
+
+**Prerequisite:** something must still open a **MAIN TCP** connection to each slot’s proxy (typically **`127.0.0.1:<proxy_port>`** from `bot/config.py`) and complete the handshake through **`SystemInformationPacket`** — for example Flash/loader started manually or by the bot. The bot does not create that connection by itself.
+
+1. **Start the bot** from the repo root (often with **`--no-launch-flash`**):
 
    ```powershell
-   .\venv\Scripts\python.exe -m bot
+   .\venv\Scripts\python.exe -m bot --no-launch-flash
    ```
 
-2. The process prints which **proxy ports** are active. For **each** configured slot, start **Transformice** through **tfm-proxy-loader** and point that loader at the **port** listed for that slot in `bot/config.py` (same idea as multi-slot invite bots).
+   Or: **`ban_bot.exe --no-launch-flash`** (exe must sit next to `bot\config.py` as usual). Omit **`--no-launch-flash`** to let the bot open Flash + loader **one slot at a time** on Windows (see `bot/flash_launch.py`).
 
-3. **Log in** in each game window as usual (the bot does not type passwords; login happens in the client).
+2. The process prints which **proxy ports** are active. Connect each game client through **tfm-proxy-loader** (or equivalent) to the **main port** for that slot.
 
-4. When the CLI says so, press **Enter** when all clients are ready, **or** wait until the tool detects that **every** slot has a connected client.
+3. **Login:** the proxy injects credentials from `bot/config.py`. Logs should include **`LoginPacket sent upstream by proxy (packet login)`** and **`OK [slot …] logged in as …`** when **`LoginSuccessPacket`** arrives.
+
+4. The bot **waits until every slot has logged in** (or until **`ALL_SLOTS_LOGIN_TIMEOUT_SEC`** in `bot/config.py`). It does not ask you to press Enter for that.
 
 5. Enter the **target room** (the text you would type after `/room`, e.g. `*Racing1`).
 
@@ -65,6 +71,7 @@ That writes **`ban_bot.exe`** in the **repository root**. Run it from that folde
 
 ### Command-line flags
 
+- **`--no-launch-flash`** — do not auto-start `flashplayer_32_sa_debug.exe` + `TFMProxyLoader.swf`.
 - **`--no-kill-stale`** — do not try to kill processes already listening on your configured proxy ports (e.g. `python -m bot --no-kill-stale` or `ban_bot.exe --no-kill-stale`).
 
 ### Environment / Flash trust
@@ -77,6 +84,7 @@ If the game lives in a folder different from this repo, set **`TRANSFORMICE_GAME
 |-------------|----------------|
 | `config.py` with ~11 accounts + unique IP | `bot/config.py`: one row per client; unique `proxy_port`; unique `bind_ip` when set (Proxifier / VPN discipline) |
 | Prompt for room + user | CLI `input()` in `bot/ban_cli.py` |
+| Wait until all accounts logged in | `login_success_event` per slot; `ALL_SLOTS_LOGIN_TIMEOUT_SEC` |
 | `/room` then `/ban` with 1–2 s jitter | `CommandPacket` in proxy; `ROOM_STAGGER_SEC`, `BAN_DELAY_*` in config |
 | Per-action confirmation | Prints for each `/room` and `/ban` |
 | “OK” on login | `LoginSuccessPacket` handler in `BanBotProxy` |
@@ -96,4 +104,5 @@ Use only in line with **Transformice’s terms** and applicable law. This reposi
 | `ban_bot.spec`, `build_exe.py`, `requirements.txt` | Build **`ban_bot.exe`** in the repo root |
 | `ban_bot.exe` | Frozen Windows app (build output; gitignored) |
 | `Initial-Idea.txt` | Original feature / difficulty notes |
+| `method.md` | Option A: proxy packet login, `--no-launch-flash`, external MAIN TCP |
 | `Transformice*.swf`, `Transformice.exe`, `TFMProxyLoader.swf` | Client / loader assets (as committed) |

@@ -212,11 +212,8 @@ class BanBotProxy(Proxy):
         *,
         slot_label: str = "",
         login_success_event: threading.Event | None = None,
-        on_first_main_connection: object | None = None,
-        on_main_tcp_accepted: object | None = None,
         verbose_login_flow: bool = False,
         log_all_main_packets: bool = False,
-        packet_auto_login: bool = False,
         packet_login_username: str = "",
         packet_login_password: str = "",
         packet_login_loader_url: str = "",
@@ -231,15 +228,11 @@ class BanBotProxy(Proxy):
         super().__init__(**kwargs)
         self.slot_label = slot_label
         self._login_success_event = login_success_event
-        self._on_first_main_connection = on_first_main_connection
-        self._on_main_tcp_accepted = on_main_tcp_accepted
-        self._first_main_hook_done = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._own_username: str | None = None
         self._verbose_login_flow = verbose_login_flow
         self._log_all_main_packets = log_all_main_packets
         self._main_handshake_mono: float | None = None
-        self._packet_auto_login = bool(packet_auto_login)
         self._packet_login_username = (packet_login_username or "").strip()
         self._packet_login_password = packet_login_password or ""
         self._packet_login_loader_url = (packet_login_loader_url or "").strip()
@@ -250,19 +243,18 @@ class BanBotProxy(Proxy):
         self._packet_login_task: asyncio.Task | None = None
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(self._vl_handshake_sb, serverbound.HandshakePacket)
-        if self._packet_auto_login:
-            self.register_packet_listener(
-                self._capture_handshake_auth_token,
-                clientbound.HandshakeResponsePacket,
-            )
-            self.register_packet_listener(
-                self._schedule_packet_login_after_sysinfo,
-                serverbound.SystemInformationPacket,
-            )
-            self.register_packet_listener(
-                self._gate_duplicate_login_packet,
-                serverbound.LoginPacket,
-            )
+        self.register_packet_listener(
+            self._capture_handshake_auth_token,
+            clientbound.HandshakeResponsePacket,
+        )
+        self.register_packet_listener(
+            self._schedule_packet_login_after_sysinfo,
+            serverbound.SystemInformationPacket,
+        )
+        self.register_packet_listener(
+            self._gate_duplicate_login_packet,
+            serverbound.LoginPacket,
+        )
         self.register_packet_listener(self._vl_login_sb, serverbound.LoginPacket)
         if verbose_login_flow:
             self._register_verbose_login_flow_listeners()
@@ -323,27 +315,23 @@ class BanBotProxy(Proxy):
         self.register_packet_listener(self._vl_translated_cb, clientbound.TranslatedGeneralMessagePacket)
 
     async def _capture_handshake_auth_token(self, source, packet):
-        if not self._packet_auto_login:
-            return
         dest = getattr(source, "destination", None)
         if dest is not None and getattr(dest, "is_satellite", False):
             return
         self._handshake_auth_token = packet.auth_token
 
     async def _schedule_packet_login_after_sysinfo(self, source, packet):
-        if not self._packet_auto_login:
-            return
         if getattr(source, "is_satellite", False):
             return
         if not (self._packet_login_username and self._packet_login_password.strip()):
             logger.warning(
-                "Slot %s: PACKET_AUTO_LOGIN enabled but username/password missing for this slot",
+                "Slot %s: username/password missing for this slot (packet login)",
                 self.slot_label,
             )
             return
         if not self._packet_login_loader_url:
             logger.warning(
-                "Slot %s: PACKET_AUTO_LOGIN needs loader URL (packet_loader_url empty)",
+                "Slot %s: packet login needs loader URL (packet_loader_url empty)",
                 self.slot_label,
             )
             return
@@ -357,7 +345,7 @@ class BanBotProxy(Proxy):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Slot %s: PACKET_AUTO_LOGIN failed", self.slot_label)
+                logger.exception("Slot %s: packet login failed", self.slot_label)
 
         self._packet_login_task = asyncio.create_task(_job())
 
@@ -368,7 +356,7 @@ class BanBotProxy(Proxy):
         at = self._handshake_auth_token
         if at is None:
             logger.warning(
-                "Slot %s: PACKET_AUTO_LOGIN skipped (no auth_token from HandshakeResponse yet)",
+                "Slot %s: packet login skipped (no auth_token from HandshakeResponse yet)",
                 self.slot_label,
             )
             return
@@ -389,16 +377,14 @@ class BanBotProxy(Proxy):
             unk_short_6=18,
         )
         self._packet_login_sent = True
-        logger.info("Slot %s: PACKET_AUTO_LOGIN — LoginPacket sent upstream (no Flash UI needed)", self.slot_label)
+        logger.info("Slot %s: LoginPacket sent upstream by proxy (packet login)", self.slot_label)
 
     async def _gate_duplicate_login_packet(self, source, packet):
-        if not self._packet_auto_login:
-            return
         if getattr(source, "is_satellite", False):
             return
         if self._packet_login_sent:
             logger.info(
-                "Slot %s: dropping client LoginPacket (PACKET_AUTO_LOGIN already satisfied)",
+                "Slot %s: dropping client LoginPacket (proxy packet login already satisfied)",
                 self.slot_label,
             )
             return self.DO_NOTHING
@@ -618,39 +604,6 @@ class BanBotProxy(Proxy):
             peer,
             self.host_main_port,
         )
-        if self._on_main_tcp_accepted is not None:
-            try:
-                self._on_main_tcp_accepted()
-            except Exception:
-                logger.exception(
-                    "Slot %s: on_main_tcp_accepted callback failed",
-                    self.slot_label,
-                )
-        # caseus.Proxy.new_main_connection awaits listen() until this TCP session ends; the hook must run
-        # *before* that or FLASH auto-login would only fire on disconnect.
-        if (
-            self._on_first_main_connection is not None
-            and not self._first_main_hook_done
-        ):
-            self._first_main_hook_done = True
-            hook = self._on_first_main_connection
-            loop = asyncio.get_running_loop()
-
-            def _run_hook() -> None:
-                try:
-                    hook()
-                except Exception:
-                    logger.exception(
-                        "Slot %s: on_first_main_connection hook failed",
-                        self.slot_label,
-                    )
-
-            logger.info(
-                "Slot %s: scheduling FLASH auto-login (first MAIN TCP, before proxy listen)",
-                self.slot_label,
-            )
-            loop.run_in_executor(None, _run_hook)
-
         await super().new_main_connection(client_reader, client_writer)
 
     async def new_satellite_connection(self, client_reader, client_writer):

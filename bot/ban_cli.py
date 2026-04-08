@@ -4,17 +4,14 @@ CMD entry: multi-slot local proxies, /room on all clients, then staggered /ban.
 Prerequisite: one Transformice + tfm-proxy-loader per ``proxy_port``. Row ``bind_ip`` is for
 Proxifier unless ``PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is True and that IP exists on this machine.
 
+The proxy always injects ``LoginPacket`` after ``SystemInformationPacket`` using credentials from
+``bot/config.py`` (see ``ban_proxy``).
+
 On Windows, Flash opens **one game at a time**: after each window opens, the bot waits for that
 slot's ``LoginSuccess`` before starting the next. The loader URL includes ``host``, ``port``,
 ``satellite``, and ``policy`` (see ``flash_launch``). A shared Flash socket-policy server runs on
 port 10801 unless disabled in config. ``TFMProxyLoader.cfg`` is written and read back for
 confirmation. Use ``--no-launch-flash`` to skip auto-launch.
-
-When ``FLASH_AUTO_LOGIN_UI`` is True in ``bot/config.py``, the bot can automate **Dismiss all** /
-**Continue** and username/password entry (see ``flash_launch``). Default trigger is
-``FLASH_LOGIN_TRIGGER = "main_tcp"``: after the first **MAIN TCP** accept, it dismisses dialogs ASAP,
-then ``FLASH_LOGIN_AFTER_MAIN_DELAY_SEC`` for the login form, then typing. Use ``"after_launch"`` for
-a fixed delay from Flash start instead. Use ``--no-flash-auto-login`` to disable.
 """
 
 from __future__ import annotations
@@ -125,17 +122,11 @@ class SlotState:
     loop: asyncio.AbstractEventLoop | None = None
     thread: threading.Thread | None = None
     error: str | None = None
-    # Set before Flash connects; used by FLASH_AUTO_LOGIN_UI (dismiss + type login).
     flash_pid: int | None = None
     flash_username: str = ""
     flash_password: str = ""
-    # Set when launch_one_flash_loader finished (HWND + optional Transformice click). MAIN TCP can
-    # arrive earlier than this; main_tcp auto-login waits so typing targets the real login screen.
-    flash_loader_ready_event: threading.Event = field(default_factory=threading.Event)
-    # Same file:///…swf URL as Flash (for optional PACKET_AUTO_LOGIN LoginPacket.loader_url).
+    # file:///…swf URL for LoginPacket.loader_url (same as patched loader).
     packet_loader_url: str = ""
-    # Set when this slot's proxy accepts MAIN TCP (Flash reached the proxy).
-    flash_main_tcp_seen: bool = False
 
 
 def _assign_listen_ports(
@@ -192,59 +183,12 @@ def _configure_logging() -> None:
     logging.info("Logging to %s", log_path)
 
 
-def _flash_login_hook_factory(state: SlotState, cfg: object):
-    """Runs in a thread pool when the first MAIN TCP connection is accepted for this slot."""
-
-    def _hook() -> None:
-        try:
-            # Proxy thread can accept MAIN TCP while the main thread is still in launch_one_flash_loader
-            # (HWND wait / Transformice click). Wait so dismiss + paste hit the login form, not the loader.
-            wait_sec = float(
-                getattr(cfg, "FLASH_LOGIN_WAIT_LOADER_READY_SEC", 180.0) or 180.0
-            )
-            wait_sec = max(5.0, min(wait_sec, 600.0))
-            if not state.flash_loader_ready_event.wait(timeout=wait_sec):
-                logger.warning(
-                    "Slot %s: flash_loader_ready_event timed out (%.0fs) — auto-login may hit wrong UI",
-                    state.label,
-                    wait_sec,
-                )
-            logger.info(
-                "Slot %s: main_tcp hook running (flash_pid=%s)",
-                state.label,
-                state.flash_pid,
-            )
-            flash_launch.run_flash_login_ui(
-                pid=state.flash_pid,
-                username=state.flash_username,
-                password=state.flash_password,
-                slot_label=state.label,
-                cfg=cfg,
-                trigger="main_tcp",
-            )
-        except Exception:
-            logger.exception("Slot %s: Flash auto-login UI failed", state.label)
-
-    return _hook
-
-
 def _run_slot_async(
     state: SlotState,
     cfg: object,
-    flash_auto_login_ui: bool,
-    flash_login_main_tcp_hook: bool,
 ) -> None:
     async def _run():
         try:
-            hook = (
-                _flash_login_hook_factory(state, cfg)
-                if (flash_auto_login_ui and flash_login_main_tcp_hook)
-                else None
-            )
-
-            def _on_main_tcp() -> None:
-                state.flash_main_tcp_seen = True
-
             proxy = BanBotProxy(
                 host_address=state.proxy_bind_host,
                 host_main_port=state.port,
@@ -252,15 +196,12 @@ def _run_slot_async(
                 host_socket_policy_port=state.policy_port,
                 slot_label=state.label,
                 login_success_event=state.login_success_event,
-                on_first_main_connection=hook,
-                on_main_tcp_accepted=_on_main_tcp,
                 verbose_login_flow=bool(
                     getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", True)
                 ),
                 log_all_main_packets=bool(
                     getattr(cfg, "PROXY_LOG_ALL_MAIN_PACKETS", False)
                 ),
-                packet_auto_login=bool(getattr(cfg, "PACKET_AUTO_LOGIN", False)),
                 packet_login_username=state.flash_username,
                 packet_login_password=state.flash_password,
                 packet_login_loader_url=state.packet_loader_url,
@@ -291,8 +232,6 @@ def start_all_slots(
     this_exe: Path,
     allow_kill: bool,
     cfg: object,
-    flash_auto_login_ui: bool,
-    flash_login_main_tcp_hook: bool,
 ) -> None:
     for s in states:
         port_roles: list[tuple[str, int]] = [
@@ -315,7 +254,7 @@ def start_all_slots(
     for s in states:
         t = threading.Thread(
             target=_run_slot_async,
-            args=(s, cfg, flash_auto_login_ui, flash_login_main_tcp_hook),
+            args=(s, cfg),
             name=f"tfm-ban-{s.port}",
             daemon=True,
         )
@@ -325,45 +264,36 @@ def start_all_slots(
     time.sleep(1.0)
 
 
-def _wait_for_game_clients(
-    states: list[SlotState],
-    timeout_sec: float = 600.0,
-    *,
-    auto_flash_launched: bool = False,
-) -> None:
-    if auto_flash_launched:
-        logger.info(
-            "Games were opened one-by-one; if any slot timed out, finish login manually. "
-            "Press Enter when all %s client(s) are ready, or wait for auto-detect.",
-            len(states),
-        )
-    else:
-        logger.info(
-            "Start %s game client(s); point each tfm-proxy-loader at its port from config.",
-            len(states),
-        )
-    logger.info("Press Enter when all are logged in (or wait for auto-detect)...")
-    # Non-blocking wait: user can press Enter early
-    deadline = time.monotonic() + timeout_sec
-    entered = threading.Event()
-
-    def _read_enter():
-        try:
-            input()
-        finally:
-            entered.set()
-
-    threading.Thread(target=_read_enter, daemon=True).start()
-
-    while time.monotonic() < deadline:
-        if entered.is_set():
-            return
-        if all(s.proxy and s.proxy.main_clients for s in states):
-            logger.info("All configured slots have a connected client.")
-            return
-        time.sleep(0.4)
+def _wait_for_all_slots_logged_in(states: list[SlotState], cfg: object) -> None:
+    """Block until every slot has received LoginSuccessPacket (or timeout)."""
+    timeout_sec = float(getattr(cfg, "ALL_SLOTS_LOGIN_TIMEOUT_SEC", 7200.0) or 7200.0)
+    timeout_sec = max(60.0, timeout_sec)
+    n = len(states)
     logger.info(
-        "Timeout waiting for connections - continuing anyway (some /room or /ban may fail).",
+        "Waiting until all %s slot(s) report login success (timeout %.0fs)...",
+        n,
+        timeout_sec,
+    )
+    deadline = time.monotonic() + timeout_sec
+    poll_sec = 2.0
+    while time.monotonic() < deadline:
+        pending = [
+            s
+            for s in states
+            if s.proxy is not None and not s.login_success_event.is_set()
+        ]
+        if not pending:
+            logger.info("All %s slot(s) logged in.", n)
+            return
+        time.sleep(poll_sec)
+    labels = [
+        s.label
+        for s in states
+        if s.proxy is not None and not s.login_success_event.is_set()
+    ]
+    logger.warning(
+        "Timeout waiting for login — missing slot(s): %s. Continuing anyway.",
+        ", ".join(labels) if labels else "(none)",
     )
 
 
@@ -421,11 +351,6 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--launch-flash-no-click",
         action="store_true",
         help="Auto-launch Flash but do not send a Transformice click (click manually in each window).",
-    )
-    p.add_argument(
-        "--no-flash-auto-login",
-        action="store_true",
-        help="Disable dismiss-all + username/password typing after MAIN TCP connect (see FLASH_AUTO_LOGIN_UI in config).",
     )
     return p.parse_args(argv)
 
@@ -564,31 +489,11 @@ def main(argv: list[str] | None = None) -> None:
         row_dict["_flash_connect_host"] = st.proxy_bind_host if st.proxy_bind_host else "127.0.0.1"
         st.packet_loader_url = flash_launch.loader_document_url_for_row(row_dict, _repo_root()) or ""
 
-    cfg_flash_auto = bool(getattr(cfg, "FLASH_AUTO_LOGIN_UI", False))
-    if args.no_flash_auto_login:
-        cfg_flash_auto = False
-    if bool(getattr(cfg, "PACKET_AUTO_LOGIN", False)):
-        cfg_flash_auto = False
-        logger.info(
-            "PACKET_AUTO_LOGIN=True — FLASH_AUTO_LOGIN_UI disabled (login is sent as LoginPacket by the proxy)",
-        )
-
-    def _flash_login_trigger(c) -> str:
-        t = str(getattr(c, "FLASH_LOGIN_TRIGGER", "after_launch") or "after_launch").strip().lower()
-        if t in ("main_tcp", "main", "tcp"):
-            return "main_tcp"
-        return "after_launch"
-
-    flash_login_trigger = _flash_login_trigger(cfg)
-    flash_login_main_tcp_hook = cfg_flash_auto and flash_login_trigger == "main_tcp"
-
     start_all_slots(
         states,
         this_exe=this_exe,
         allow_kill=allow_kill,
         cfg=cfg,
-        flash_auto_login_ui=cfg_flash_auto,
-        flash_login_main_tcp_hook=flash_login_main_tcp_hook,
     )
 
     auto_flash = (
@@ -596,10 +501,6 @@ def main(argv: list[str] | None = None) -> None:
         and not args.no_launch_flash
         and flash_launch.flash_launch_files_present(_repo_root())
     )
-    # main_tcp auto-login waits on flash_loader_ready_event; without auto-launch there is no loader phase.
-    if not auto_flash:
-        for s in states:
-            s.flash_loader_ready_event.set()
 
     if auto_flash:
         flash_accounts: list[dict[str, object]] = []
@@ -617,8 +518,6 @@ def main(argv: list[str] | None = None) -> None:
         stagger_after = float(getattr(cfg, "FLASH_STAGGER_AFTER_LOGIN_SEC", 0.5))
         for idx, (flash_row, st) in enumerate(zip(flash_accounts, states), start=1):
             st.login_success_event.clear()
-            st.flash_main_tcp_seen = False
-            st.flash_loader_ready_event.clear()
             logger.info(
                 "Opening game %s/%s (slot %s); waiting up to %ss for login before next client.",
                 idx,
@@ -626,130 +525,23 @@ def main(argv: list[str] | None = None) -> None:
                 st.label,
                 login_timeout,
             )
-            try:
-                proc = flash_launch.launch_one_flash_loader(
-                    flash_row,
-                    root=_repo_root(),
-                    click_transformice=not args.launch_flash_no_click,
-                    on_flash_pid=lambda pid, st=st: setattr(st, "flash_pid", pid),
-                    post_open_delay_sec=float(
-                        getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
-                    ),
-                )
-            finally:
-                st.flash_loader_ready_event.set()
+            proc = flash_launch.launch_one_flash_loader(
+                flash_row,
+                root=_repo_root(),
+                click_transformice=not args.launch_flash_no_click,
+                on_flash_pid=lambda pid, st=st: setattr(st, "flash_pid", pid),
+                post_open_delay_sec=float(
+                    getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
+                ),
+            )
             if proc is None:
                 st.flash_pid = None
-            poll_dismiss = float(
-                getattr(cfg, "FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC", 0.0) or 0.0
-            )
-            if (
-                proc is not None
-                and st.flash_pid is not None
-                and poll_dismiss > 0
-                and sys.platform == "win32"
-            ):
-
-                def _flash_error_dismiss_poll(
-                    _st: SlotState = st,
-                    _pd: float = poll_dismiss,
-                ) -> None:
-                    while True:
-                        time.sleep(_pd)
-                        if _st.login_success_event.is_set():
-                            break
-                        pid = _st.flash_pid
-                        if pid is None or pid <= 0:
-                            continue
-                        if not flash_launch.flash_pid_is_alive(pid):
-                            break
-                        if not flash_launch.try_acquire_flash_ui(pid):
-                            continue
-                        try:
-                            flash_launch.dismiss_flashplayer_actionscript_dialogs(
-                                pid,
-                                _st.label,
-                                cfg,
-                                pre_dismiss_sec=0.0,
-                                quiet=True,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Slot %s: periodic Flash error dismiss failed",
-                                _st.label,
-                                exc_info=True,
-                            )
-                        finally:
-                            flash_launch.release_flash_ui(pid)
-
-                threading.Thread(
-                    target=_flash_error_dismiss_poll,
-                    daemon=True,
-                    name=f"flash-err-dismiss-{st.label}",
-                ).start()
-            if (
-                cfg_flash_auto
-                and flash_login_trigger == "main_tcp"
-                and st.flash_pid is not None
-            ):
-                dm = float(getattr(cfg, "FLASH_LOGIN_AFTER_MAIN_DELAY_SEC", 1.0))
-                logger.info(
-                    "Slot %s: FLASH auto-login on first MAIN TCP: dismiss ASAP, then %.2fs before username (FLASH_LOGIN_TRIGGER=main_tcp)",
-                    st.label,
-                    max(0.0, dm),
-                )
-            if (
-                cfg_flash_auto
-                and flash_login_trigger == "after_launch"
-                and st.flash_pid is not None
-            ):
-                after_launch_sec = float(getattr(cfg, "FLASH_LOGIN_AFTER_LAUNCH_SEC", 12.0))
-
-                def _run_login_ui_later(
-                    *,
-                    _st: SlotState = st,
-                    _cfg: object = cfg,
-                    _delay: float = after_launch_sec,
-                ) -> None:
-                    time.sleep(max(0.0, _delay))
-                    try:
-                        flash_launch.run_flash_login_ui(
-                            pid=_st.flash_pid,
-                            username=_st.flash_username,
-                            password=_st.flash_password,
-                            slot_label=_st.label,
-                            cfg=_cfg,
-                            trigger="after_launch",
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Slot %s: FLASH_LOGIN_TRIGGER=after_launch login UI failed",
-                            _st.label,
-                        )
-
-                threading.Thread(
-                    target=_run_login_ui_later,
-                    daemon=True,
-                    name=f"flash-login-ui-{st.label}",
-                ).start()
-                logger.info(
-                    "Slot %s: scheduled FLASH auto-login in %.1fs (after_launch; tune FLASH_LOGIN_AFTER_LAUNCH_SEC)",
-                    st.label,
-                    max(0.0, after_launch_sec),
-                )
             poll_sec = float(getattr(cfg, "FLASH_LOGIN_WAIT_POLL_SEC", 45.0))
             poll_sec = max(10.0, min(poll_sec, 120.0))
             deadline = time.monotonic() + login_timeout
             got_login = False
             verbose = bool(getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", True))
-            if not cfg_flash_auto:
-                logger.info(
-                    "Slot %s: manual login — type username/password and submit in Flash. "
-                    "Watch log for HandshakeResponse, LoginPacket (password redacted), "
-                    "AccountError, Captcha, ChangeSatelliteServer; OK line = LoginSuccess.",
-                    st.label,
-                )
-            elif verbose:
+            if verbose:
                 logger.info(
                     "Slot %s: PROXY_VERBOSE_LOGIN_FLOW=True — extra login-phase packet lines in log.",
                     st.label,
@@ -763,39 +555,19 @@ def main(argv: list[str] | None = None) -> None:
                     got_login = True
                     logger.info("Slot %s reported login success; proceeding.", st.label)
                     break
-                if st.flash_main_tcp_seen:
-                    extra_verbose = (
-                        " With PROXY_VERBOSE_LOGIN_FLOW: expect a [MAIN→srv] LoginPacket after you submit; "
-                        "if none appears, auto-login may be too early or submit missed — try "
-                        "FLASH_LOGIN_AFTER_SUBMIT_EXTRA_SEC / FLASH_LOGIN_SECOND_SUBMIT_CLICK in config."
+                logger.info(
+                    "Still waiting slot %s (~%.0fs left): no LoginSuccess yet. "
+                    "Ensure loader connects to 127.0.0.1:%s (patched SWF)."
+                    "%s",
+                    st.label,
+                    max(0.0, deadline - time.monotonic()),
+                    st.port,
+                    (
+                        " With PROXY_VERBOSE_LOGIN_FLOW, look for AccountError / captcha lines above."
                         if verbose
                         else ""
-                    )
-                    logger.info(
-                        "Still waiting slot %s (~%.0fs left): no LoginSuccess yet. "
-                        "MAIN TCP already connected — Flash reached 127.0.0.1:%s; next step is a "
-                        "LoginPacket from the client. If none ever appears, login was not submitted.%s",
-                        st.label,
-                        max(0.0, deadline - time.monotonic()),
-                        st.port,
-                        extra_verbose,
-                    )
-                else:
-                    logger.info(
-                        "Still waiting slot %s (~%.0fs left): no LoginSuccess / OK line yet. "
-                        "If the log never shows 'MAIN TCP accept' for this slot, Flash is not connecting "
-                        "to 127.0.0.1:%s — open tmp/loader_patch/*_zwsflen.swf for this port (not raw "
-                        "TFMProxyLoader.swf), check firewall, or click Transformice in the loader."
-                        "%s",
-                        st.label,
-                        max(0.0, deadline - time.monotonic()),
-                        st.port,
-                        (
-                            " With PROXY_VERBOSE_LOGIN_FLOW, look for AccountError / captcha lines above."
-                            if verbose
-                            else ""
-                        ),
-                    )
+                    ),
+                )
             if not got_login:
                 logger.warning(
                     "Slot %s: no login success within %ss — finish manually or fix loader/proxy; continuing.",
@@ -803,7 +575,7 @@ def main(argv: list[str] | None = None) -> None:
                     login_timeout,
                 )
             time.sleep(max(0.0, stagger_after))
-    _wait_for_game_clients(states, auto_flash_launched=auto_flash)
+    _wait_for_all_slots_logged_in(states, cfg)
 
     while True:
         room = input("Target room (text after /room, e.g. *Racing1): ").strip()

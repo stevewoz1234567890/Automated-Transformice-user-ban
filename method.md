@@ -1,8 +1,8 @@
-# Method: Option A — Packet auto-login, no Flash started by the bot
+# Method: Option A — Packet login, no Flash started by the bot (optional)
 
-**Git branch:** `cmd-option-a` (the name `cmd/option-a` is impossible while branch `cmd` exists; see root `idea.md`.)
+**Git branch:** `cmd-option-a` (Git disallows a branch `cmd/option-a` while a branch named `cmd` exists — use `cmd-option-a` instead.)
 
-This branch documents **Option A**: use **`PACKET_AUTO_LOGIN`** in `bot/config.py` and **`--no-launch-flash`** so the bot never starts Flash Player or `TFMProxyLoader.swf`. The proxy sends **`LoginPacket`** after **`SystemInformationPacket`**; you do not automate the Flash login UI.
+This branch documents **Option A**: run with **`--no-launch-flash`** so the bot never starts Flash Player or `TFMProxyLoader.swf`. The proxy **always** sends **`LoginPacket`** after **`SystemInformationPacket`** using credentials from `bot/config.py`; there is no Flash login UI automation.
 
 ## Prerequisites
 
@@ -14,11 +14,10 @@ This branch documents **Option A**: use **`PACKET_AUTO_LOGIN`** in `bot/config.p
 
 In **`bot/config.py`**:
 
-1. Set **`PACKET_AUTO_LOGIN = True`**.
-2. Ensure each account row has **`username`** and **`password`** (used only for proxy-injected login; not for Flash UI when packet login is on).
-3. With **`PACKET_AUTO_LOGIN = True`**, **`FLASH_AUTO_LOGIN_UI`** is effectively disabled for the run (see `bot/ban_cli.py`).
+1. **`PACKET_LOGIN_DELAY_SEC`** / **`PACKET_LOGIN_START_ROOM`** — optional tuning for the injected login.
+2. **`ALL_SLOTS_LOGIN_TIMEOUT_SEC`** — max time to wait for **every** slot to show **`LoginSuccess`** before the ban prompt (no “press Enter when ready”).
 
-Optional: tune **`PROXY_VERBOSE_LOGIN_FLOW`**, **`PACKET_LOGIN_DELAY`** (if present in your config), etc., per your `ban_proxy` / config conventions.
+Optional: **`PROXY_VERBOSE_LOGIN_FLOW`**, etc.
 
 ## Command line
 
@@ -41,11 +40,11 @@ Flags:
 
 ## What to expect
 
-- Logs should show **`PACKET_AUTO_LOGIN — LoginPacket sent upstream (no Flash UI needed)`** when the proxy injects login (see `bot/ban_proxy.py`).
+- Logs should show **`LoginPacket sent upstream by proxy (packet login)`** when the proxy injects login (see `bot/ban_proxy.py`).
 - **`OK [slot …] logged in as …`** when **`LoginSuccessPacket`** is seen.
-- If nothing connects to the proxy port, you will not get past the wait for clients; ensure your external connector reaches **`127.0.0.1:<proxy_port>`** for each slot.
+- If nothing connects to the proxy port, you will not get past the wait for login; ensure your external connector reaches **`127.0.0.1:<proxy_port>`** for each slot.
 
 ## See also
 
-- Root **`idea.md`** — full comparison of Option A vs Option B.
-- **`docs/TRANSFORMICE_LOGIN_ANALYSIS.md`** — packet sequence and `PACKET_AUTO_LOGIN` behavior.
+- Root **`README.md`** — how to run with `--no-launch-flash` and Option A expectations.
+- **`docs/TRANSFORMICE_LOGIN_ANALYSIS.md`** — packet sequence and proxy login behavior.
