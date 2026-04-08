@@ -1,5 +1,7 @@
 # Method: Option A — Packet auto-login, no Flash started by the bot
 
+**Git branch:** `cmd-option-a` (the name `cmd/option-a` is impossible while branch `cmd` exists; see root `idea.md`.)
+
 This branch documents **Option A**: use **`PACKET_AUTO_LOGIN`** in `bot/config.py` and **`--no-launch-flash`** so the bot never starts Flash Player or `TFMProxyLoader.swf`. The proxy sends **`LoginPacket`** after **`SystemInformationPacket`**; you do not automate the Flash login UI.
 
 ## Prerequisites
