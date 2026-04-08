@@ -1,5 +1,7 @@
 # Method: Option B — Headless `caseus.Client` to the local proxy
 
+**Git branch:** `cmd-option-b` (the name `cmd/option-b` is impossible while branch `cmd` exists; see root `idea.md`.)
+
 This branch documents **Option B**: run the bot **without** launching Flash (`--no-launch-flash`), and use a **separate** Python process built on **`caseus.Client`** to connect to **`127.0.0.1:<proxy_port>`** with valid **`Secrets`**. The client performs the full login sequence (including **`LoginPacket`**); the proxy must **not** also inject login.
 
 ## Why not `PACKET_AUTO_LOGIN` here?
