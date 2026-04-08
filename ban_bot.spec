@@ -1,11 +1,27 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Build: python build_exe.py   →  ban_bot.exe in repo root
+import importlib.util
+
 from PyInstaller.utils.hooks import collect_all
+
+# Fail at build time if deps are missing from *this* interpreter (avoids a broken exe).
+for _mod, _hint in (
+    ("caseus", "pip install git+https://github.com/friedkeenan/caseus.git"),
+    ("pak", "pip install pak"),
+):
+    if importlib.util.find_spec(_mod) is None:
+        raise SystemExit(
+            f"ban_bot.spec: `{_mod}` is not importable in the Python running PyInstaller.\n"
+            f"  {_hint}\n"
+            "Use the same venv/interpreter for `pip install` and `python build_exe.py`."
+        )
 
 block_cipher = None
 
 datas, binaries, hiddenimports = [], [], []
-for pkg in ("caseus", "aiohttp", "colorama"):
+# ``pak`` is a separate PyPI package (caseus dependency) and is imported in ``bot/ban_proxy.py``;
+# PyInstaller often omits it from the one-file bundle unless collected explicitly.
+for pkg in ("caseus", "pak", "aiohttp", "colorama"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -40,7 +56,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir="tmp",
     console=True,
@@ -49,4 +65,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    # Avoid CopyIcons resource updates that often hit WinError 32 (AV / locked handles).
+    icon="NONE",
 )

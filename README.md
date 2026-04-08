@@ -31,6 +31,8 @@ After **`pip install -r requirements.txt`** (see Install above), from the repo r
 .\venv\Scripts\python.exe build_exe.py
 ```
 
+**Important:** `caseus` is installed from GitHub via `requirements.txt`, and **`ban_bot.exe` must be built with the same Python** where `import caseus` and `import pak` work. If you use another interpreter to run `build_exe.py`, the frozen exe can start with `ModuleNotFoundError` for those packages. The spec aborts the build with a short message if they are missing.
+
 That writes **`ban_bot.exe`** in the **repository root**. Run it from that folder so **`bot/config.py`** is found at `bot\config.py` next to the exe. Session logs go to **`log.txt`** in the same folder.
 
 ## How to use the bot

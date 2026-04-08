@@ -1,5 +1,7 @@
 # Ban bot: caseus local proxy + tfm-proxy-loader (see README.md)
-caseus>=0.1.0
+# caseus is not on PyPI; needs git on PATH for pip:
+caseus @ git+https://github.com/friedkeenan/caseus.git
+pak>=1.0.0
 colorama>=0.4.6
 
 # Build ban_bot.exe: python build_exe.py
