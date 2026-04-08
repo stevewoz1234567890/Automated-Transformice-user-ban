@@ -2,6 +2,13 @@
 
 This document captures the architectural notes for running the ban bot **without** Flash Player and **without** TFMProxyLoader, while keeping everything **CLI-driven** where possible.
 
+## Branch names for the two methods
+
+Git cannot create branches named `cmd/option-a` or `cmd/option-b` while a branch named **`cmd`** already exists (a `cmd` ref and a `cmd/…` ref cannot coexist). The same content lives on:
+
+- **`cmd-option-a`** — see **`method.md`** there for **Option A** (`PACKET_AUTO_LOGIN` + `--no-launch-flash`).
+- **`cmd-option-b`** — see **`method.md`** there for **Option B** (headless **`caseus.Client`**).
+
 ## What “no interface” can mean
 
 There are **two different things**:
