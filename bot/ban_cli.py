@@ -211,6 +211,9 @@ def _run_slot_async(
                 ),
                 main_server_address=main_server_address,
                 main_server_ports=main_server_ports,
+                upstream_connect_diag=bool(
+                    getattr(cfg, "PROXY_UPSTREAM_CONNECT_DIAG", True)
+                ),
             )
             state.proxy = proxy
             await proxy.startup()

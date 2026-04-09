@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import sys
 import threading
 import time
@@ -93,6 +94,7 @@ class BanBotProxy(Proxy):
         packet_login_loader_url: str = "",
         packet_login_delay_sec: float = 0.35,
         packet_login_start_room: str = "",
+        upstream_connect_diag: bool = True,
         **kwargs,
     ):
         # Flash file:// SWF + Socket: use IPv4 literal so the client never targets the public
@@ -117,6 +119,10 @@ class BanBotProxy(Proxy):
         self._packet_login_task: asyncio.Task | None = None
         self._sysinfo_received: bool = False
         self._login_watchdog_task: asyncio.Task | None = None
+        self._upstream_connect_diag = upstream_connect_diag
+        self._upstream_tcp_established: bool = False
+        self._upstream_open_streams_entered: bool = False
+        self._upstream_endpoint: tuple[str, int] | None = None
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(
             self._log_client_verification_challenge,
@@ -190,6 +196,9 @@ class BanBotProxy(Proxy):
         self._packet_login_sent = False
         self._sysinfo_received = False
         self._main_handshake_mono = None
+        self._upstream_tcp_established = False
+        self._upstream_open_streams_entered = False
+        self._upstream_endpoint = None
         if self._packet_login_task is not None and not self._packet_login_task.done():
             self._packet_login_task.cancel()
         self._packet_login_task = None
@@ -201,10 +210,27 @@ class BanBotProxy(Proxy):
             if self._login_success_event is not None and self._login_success_event.is_set():
                 return
             if self._handshake_auth_token is None:
+                detail = ""
+                if not self._upstream_tcp_established:
+                    if self._upstream_open_streams_entered:
+                        detail = (
+                            " (upstream TCP never completed — see earlier [login] upstream TCP attempt lines; "
+                            "possible slow connect, RST, or firewall on python.exe)"
+                        )
+                    else:
+                        detail = (
+                            " (still before/during open_streams to game host — connect may be blocked or hanging)"
+                        )
+                else:
+                    detail = (
+                        f" (upstream TCP OK to {self._upstream_endpoint!r} but no HandshakeResponse — "
+                        "wrong game_version/secrets, server drop, or packet parse issue)"
+                    )
                 logger.warning(
-                    "Slot %s: [login] no HandshakeResponse from upstream after 20s — "
+                    "Slot %s: [login] no HandshakeResponse from upstream after 20s%s — "
                     "check UPSTREAM host/ports, game version vs secrets, firewall, or server load",
                     self.slot_label,
+                    detail,
                 )
                 return
             await asyncio.sleep(25.0)
@@ -509,6 +535,73 @@ class BanBotProxy(Proxy):
             )
         raise NotImplementedError(f"We do not properly handle changing the main server: {packet}")
 
+    async def open_streams(self, address, ports):
+        """
+        Same behavior as ``caseus.Proxy.open_streams`` (random port order), but log each
+        ``asyncio.open_connection`` attempt. The base implementation swallows exceptions,
+        which hides refused / timeout / firewall errors.
+        """
+        if not self._upstream_connect_diag:
+            return await super().open_streams(address, ports)
+
+        ports_seq = list(ports)
+        order = random.sample(ports_seq, len(ports_seq))
+        self._upstream_open_streams_entered = True
+        logger.info(
+            "Slot %s: [login] upstream TCP: connecting to host=%r port_try_order=%s (pool=%s)",
+            self.slot_label,
+            address,
+            order,
+            tuple(ports_seq),
+        )
+        last_exc: BaseException | None = None
+        for port in order:
+            try:
+                t0 = time.monotonic()
+                server_reader, server_writer = await asyncio.open_connection(address, port)
+                dt = time.monotonic() - t0
+                peer = None
+                try:
+                    if server_writer.transport is not None:
+                        peer = server_writer.transport.get_extra_info("peername")
+                except Exception:
+                    pass
+                self._upstream_tcp_established = True
+                self._upstream_endpoint = (str(address), int(port))
+                logger.info(
+                    "Slot %s: [login] upstream TCP connected %s:%s in %.3fs remote_peer=%r",
+                    self.slot_label,
+                    address,
+                    port,
+                    dt,
+                    peer,
+                )
+                return server_reader, server_writer
+            except Exception as e:
+                last_exc = e
+                extra = ""
+                if isinstance(e, OSError):
+                    for name in ("errno", "winerror"):
+                        v = getattr(e, name, None)
+                        if v is not None:
+                            extra += f" {name}={v}"
+                logger.warning(
+                    "Slot %s: [login] upstream TCP attempt failed %s:%s — %s: %s%s",
+                    self.slot_label,
+                    address,
+                    port,
+                    type(e).__name__,
+                    e,
+                    extra,
+                )
+        logger.error(
+            "Slot %s: [login] upstream TCP all ports failed — last_error=%s: %s",
+            self.slot_label,
+            type(last_exc).__name__ if last_exc else "None",
+            last_exc,
+        )
+        raise ValueError(f"Unable to connect to address '{address}' on ports {ports}")
+
     async def startup(self):
         self.main_srv = await self.open_main_server()
         self.satellite_srv = await self.open_satellite_server()
@@ -545,6 +638,13 @@ class BanBotProxy(Proxy):
             peer,
             self.host_main_port,
         )
+        if getattr(self, "main_server_address", None) is not None:
+            logger.info(
+                "Slot %s: [login] proxy upstream target host=%r ports=%r",
+                self.slot_label,
+                self.main_server_address,
+                self.main_server_ports,
+            )
         if self._login_watchdog_task is not None and not self._login_watchdog_task.done():
             self._login_watchdog_task.cancel()
         self._login_watchdog_task = asyncio.create_task(self._login_stall_watchdog())
