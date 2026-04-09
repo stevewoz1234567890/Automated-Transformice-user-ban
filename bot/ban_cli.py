@@ -184,6 +184,8 @@ def _run_slot_async(
     *,
     main_server_address: str | None = None,
     main_server_ports: tuple[int, ...] | None = None,
+    packet_login_auth_key_fallback: int | None = None,
+    packet_login_packet_key_sources_fallback: list | tuple | None = None,
 ) -> None:
     async def _run():
         try:
@@ -214,6 +216,8 @@ def _run_slot_async(
                 upstream_connect_diag=bool(
                     getattr(cfg, "PROXY_UPSTREAM_CONNECT_DIAG", True)
                 ),
+                packet_login_auth_key_fallback=packet_login_auth_key_fallback,
+                packet_login_packet_key_sources_fallback=packet_login_packet_key_sources_fallback,
             )
             state.proxy = proxy
             await proxy.startup()
@@ -237,6 +241,8 @@ def start_all_slots(
     cfg: object,
     main_server_address: str | None = None,
     main_server_ports: tuple[int, ...] | None = None,
+    packet_login_auth_key_fallback: int | None = None,
+    packet_login_packet_key_sources_fallback: list | tuple | None = None,
 ) -> None:
     for s in states:
         for role, p in (
@@ -258,6 +264,8 @@ def start_all_slots(
             kwargs={
                 "main_server_address": main_server_address,
                 "main_server_ports": main_server_ports,
+                "packet_login_auth_key_fallback": packet_login_auth_key_fallback,
+                "packet_login_packet_key_sources_fallback": packet_login_packet_key_sources_fallback,
             },
             name=f"tfm-ban-{s.port}",
             daemon=True,
@@ -501,6 +509,12 @@ def main(argv: list[str] | None = None) -> None:
             upstream_ports,
         )
 
+    auth_key_fallback: int | None = None
+    packet_key_sources_fallback: list | tuple | None = None
+    if headless_auto and base_secrets is not None:
+        auth_key_fallback = getattr(base_secrets, "auth_key", None)
+        packet_key_sources_fallback = getattr(base_secrets, "packet_key_sources", None)
+
     start_all_slots(
         states,
         this_exe=this_exe,
@@ -508,6 +522,8 @@ def main(argv: list[str] | None = None) -> None:
         cfg=cfg,
         main_server_address=upstream_addr,
         main_server_ports=upstream_ports,
+        packet_login_auth_key_fallback=auth_key_fallback,
+        packet_login_packet_key_sources_fallback=packet_key_sources_fallback,
     )
 
     if headless_auto:

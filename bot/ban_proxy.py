@@ -95,6 +95,8 @@ class BanBotProxy(Proxy):
         packet_login_delay_sec: float = 0.35,
         packet_login_start_room: str = "",
         upstream_connect_diag: bool = True,
+        packet_login_auth_key_fallback: int | None = None,
+        packet_login_packet_key_sources_fallback: list | tuple | None = None,
         **kwargs,
     ):
         # Flash file:// SWF + Socket: use IPv4 literal so the client never targets the public
@@ -123,6 +125,8 @@ class BanBotProxy(Proxy):
         self._upstream_tcp_established: bool = False
         self._upstream_open_streams_entered: bool = False
         self._upstream_endpoint: tuple[str, int] | None = None
+        self._packet_login_auth_key_fallback = packet_login_auth_key_fallback
+        self._packet_login_packet_key_sources_fallback = packet_login_packet_key_sources_fallback
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(
             self._log_client_verification_challenge,
@@ -146,6 +150,43 @@ class BanBotProxy(Proxy):
             self._register_verbose_login_flow_listeners()
         if log_all_main_packets:
             self.register_packet_listener(self._log_all_main_packet, Packet)
+
+    @staticmethod
+    def _listen_stream_label(source_conn) -> str:
+        """Identify which TCP leg failed for listen-loop diagnostics."""
+        if getattr(source_conn, "is_satellite", False):
+            return "satellite"
+        name = type(source_conn).__name__
+        if name == "ServerConnection":
+            return "upstream(game→proxy)"
+        if name == "ClientConnection":
+            return "local(client→proxy)"
+        return name
+
+    async def _listen_impl(self, source_conn):
+        """Same as ``caseus.Proxy._listen_impl`` but log parse/read errors to ``log.txt``."""
+        label = self._listen_stream_label(source_conn)
+        while self.is_serving() and not source_conn.is_closing():
+            try:
+                async for packet in source_conn.continuously_read_packets():
+                    packet.make_immutable()
+
+                    await self._listen_to_packet(source_conn, packet)
+
+            except asyncio.CancelledError:
+                raise
+            except BaseException as e:
+                logger.exception(
+                    "Slot %s: [login] MAIN listen stopped on %s — %s: %s "
+                    "(often wrong packet_key_sources / game_version vs server, or truncated socket)",
+                    self.slot_label,
+                    label,
+                    type(e).__name__,
+                    e,
+                )
+                raise
+            finally:
+                await self.end_listener_tasks()
 
     def _during_login_wait(self) -> bool:
         ev = self._login_success_event
@@ -329,17 +370,31 @@ class BanBotProxy(Proxy):
             )
             return
         secrets = server_conn.secrets
+        if (
+            getattr(secrets, "packet_key_sources", None) is None
+            and self._packet_login_packet_key_sources_fallback is not None
+        ):
+            server_conn.secrets = secrets.copy(
+                packet_key_sources=self._packet_login_packet_key_sources_fallback
+            )
+            secrets = server_conn.secrets
         ak = getattr(secrets, "auth_key", None)
+        if ak is None and self._packet_login_auth_key_fallback is not None:
+            ak = self._packet_login_auth_key_fallback
         if ak is not None:
             ciphered = int(at) ^ int(ak)
         else:
             ciphered = None
         logger.info(
-            "Slot %s: [login] sending LoginPacket username=%r auth_key_present=%s ciphered_token=%s",
+            "Slot %s: [login] sending LoginPacket username=%r auth_key_present=%s ciphered_token=%s "
+            "(auth_key from server_conn=%s fallback=%s packet_key_sources merged=%s)",
             self.slot_label,
             self._packet_login_username,
             ak is not None,
             ciphered is not None,
+            getattr(server_conn.secrets, "auth_key", None) is not None,
+            self._packet_login_auth_key_fallback is not None,
+            self._packet_login_packet_key_sources_fallback is not None,
         )
         pw_hash = shakikoo(self._packet_login_password.strip())
         await server_conn.write_packet(
@@ -684,6 +739,30 @@ class BanBotProxy(Proxy):
 
     async def on_start(self):
         self._loop = asyncio.get_running_loop()
+        loop = self._loop
+        prior = loop.get_exception_handler()
+
+        def _asyncio_exc_handler(loop_ref, context):
+            exc = context.get("exception")
+            if exc is not None:
+                logger.error(
+                    "Slot %s: asyncio: %s",
+                    self.slot_label,
+                    context.get("message", ""),
+                    exc_info=exc,
+                )
+            elif context.get("message"):
+                logger.warning(
+                    "Slot %s: asyncio: %s",
+                    self.slot_label,
+                    context.get("message"),
+                )
+            if prior is not None:
+                prior(loop_ref, context)
+            else:
+                loop_ref.default_exception_handler(context)
+
+        loop.set_exception_handler(_asyncio_exc_handler)
         tasks = [self.main_srv.serve_forever(), self.satellite_srv.serve_forever()]
         if self.socket_policy_srv is not None:
             tasks.append(self.socket_policy_srv.serve_forever())
