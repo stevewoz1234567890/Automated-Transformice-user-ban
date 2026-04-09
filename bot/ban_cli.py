@@ -1,13 +1,16 @@
 """
 CMD entry: multi-slot local proxies, /room on all clients, then staggered /ban.
 
-Something external must open a MAIN TCP connection to each slot's ``proxy_port`` and complete the
-handshake through ``SystemInformationPacket``. Row ``bind_ip`` is for Proxifier unless
-``PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is True and that IP exists on this machine.
+Enable automatic TCP login by setting ``HEADLESS_AUTO_LOGIN = True`` in ``bot/config.py`` or running
+``python -m bot --headless``. That starts one **caseus** client per slot to each local proxy port
+(``HandshakePacket`` + ``SystemInformationPacket``); the proxy injects ``LoginPacket`` (see ``ban_proxy``).
+Requires ``HEADLESS_SECRETS_JSON`` or ``HEADLESS_SECRETS_DUMPER`` and upstream ``server_address`` /
+``server_ports`` in that JSON (or ``UPSTREAM_SERVER_*`` in config).
 
-The proxy injects ``LoginPacket`` after ``SystemInformationPacket`` using credentials from
-``bot/config.py`` (see ``ban_proxy``). Loader URL fields for that packet are built from
-``TFMProxyLoader.swf`` metadata (see ``flash_launch``); the bot does not start Flash Player.
+Use ``python -m bot --no-headless`` to force external connectors only. Row ``bind_ip`` is for Proxifier
+unless ``PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is True and that IP exists on this machine.
+
+Loader URL fields for ``LoginPacket`` are built from ``TFMProxyLoader.swf`` metadata (see ``flash_launch``).
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from colorama import init as colorama_init
 
 from .ban_proxy import BanBotProxy
 from . import flash_launch
+from .headless_client import load_secrets_base, start_headless_client_threads
 from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
 
 logger = logging.getLogger(__name__)
@@ -177,6 +181,9 @@ def _configure_logging() -> None:
 def _run_slot_async(
     state: SlotState,
     cfg: object,
+    *,
+    main_server_address: str | None = None,
+    main_server_ports: tuple[int, ...] | None = None,
 ) -> None:
     async def _run():
         try:
@@ -188,7 +195,7 @@ def _run_slot_async(
                 slot_label=state.label,
                 login_success_event=state.login_success_event,
                 verbose_login_flow=bool(
-                    getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", True)
+                    getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", False)
                 ),
                 log_all_main_packets=bool(
                     getattr(cfg, "PROXY_LOG_ALL_MAIN_PACKETS", False)
@@ -202,6 +209,8 @@ def _run_slot_async(
                 packet_login_start_room=str(
                     getattr(cfg, "PACKET_LOGIN_START_ROOM", "") or ""
                 ),
+                main_server_address=main_server_address,
+                main_server_ports=main_server_ports,
             )
             state.proxy = proxy
             await proxy.startup()
@@ -223,6 +232,8 @@ def start_all_slots(
     this_exe: Path,
     allow_kill: bool,
     cfg: object,
+    main_server_address: str | None = None,
+    main_server_ports: tuple[int, ...] | None = None,
 ) -> None:
     for s in states:
         for role, p in (
@@ -241,6 +252,10 @@ def start_all_slots(
         t = threading.Thread(
             target=_run_slot_async,
             args=(s, cfg),
+            kwargs={
+                "main_server_address": main_server_address,
+                "main_server_ports": main_server_ports,
+            },
             name=f"tfm-ban-{s.port}",
             daemon=True,
         )
@@ -327,6 +342,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--no-kill-stale",
         action="store_true",
         help="Do not kill processes already listening on configured proxy ports.",
+    )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="Start built-in caseus TCP clients per slot (needs HEADLESS_SECRETS_JSON or dumper + upstream).",
+    )
+    p.add_argument(
+        "--no-headless",
+        action="store_true",
+        help="Do not start built-in caseus TCP clients (overrides config HEADLESS_AUTO_LOGIN).",
     )
     return p.parse_args(argv)
 
@@ -443,12 +468,52 @@ def main(argv: list[str] | None = None) -> None:
         row_dict["_flash_connect_host"] = st.proxy_bind_host if st.proxy_bind_host else "127.0.0.1"
         st.packet_loader_url = flash_launch.loader_document_url_for_row(row_dict, _repo_root()) or ""
 
+    headless_auto = (
+        (bool(getattr(cfg, "HEADLESS_AUTO_LOGIN", False)) or args.headless)
+        and not args.no_headless
+    )
+    upstream_addr: str | None = None
+    upstream_ports: tuple[int, ...] | None = None
+    base_secrets = None
+
+    if headless_auto:
+        base_secrets = load_secrets_base(cfg)
+        ua = getattr(cfg, "UPSTREAM_SERVER_ADDRESS", None)
+        up = getattr(cfg, "UPSTREAM_SERVER_PORTS", None)
+        if ua and up:
+            upstream_addr = str(ua).strip()
+            upstream_ports = tuple(int(x) for x in up)
+        else:
+            upstream_addr = base_secrets.server_address
+            upstream_ports = base_secrets.server_ports
+        if not upstream_addr or not upstream_ports:
+            logger.error(
+                "HEADLESS_AUTO_LOGIN needs server_address and server_ports in the secrets JSON "
+                "(from tfm-secrets) or set UPSTREAM_SERVER_ADDRESS and UPSTREAM_SERVER_PORTS in config."
+            )
+            raise SystemExit(1)
+        logger.info(
+            "Headless TCP login enabled: proxy upstream %s ports %s",
+            upstream_addr,
+            upstream_ports,
+        )
+
     start_all_slots(
         states,
         this_exe=this_exe,
         allow_kill=allow_kill,
         cfg=cfg,
+        main_server_address=upstream_addr,
+        main_server_ports=upstream_ports,
     )
+
+    if headless_auto:
+        start_headless_client_threads(
+            states,
+            raw_accounts,
+            cfg,
+            base_secrets=base_secrets,
+        )
 
     _wait_for_all_slots_logged_in(states, cfg)
 

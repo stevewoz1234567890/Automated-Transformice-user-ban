@@ -115,7 +115,13 @@ class BanBotProxy(Proxy):
         self._handshake_auth_token: int | None = None
         self._packet_login_sent = False
         self._packet_login_task: asyncio.Task | None = None
+        self._sysinfo_received: bool = False
+        self._login_watchdog_task: asyncio.Task | None = None
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
+        self.register_packet_listener(
+            self._log_client_verification_challenge,
+            clientbound.ClientVerificationPacket,
+        )
         self.register_packet_listener(self._vl_handshake_sb, serverbound.HandshakePacket)
         self.register_packet_listener(
             self._capture_handshake_auth_token,
@@ -167,9 +173,8 @@ class BanBotProxy(Proxy):
             address=addr,
             ports=proxied_ports,
         )
-        logger.info(
-            "Slot %s: ChangeSatelliteServer → Flash client: address=%r ports=%s "
-            "(server sent %r ports %s; all local — avoids Flash #2048 on public host)",
+        logger.debug(
+            "Slot %s: ChangeSatelliteServer rewrite → %r ports=%s (was %r %s)",
             self.slot_label,
             addr,
             proxied_ports,
@@ -178,6 +183,56 @@ class BanBotProxy(Proxy):
         )
         await source.destination.write_packet_instance(proxied)
         return self.DO_NOTHING
+
+    def _reset_main_session_state(self) -> None:
+        """New MAIN TCP client: clear login pipeline state."""
+        self._handshake_auth_token = None
+        self._packet_login_sent = False
+        self._sysinfo_received = False
+        self._main_handshake_mono = None
+        if self._packet_login_task is not None and not self._packet_login_task.done():
+            self._packet_login_task.cancel()
+        self._packet_login_task = None
+
+    async def _login_stall_watchdog(self) -> None:
+        """Warn when the login pipeline stalls (helps diagnose silent upstream failures)."""
+        try:
+            await asyncio.sleep(20.0)
+            if self._login_success_event is not None and self._login_success_event.is_set():
+                return
+            if self._handshake_auth_token is None:
+                logger.warning(
+                    "Slot %s: [login] no HandshakeResponse from upstream after 20s — "
+                    "check UPSTREAM host/ports, game version vs secrets, firewall, or server load",
+                    self.slot_label,
+                )
+                return
+            await asyncio.sleep(25.0)
+            if self._login_success_event is not None and self._login_success_event.is_set():
+                return
+            if not self._sysinfo_received:
+                logger.warning(
+                    "Slot %s: [login] HandshakeResponse OK but no SystemInformationPacket from client "
+                    "after 25s — headless client or loader may be stuck",
+                    self.slot_label,
+                )
+            elif not self._packet_login_sent:
+                logger.warning(
+                    "Slot %s: [login] SystemInformation seen but LoginPacket was not injected "
+                    "(missing username/password/loader URL on this slot?)",
+                    self.slot_label,
+                )
+        except asyncio.CancelledError:
+            pass
+
+    async def _log_client_verification_challenge(self, source, packet):
+        if getattr(source, "is_satellite", False):
+            return
+        logger.warning(
+            "Slot %s: [login] server sent ClientVerificationPacket (anti-bot) — "
+            "if login fails, the headless path may not satisfy this challenge; try a full client",
+            self.slot_label,
+        )
 
     def _register_verbose_login_flow_listeners(self) -> None:
         self.register_packet_listener(self._vl_sysinfo_sb, serverbound.SystemInformationPacket)
@@ -193,33 +248,46 @@ class BanBotProxy(Proxy):
         if dest is not None and getattr(dest, "is_satellite", False):
             return
         self._handshake_auth_token = packet.auth_token
+        logger.info(
+            "Slot %s: [login] HandshakeResponse received auth_token=%s (num_online=%s)",
+            self.slot_label,
+            packet.auth_token,
+            getattr(packet, "num_online_players", None),
+        )
 
     async def _schedule_packet_login_after_sysinfo(self, source, packet):
         if getattr(source, "is_satellite", False):
             return
+        self._sysinfo_received = True
+        delay = max(0.0, self._packet_login_delay_sec)
         if not (self._packet_login_username and self._packet_login_password.strip()):
             logger.warning(
-                "Slot %s: username/password missing for this slot (packet login)",
+                "Slot %s: [login] SystemInformation received but username/password missing — cannot inject LoginPacket",
                 self.slot_label,
             )
             return
         if not self._packet_login_loader_url:
             logger.warning(
-                "Slot %s: packet login needs loader URL (packet_loader_url empty)",
+                "Slot %s: [login] SystemInformation received but packet_loader_url empty — cannot inject LoginPacket",
                 self.slot_label,
             )
             return
+        logger.info(
+            "Slot %s: [login] SystemInformation received — injecting LoginPacket in %.2fs",
+            self.slot_label,
+            delay,
+        )
 
         async def _job() -> None:
             try:
-                await asyncio.sleep(max(0.0, self._packet_login_delay_sec))
+                await asyncio.sleep(delay)
                 if self._packet_login_sent:
                     return
                 await self._send_packet_login_upstream()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Slot %s: packet login failed", self.slot_label)
+                logger.exception("Slot %s: [login] packet login task failed", self.slot_label)
 
         self._packet_login_task = asyncio.create_task(_job())
 
@@ -230,7 +298,7 @@ class BanBotProxy(Proxy):
         at = self._handshake_auth_token
         if at is None:
             logger.warning(
-                "Slot %s: packet login skipped (no auth_token from HandshakeResponse yet)",
+                "Slot %s: [login] cannot inject LoginPacket — no auth_token yet (HandshakeResponse missing?)",
                 self.slot_label,
             )
             return
@@ -240,6 +308,13 @@ class BanBotProxy(Proxy):
             ciphered = int(at) ^ int(ak)
         else:
             ciphered = None
+        logger.info(
+            "Slot %s: [login] sending LoginPacket username=%r auth_key_present=%s ciphered_token=%s",
+            self.slot_label,
+            self._packet_login_username,
+            ak is not None,
+            ciphered is not None,
+        )
         pw_hash = shakikoo(self._packet_login_password.strip())
         await server_conn.write_packet(
             serverbound.LoginPacket,
@@ -251,7 +326,10 @@ class BanBotProxy(Proxy):
             unk_short_6=18,
         )
         self._packet_login_sent = True
-        logger.info("Slot %s: LoginPacket sent upstream by proxy (packet login)", self.slot_label)
+        logger.info(
+            "Slot %s: [login] LoginPacket sent upstream (waiting for LoginSuccess or AccountError)",
+            self.slot_label,
+        )
 
     async def _gate_duplicate_login_packet(self, source, packet):
         if getattr(source, "is_satellite", False):
@@ -356,26 +434,16 @@ class BanBotProxy(Proxy):
     async def _vl_account_error_cb(self, source, packet):
         ec = getattr(packet, "error_code", None)
         hint = _account_error_hint(ec)
-        if self._verbose_login_flow:
-            logger.warning(
-                "Slot %s [srv→] AccountErrorPacket error_code=%s suggested_username=%r unk_string_3=%r — %s",
-                self.slot_label,
-                ec,
-                getattr(packet, "suggested_username", None),
-                _trunc(getattr(packet, "unk_string_3", ""), 80),
-                hint,
-            )
-        else:
-            logger.warning(
-                "Slot %s [srv→] AccountErrorPacket error_code=%s — %s",
-                self.slot_label,
-                ec,
-                hint,
-            )
+        logger.warning(
+            "Slot %s: [login] AccountErrorPacket error_code=%s suggested_username=%r unk=%r — %s",
+            self.slot_label,
+            ec,
+            getattr(packet, "suggested_username", None),
+            _trunc(getattr(packet, "unk_string_3", ""), 80),
+            hint,
+        )
 
     async def _vl_captcha_cb(self, source, packet):
-        if not self._verbose_login_flow:
-            return
         info = getattr(packet, "info", None)
         w = h = typ = None
         if info is not None:
@@ -459,11 +527,12 @@ class BanBotProxy(Proxy):
             socks = getattr(srv, "sockets", None) or []
             for s in socks:
                 try:
-                    logger.info("Slot %s %s server bound to %s", self.slot_label, name, s.getsockname())
+                    logger.debug("Slot %s %s bound %s", self.slot_label, name, s.getsockname())
                 except OSError:
                     pass
 
     async def new_main_connection(self, client_reader, client_writer):
+        self._reset_main_session_state()
         peer = None
         try:
             if client_writer.transport is not None:
@@ -471,12 +540,32 @@ class BanBotProxy(Proxy):
         except Exception:
             pass
         logger.info(
-            "Slot %s: MAIN TCP accept from %r (proxy main port %s) — game/loader reached this slot",
+            "Slot %s: [login] MAIN client connected from %r (listening port %s)",
             self.slot_label,
             peer,
             self.host_main_port,
         )
-        await super().new_main_connection(client_reader, client_writer)
+        if self._login_watchdog_task is not None and not self._login_watchdog_task.done():
+            self._login_watchdog_task.cancel()
+        self._login_watchdog_task = asyncio.create_task(self._login_stall_watchdog())
+        try:
+            await super().new_main_connection(client_reader, client_writer)
+        except ValueError as e:
+            err_s = str(e)
+            if "Unable to connect" in err_s:
+                logger.error(
+                    "Slot %s: [login] upstream TCP failed: %s — refresh tfm-secrets for the "
+                    "current game build; check firewall/VPN; optionally set "
+                    "UPSTREAM_SERVER_ADDRESS and UPSTREAM_SERVER_PORTS in bot/config.py (try main port 11801).",
+                    self.slot_label,
+                    err_s,
+                )
+                return
+            raise
+        finally:
+            if self._login_watchdog_task is not None and not self._login_watchdog_task.done():
+                self._login_watchdog_task.cancel()
+                self._login_watchdog_task = None
 
     async def new_satellite_connection(self, client_reader, client_writer):
         peer = None
@@ -485,8 +574,8 @@ class BanBotProxy(Proxy):
                 peer = client_writer.transport.get_extra_info("peername")
         except Exception:
             pass
-        logger.info(
-            "Slot %s: SATELLITE TCP accept from %r (satellite port %s)",
+        logger.debug(
+            "Slot %s: SATELLITE TCP from %r (port %s)",
             self.slot_label,
             peer,
             self.host_satellite_port,
@@ -548,18 +637,16 @@ class BanBotProxy(Proxy):
             self._own_username = self._own_username.strip()
         user = self._own_username or "?"
         if self._verbose_login_flow:
-            logger.info(
-                "Slot %s: LoginSuccessPacket global_id=%s community=%s registered=%s session_id=%s "
-                "played_time=%s staff_roles=%s modo_all_staff_ch=%s",
+            logger.debug(
+                "Slot %s: LoginSuccessPacket details global_id=%s community=%s registered=%s session_id=%s",
                 self.slot_label,
                 getattr(packet, "global_id", None),
                 getattr(packet, "community", None),
                 getattr(packet, "registered", None),
                 getattr(packet, "session_id", None),
-                getattr(packet, "played_time", None),
-                getattr(packet, "staff_roles", None),
-                getattr(packet, "modo_can_speak_in_all_staff_channels", None),
             )
+        if self._login_watchdog_task is not None and not self._login_watchdog_task.done():
+            self._login_watchdog_task.cancel()
         msg = f"OK  [slot {self.slot_label}] logged in as {user}"
         logger.info(msg)
         _safe_print(msg)

@@ -1,11 +1,13 @@
 """
-Option B: one ``caseus.Client`` per slot connecting to the local BanBotProxy (no Flash).
+One ``caseus.Client`` per slot connecting to the local BanBotProxy (no Flash).
 
 Requires ``Secrets`` (game keys) from ``HEADLESS_SECRETS_JSON`` or ``HEADLESS_SECRETS_DUMPER`` in
-``bot/config.py``. Point ``Secrets`` at ``127.0.0.1:<main proxy_port>`` per slot — done here via
-``Secrets.copy(server_address=..., server_ports=(...))``.
+``bot/config.py``. Each client uses ``Secrets.copy(server_address=..., server_ports=(...))`` to
+target ``127.0.0.1:<proxy_port>`` while ``BanBotProxy`` is given the real ``server_address`` /
+``server_ports`` from the same JSON so the proxy connects upstream immediately.
 
-Keep ``PACKET_AUTO_LOGIN = False`` so the proxy does not inject a second ``LoginPacket``.
+The proxy injects ``LoginPacket`` after ``SystemInformationPacket``; this client must **not** send
+its own ``LoginPacket`` (see ``HeadlessProxyClient.login`` no-op).
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from typing import Any
 import pak
 from caseus import Secrets
 from caseus.clients.client import AccountError, Client
-from caseus.packets import clientbound, serverbound
+from caseus.packets import clientbound
 from caseus.util.crypto import shakikoo
 
 logger = logging.getLogger(__name__)
@@ -68,34 +70,20 @@ def load_secrets_base(cfg: object) -> Secrets:
 
 
 class HeadlessProxyClient(Client):
-    """``caseus.Client`` with the same ``LoginPacket.loader_url`` as Flash and login success signaling."""
+    """``caseus.Client`` that completes Handshake + SystemInformation; proxy sends ``LoginPacket``."""
 
     def __init__(
         self,
         *,
-        loader_url: str,
         login_success_event: threading.Event | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self._loader_url = loader_url
         self._login_success_event = login_success_event
 
     async def login(self) -> None:
-        if self.secrets.auth_key is not None:
-            ciphered_auth_token = self.auth_token ^ self.secrets.auth_key
-        else:
-            ciphered_auth_token = None
-
-        await self.main.write_packet(
-            serverbound.LoginPacket,
-            username=self.username,
-            password_hash=self.password_hash,
-            loader_url=self._loader_url,
-            start_room=self.start_room,
-            ciphered_auth_token=ciphered_auth_token,
-            unk_short_6=18,
-        )
+        """Do not send ``LoginPacket`` — ``BanBotProxy`` injects it after ``SystemInformationPacket``."""
+        return
 
     @pak.packet_listener(clientbound.LoginSuccessPacket)
     async def _on_login_success(self, server, packet):
@@ -110,8 +98,8 @@ async def _run_one_client(
     username: str,
     password: str,
     start_room: str,
-    loader_url: str,
     login_success_event: threading.Event,
+    connect_to_satellite: bool,
 ) -> None:
     pw_hash = shakikoo(password.strip())
     client = HeadlessProxyClient(
@@ -119,9 +107,8 @@ async def _run_one_client(
         username=username,
         password_hash=pw_hash,
         start_room=start_room,
-        loader_url=loader_url,
         login_success_event=login_success_event,
-        connect_to_satellite=True,
+        connect_to_satellite=connect_to_satellite,
     )
     await client.start()
 
@@ -144,9 +131,6 @@ def _slot_thread_main(
         server_ports=(main_port,),
     )
 
-    # Same file:///…swf?… as Flash / PACKET_AUTO_LOGIN (set on SlotState in ban_cli).
-    loader_url = (getattr(state, "packet_loader_url", None) or "").strip() or Client.LOADER_URL
-
     username = str(row.get("username", "") or "").strip()
     password = str(row.get("password", "") or "")
     if not username or not password.strip():
@@ -168,14 +152,21 @@ def _slot_thread_main(
                 username=username,
                 password=password,
                 start_room=start_room,
-                loader_url=loader_url,
                 login_success_event=state.login_success_event,
+                connect_to_satellite=bool(getattr(cfg, "HEADLESS_CONNECT_TO_SATELLITE", True)),
             )
         )
+        if not state.login_success_event.is_set():
+            logger.warning(
+                "Slot %s: [login] headless TCP session ended before LoginSuccess (disconnect or server closed)",
+                label,
+            )
+        else:
+            logger.debug("Slot %s: headless session ended (connection closed)", label)
     except AccountError as e:
-        logger.error("Slot %s: AccountError code=%s", label, e.error_code)
+        logger.error("Slot %s: [login] AccountError from server error_code=%s", label, e.error_code)
     except OSError as e:
-        logger.error("Slot %s: connection error: %s", label, e)
+        logger.error("Slot %s: [login] cannot reach proxy (check port): %s", label, e)
     except Exception:
         logger.exception("Slot %s: headless client failed", label)
 
@@ -184,9 +175,11 @@ def start_headless_client_threads(
     states: list[Any],
     raw_accounts: list[dict[str, object]],
     cfg: object,
+    *,
+    base_secrets: Secrets | None = None,
 ) -> None:
     """Spawn one daemon thread per slot; each runs ``asyncio.run(HeadlessProxyClient.start())``."""
-    base = load_secrets_base(cfg)
+    base = base_secrets if base_secrets is not None else load_secrets_base(cfg)
     stagger = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 0.5) or 0.0)
     stagger = max(0.0, stagger)
 

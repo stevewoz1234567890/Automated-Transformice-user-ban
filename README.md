@@ -2,13 +2,23 @@
 
 This repository (**Automated-Transformice-user-ban**) is aimed at a **command-line** workflow for coordinating **room** moves and **staggered `/ban`** across many Transformice clients, as described in [`Initial-Idea.txt`](Initial-Idea.txt).
 
-The implementation is the Python package **`bot/`**: one **local TCP proxy per game client** (via **caseus**). The proxy injects **`LoginPacket`** after **`SystemInformationPacket`** using credentials from `bot/config.py`. The bot does **not** start Flash Player; you attach your own client to each slot’s main port.
+The implementation is the Python package **`bot/`**: one **local TCP proxy per game client** (via **caseus**). The proxy injects **`LoginPacket`** after **`SystemInformationPacket`** using credentials from `bot/config.py`. The bot does **not** start Flash Player.
+
+**Automatic login (recommended):** run **`python -m bot --headless`** or set **`HEADLESS_AUTO_LOGIN = True`** in `bot/config.py`. The bot starts a built-in **caseus** TCP client per slot (see `bot/headless_client.py`, `HandshakePacket` → `SystemInformationPacket` → proxy-injected `LoginPacket`). You need **`HEADLESS_SECRETS_JSON`** (output from `tfm-secrets` / `tfm-secrets dump`) or **`HEADLESS_SECRETS_DUMPER`**. If both are set, **`UPSTREAM_SERVER_ADDRESS`** and **`UPSTREAM_SERVER_PORTS`** override the JSON host/ports (use this after a fresh secrets dump or to test connectivity, e.g. main port **11801**):
+
+```python
+# Optional — overrides server_address / server_ports from HEADLESS_SECRETS_JSON
+UPSTREAM_SERVER_ADDRESS = "51.38.60.113"
+UPSTREAM_SERVER_PORTS = (11801, 12801, 13801, 14801)
+```
+
+**Manual connector:** omit `--headless` and keep **`HEADLESS_AUTO_LOGIN`** false; attach your own client to each slot’s main port.
 
 ## What you need
 
 - **Python 3.10+**
 - **`TFMProxyLoader.swf`** in the repo root (or set **`TFM_PROXY_SWF`**) so the proxy can build a matching **`LoginPacket.loader_url`** (see `bot/flash_launch.py`). Game assets are optional for the bot itself.
-- **One connector per account** that opens a TCP connection to the **matching `proxy_port`** from `bot/config.py` and completes the handshake through **`SystemInformationPacket`**.
+- **Either** automatic headless mode (secrets JSON + optional flags above) **or** one external connector per account that opens TCP to the **matching `proxy_port`** and completes the handshake through **`SystemInformationPacket`**.
 - **Unique outbound IP per client** where required (e.g. **Proxifier** + proxies/VPN). The `bind_ip` field in config is only a **reminder** of which IP you assigned; the bot does not configure Proxifier for you.
 
 ## Install
@@ -39,17 +49,17 @@ That writes **`ban_bot.exe`** in the **repository root**. Run it from that folde
 
 **Option A** — packet login from the proxy — is spelled out in root [`method.md`](method.md). The proxy always sends **`LoginPacket`** after **`SystemInformationPacket`** using each row’s **`username`** / **`password`** in `bot/config.py`. The bot never starts Flash Player.
 
-**Prerequisite:** something must still open a **MAIN TCP** connection to each slot’s proxy (typically **`127.0.0.1:<proxy_port>`** from `bot/config.py`) and complete the handshake through **`SystemInformationPacket`**. The bot does not create that connection by itself.
+**Prerequisite:** something must open a **MAIN TCP** connection to each slot’s proxy (typically **`127.0.0.1:<proxy_port>`**). Use **`--headless`** to do that inside the bot, or connect manually.
 
-1. **Start the bot** from the repo root:
+1. **Start the bot** from the repo root (add **`--headless`** for automatic TCP login if secrets are configured):
 
    ```powershell
-   .\venv\Scripts\python.exe -m bot
+   .\venv\Scripts\python.exe -m bot --headless
    ```
 
-   Or: **`ban_bot.exe`** (exe must sit next to `bot\config.py` as usual).
+   Or: **`ban_bot.exe --headless`** (exe must sit next to `bot\config.py` as usual). Without **`--headless`**, connect each external client to the **main port** for that slot.
 
-2. The process prints which **proxy ports** are active. Connect each game client through **tfm-proxy-loader** (or equivalent) to the **main port** for that slot.
+2. The process logs which **proxy ports** are active. If not using headless, connect each game client through **tfm-proxy-loader** (or equivalent) to the **main port** for that slot.
 
 3. **Login:** the proxy injects credentials from `bot/config.py`. Logs should include **`LoginPacket sent upstream by proxy (packet login)`** and **`OK [slot …] logged in as …`** when **`LoginSuccessPacket`** arrives.
 
@@ -71,6 +81,8 @@ That writes **`ban_bot.exe`** in the **repository root**. Run it from that folde
 
 ### Command-line flags
 
+- **`--headless`** — start built-in caseus TCP clients (requires secrets in config; see above).
+- **`--no-headless`** — do not start built-in clients even if `HEADLESS_AUTO_LOGIN` is true in config.
 - **`--no-kill-stale`** — do not try to kill processes already listening on your configured proxy ports (e.g. `python -m bot --no-kill-stale` or `ban_bot.exe --no-kill-stale`).
 
 ### Loader SWF path

@@ -8,7 +8,7 @@ The bot **never** starts Flash Player or `TFMProxyLoader.swf`. The proxy **alway
 
 - Python 3.10+ and `pip install -r requirements.txt` (see root `README.md`).
 - `bot/config.py` with **`ACCOUNTS`** rows: each slot needs **`proxy_port`**, **`username`**, **`password`**, and optional **`label`** / **`bind_ip`**.
-- **Something** must still connect to each slot’s MAIN TCP (`127.0.0.1:<proxy_port>`) and complete the handshake through **`SystemInformationPacket`** (your own client, Ruffle, another tool, etc.). The bot does not create that connection by itself.
+- **Either** enable **headless TCP** (`python -m bot --headless` or `HEADLESS_AUTO_LOGIN = True`) with **`HEADLESS_SECRETS_JSON`** (and upstream `server_address` / `server_ports` in that JSON), **or** connect each slot yourself to MAIN TCP (`127.0.0.1:<proxy_port>`) through **`SystemInformationPacket`** (external client, Ruffle, etc.).
 
 ## Configuration
 
@@ -24,17 +24,19 @@ Optional: **`PROXY_VERBOSE_LOGIN_FLOW`**, **`SHARED_FLASH_SOCKET_POLICY_PORT`** 
 From the repository root:
 
 ```powershell
-.\venv\Scripts\python.exe -m bot
+.\venv\Scripts\python.exe -m bot --headless
 ```
 
 Or with the frozen exe (from repo root, next to `bot\config.py`):
 
 ```powershell
-.\ban_bot.exe
+.\ban_bot.exe --headless
 ```
 
 Flags:
 
+- **`--headless`** — start built-in caseus clients (needs secrets JSON + upstream server in JSON or `UPSTREAM_SERVER_*` in config).
+- **`--no-headless`** — never start built-in clients (use an external connector).
 - **`--no-kill-stale`** — optional; do not kill processes already on your proxy ports.
 
 ## What to expect
