@@ -9,8 +9,8 @@ This document describes how **this project** interacts with Transformice login. 
 | **`Transformice.exe` / SWF** | Official client; login UI and password handling live inside the binary. |
 | **`caseus` (Python)** | Parses and forwards the game’s TCP protocol (`HandshakePacket`, `LoginPacket`, `LoginSuccessPacket`, etc.). |
 | **`bot/ban_proxy.py`** | Local proxy (`BanBotProxy`): logs login-phase traffic, rewrites `ChangeSatelliteServerPacket` to keep Flash on `127.0.0.1`, injects **`LoginPacket`** after **`SystemInformationPacket`**, signals success on `LoginSuccessPacket`. |
-| **`bot/flash_launch.py`** | Launches Flash + `TFMProxyLoader.swf`, clicks Transformice in the loader (Windows). |
-| **`bot/ban_cli.py`** | Multi-slot orchestration: proxies, optional sequential Flash launch, waits for **`LoginSuccess`** on every slot before **`/room`**. |
+| **`bot/flash_launch.py`** | Builds **`LoginPacket.loader_url`** from `TFMProxyLoader.swf` (file path + query params); does not start Flash Player. |
+| **`bot/ban_cli.py`** | Multi-slot orchestration: proxies, waits for **`LoginSuccess`** on every slot before **`/room`**. |
 
 ## Network sequence (proxy view)
 
@@ -27,5 +27,5 @@ Failure paths commonly seen in logs: `AccountErrorPacket`, `CaptchaPacket`, `Cha
 ## References
 
 - `bot/ban_proxy.py` — packet listeners, `LoginSuccessPacket`, satellite rewrite, proxy packet login.
-- `bot/flash_launch.py` — `launch_one_flash_loader`, loader URL / SWF patch.
+- `bot/flash_launch.py` — `loader_document_url_for_row`, SWF port patch for URL metadata.
 - `bot/ban_cli.py` — slot state, `ALL_SLOTS_LOGIN_TIMEOUT_SEC` wait for all slots to log in.

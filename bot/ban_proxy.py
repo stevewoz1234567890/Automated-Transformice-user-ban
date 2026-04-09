@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 import threading
 import time
@@ -33,131 +32,6 @@ def project_root_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
-
-
-def ensure_flash_trust_config() -> tuple[Path, list[str]] | None:
-    """
-    Windows Flash Player trust for TFMProxyLoader (same idea as transformice-bot).
-
-    Returns ``(cfg_path, trusted_path_strings)`` after a successful write and read-back check,
-    else ``None``.
-    """
-    if sys.platform != "win32":
-        return None
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
-        logger.warning("APPDATA not set; skipping Flash trust cfg")
-        return None
-    trust_dir = Path(appdata) / "Macromedia" / "Flash Player" / "#Security" / "FlashPlayerTrust"
-    cfg_path = trust_dir / "TFMProxyLoader.cfg"
-
-    trusted: list[Path] = []
-    seen: set[Path] = set()
-    env_game = (os.environ.get("TRANSFORMICE_GAME_DIR") or os.environ.get("TFM_GAME_DIR") or "").strip()
-    if env_game:
-        gp = Path(env_game).expanduser().resolve()
-        if gp.is_dir() and gp not in seen:
-            seen.add(gp)
-            trusted.append(gp)
-
-    bot_root = project_root_dir().resolve()
-    if bot_root not in seen:
-        seen.add(bot_root)
-        trusted.append(bot_root)
-
-    lines: list[str] = []
-    if cfg_path.is_file():
-        try:
-            for raw in cfg_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                s = raw.strip()
-                if s and s not in lines:
-                    lines.append(s)
-        except OSError:
-            pass
-    for p in trusted:
-        ps = str(p)
-        if ps not in lines:
-            lines.append(ps)
-
-    text = "\r\n".join(lines) + "\r\n"
-    try:
-        trust_dir.mkdir(parents=True, exist_ok=True)
-        cfg_path.write_text(text, encoding="utf-8")
-    except OSError as e:
-        logger.warning("Could not write Flash trust cfg: %s", e)
-        return None
-
-    try:
-        reread = cfg_path.read_text(encoding="utf-8", errors="strict")
-    except OSError as e:
-        logger.warning("Wrote %s but could not re-read for verification: %s", cfg_path, e)
-        return cfg_path, lines
-
-    def _norm(s: str) -> str:
-        return "\n".join(x.strip() for x in s.replace("\r\n", "\n").splitlines() if x.strip())
-
-    if _norm(reread) != _norm(text):
-        logger.error(
-            "TFMProxyLoader.cfg content mismatch after write (check permissions). Path: %s",
-            cfg_path,
-        )
-        return cfg_path, lines
-
-    logger.info("Flash trust cfg written and verified: %s", cfg_path)
-    for i, entry in enumerate(lines, 1):
-        logger.info("  TFMProxyLoader.cfg [%s/%s] %s", i, len(lines), entry)
-    return cfg_path, lines
-
-
-def start_shared_flash_socket_policy_thread(
-    *,
-    port: int,
-    bind_host: str = "127.0.0.1",
-) -> threading.Thread:
-    """
-    One Flash socket-policy server for all slots.
-
-    TFMProxyLoader always calls ``Security.loadPolicyFile("xmlsocket://localhost:10801")`` (port 10801
-    in upstream). Per-slot policy ports on other TCP ports never match, so Flash blocks the game
-    socket unless this shared listener exists.
-    """
-
-    async def _serve() -> None:
-        async def _client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            try:
-                peer = None
-                try:
-                    if writer.transport is not None:
-                        peer = writer.transport.get_extra_info("peername")
-                except Exception:
-                    pass
-                logger.info("Shared Flash policy: TCP from %r → sending socket policy (port %s)", peer, port)
-                writer.write(Proxy.SOCKET_POLICY_RESPONSE)
-                await writer.drain()
-            finally:
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-
-        srv = await asyncio.start_server(_client, bind_host, port)
-        logger.info("Shared Flash socket-policy listening on %s:%s", bind_host, port)
-        await srv.serve_forever()
-
-    def _run() -> None:
-        try:
-            asyncio.run(_serve())
-        except OSError as e:
-            logger.error("Shared Flash socket-policy server failed: %s", e)
-
-    t = threading.Thread(
-        target=_run,
-        name="tfm-flash-socket-policy",
-        daemon=True,
-    )
-    t.start()
-    return t
 
 
 def normalize_nickname_tag(nickname: str) -> str:
@@ -568,8 +442,6 @@ class BanBotProxy(Proxy):
         raise NotImplementedError(f"We do not properly handle changing the main server: {packet}")
 
     async def startup(self):
-        # Flash trust is applied once in ban_cli.start_all_slots (not here — avoids 12 threads
-        # racing on the same TFMProxyLoader.cfg and WinError 32/5).
         self.main_srv = await self.open_main_server()
         self.satellite_srv = await self.open_satellite_server()
         if self.host_socket_policy_port is not None:
