@@ -222,6 +222,9 @@ def _run_slot_async(
                 upstream_connect_diag=bool(
                     getattr(cfg, "PROXY_UPSTREAM_CONNECT_DIAG", True)
                 ),
+                upstream_connect_shuffle_ports=bool(
+                    getattr(cfg, "UPSTREAM_CONNECT_SHUFFLE_PORTS", False)
+                ),
                 packet_login_auth_key_fallback=packet_login_auth_key_fallback,
                 packet_login_packet_key_sources_fallback=packet_login_packet_key_sources_fallback,
                 bootstrap_secrets=bootstrap_secrets,

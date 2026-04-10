@@ -137,6 +137,7 @@ class BanBotProxy(Proxy):
         packet_login_packet_key_sources_fallback: list | tuple | None = None,
         bootstrap_secrets: Secrets | None = None,
         login_diagnostics: bool = True,
+        upstream_connect_shuffle_ports: bool = False,
         **kwargs,
     ):
         # Flash file:// SWF + Socket: use IPv4 literal so the client never targets the public
@@ -171,6 +172,7 @@ class BanBotProxy(Proxy):
         self._login_diag = login_diagnostics
         self._login_diag_upstream_cb_seq = 0
         self._upstream_raw_chunk_logged = False
+        self._upstream_connect_shuffle_ports = upstream_connect_shuffle_ports
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(
             self._log_client_verification_challenge,
@@ -609,6 +611,22 @@ class BanBotProxy(Proxy):
         if getattr(source, "is_satellite", False):
             return
         tn = type(packet).__name__
+        if self._verbose_login_flow:
+            if tn in (
+                "HandshakePacket",
+                "LoginPacket",
+                "SystemInformationPacket",
+                "CaptchaRequestPacket",
+                "HandshakeResponsePacket",
+                "CaptchaPacket",
+                "ChangeSatelliteServerPacket",
+            ):
+                return
+            if self._during_login_wait() and tn in (
+                "ServerMessagePacket",
+                "TranslatedGeneralMessagePacket",
+            ):
+                return
         if tn in ("KeepAlivePacket", "IPSPingPacket", "PingPacket"):
             return
         direction = "→srv" if isinstance(packet, ServerboundPacket) else "srv→"
@@ -772,20 +790,25 @@ class BanBotProxy(Proxy):
 
     async def open_streams(self, address, ports):
         """
-        Same behavior as ``caseus.Proxy.open_streams`` (random port order), but log each
-        ``asyncio.open_connection`` attempt. The base implementation swallows exceptions,
-        which hides refused / timeout / firewall errors.
+        Like ``caseus.Proxy.open_streams`` but log each ``asyncio.open_connection`` attempt.
+        Port order: random shuffle when ``upstream_connect_shuffle_ports`` is True; otherwise
+        the same order as ``ports`` (put main, e.g. 11801, first in config to try it before fallbacks).
+        The base implementation swallows exceptions, which hides refused / timeout / firewall errors.
         """
         if not self._upstream_connect_diag:
             return await super().open_streams(address, ports)
 
         ports_seq = list(ports)
-        order = random.sample(ports_seq, len(ports_seq))
+        if self._upstream_connect_shuffle_ports:
+            order = random.sample(ports_seq, len(ports_seq))
+        else:
+            order = list(ports_seq)
         self._upstream_open_streams_entered = True
         logger.info(
-            "Slot %s: [login] upstream TCP: connecting to host=%r port_try_order=%s (pool=%s)",
+            "Slot %s: [login] upstream TCP: host=%r shuffle_ports=%s port_try_order=%s (pool=%s)",
             self.slot_label,
             address,
+            self._upstream_connect_shuffle_ports,
             order,
             tuple(ports_seq),
         )

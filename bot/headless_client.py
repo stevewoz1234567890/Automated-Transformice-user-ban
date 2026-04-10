@@ -219,11 +219,12 @@ def start_headless_client_threads(
     to completion before the next starts. This avoids hammering the game server with parallel
     handshakes from one host.
 
-    ``HEADLESS_LOGIN_STAGGER_SEC`` (default 0.5) is the pause **between** finishing one slot and
-    starting the next (not used for overlapping parallel starts).
+    ``HEADLESS_LOGIN_STAGGER_SEC`` (default 2.5) is the pause **between** finishing one slot and
+    starting the next (not used for overlapping parallel starts). Increase if you see WinError 121
+    on later slots (rate limiting / connect timeouts).
     """
     base = base_secrets if base_secrets is not None else load_secrets_base(cfg)
-    gap = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 0.5) or 0.0)
+    gap = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 2.5) or 0.0)
     gap = max(0.0, gap)
 
     pairs = list(zip(states, raw_accounts))
