@@ -17,6 +17,7 @@ from pathlib import Path
 import pak
 from caseus import Proxy, Secrets
 from caseus.packets import Packet, ServerboundPacket, clientbound, serverbound
+from caseus.packets.packet import ClientboundPacket
 from caseus.util.crypto import shakikoo
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ class BanBotProxy(Proxy):
         packet_login_auth_key_fallback: int | None = None,
         packet_login_packet_key_sources_fallback: list | tuple | None = None,
         bootstrap_secrets: Secrets | None = None,
+        login_diagnostics: bool = True,
         **kwargs,
     ):
         # Flash file:// SWF + Socket: use IPv4 literal so the client never targets the public
@@ -129,6 +131,8 @@ class BanBotProxy(Proxy):
         self._packet_login_auth_key_fallback = packet_login_auth_key_fallback
         self._packet_login_packet_key_sources_fallback = packet_login_packet_key_sources_fallback
         self._bootstrap_secrets = bootstrap_secrets
+        self._login_diag = login_diagnostics
+        self._login_diag_upstream_cb_seq = 0
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(
             self._log_client_verification_challenge,
@@ -152,6 +156,21 @@ class BanBotProxy(Proxy):
             self._register_verbose_login_flow_listeners()
         if log_all_main_packets:
             self.register_packet_listener(self._log_all_main_packet, Packet)
+        if self._login_diag:
+            self.register_packet_listener(
+                self._login_diag_clientbound_from_upstream,
+                ClientboundPacket,
+            )
+            self.register_packet_listener(
+                self._login_diag_after_handshake_sb,
+                serverbound.HandshakePacket,
+                after=True,
+            )
+            self.register_packet_listener(
+                self._login_diag_set_language_sb,
+                serverbound.SetLanguagePacket,
+                after=True,
+            )
 
     @staticmethod
     def _listen_stream_label(source_conn) -> str:
@@ -169,18 +188,21 @@ class BanBotProxy(Proxy):
         """Same as ``caseus.Proxy._listen_impl`` but log parse/read errors to ``log.txt``."""
         label = self._listen_stream_label(source_conn)
         while self.is_serving() and not source_conn.is_closing():
+            clean_eof = False
             try:
                 async for packet in source_conn.continuously_read_packets():
                     packet.make_immutable()
 
                     await self._listen_to_packet(source_conn, packet)
 
+                clean_eof = True
             except asyncio.CancelledError:
                 raise
             except BaseException as e:
                 logger.exception(
                     "Slot %s: [login] MAIN listen stopped on %s — %s: %s "
-                    "(often wrong packet_key_sources / game_version vs server, or truncated socket)",
+                    "(parse/decrypt vs secrets, wrong game_version, or truncated TCP; "
+                    "see [login][diag] lines if PROXY_LOGIN_DIAGNOSTICS is on)",
                     self.slot_label,
                     label,
                     type(e).__name__,
@@ -189,6 +211,89 @@ class BanBotProxy(Proxy):
                 raise
             finally:
                 await self.end_listener_tasks()
+            if clean_eof and self._login_diag:
+                self._log_listen_stream_ended_clean_eof(label)
+
+    def _log_listen_stream_ended_clean_eof(self, label: str) -> None:
+        ev = self._login_success_event
+        success = ev is not None and ev.is_set()
+        waiting = self._during_login_wait()
+        extra = ""
+        if label == "upstream(game→proxy)" and waiting and not success:
+            extra = (
+                " If Handshake was sent but no HandshakeResponse was logged, the server likely "
+                "closed without answering or bytes could not be parsed as packets."
+            )
+        log_fn = logger.warning if waiting and not success else logger.info
+        log_fn(
+            "Slot %s: [login][diag] %s read loop ended (EOF / peer closed TCP). "
+            "during_login_wait=%s login_success=%s handshake_auth_token=%s "
+            "sysinfo_received=%s login_packet_sent=%s upstream_tcp_ok=%s "
+            "upstream_clientbound_logged=%s%s",
+            self.slot_label,
+            label,
+            waiting,
+            success,
+            self._handshake_auth_token is not None,
+            self._sysinfo_received,
+            self._packet_login_sent,
+            self._upstream_tcp_established,
+            self._login_diag_upstream_cb_seq,
+            extra,
+        )
+
+    async def _login_diag_clientbound_from_upstream(self, source, packet):
+        if not self._during_login_wait():
+            return
+        if getattr(source, "is_satellite", False):
+            return
+        if type(source).__name__ != "ServerConnection":
+            return
+        tn = type(packet).__name__
+        if tn in ("KeepAlivePacket", "IPSPingPacket", "PingPacket"):
+            return
+        if isinstance(packet, clientbound.LoginSuccessPacket):
+            return
+        self._login_diag_upstream_cb_seq += 1
+        pid = getattr(packet, "id", None)
+        body = ""
+        if isinstance(packet, pak.GenericPacket):
+            body = f" generic_code={getattr(packet, 'code', None)!r}"
+        logger.info(
+            "Slot %s: [login][diag] srv→proxy #%s %s id=%s%s",
+            self.slot_label,
+            self._login_diag_upstream_cb_seq,
+            tn,
+            pid,
+            body,
+        )
+
+    async def _login_diag_after_handshake_sb(self, source, packet):
+        if getattr(source, "is_satellite", False):
+            return
+        srv = source.destination
+        if type(srv).__name__ != "ServerConnection":
+            return
+        sec = getattr(srv, "secrets", None)
+        logger.info(
+            "Slot %s: [login][diag] Handshake forwarded to upstream; server_conn ctx "
+            "game_version=%r has_packet_key_sources=%s has_verification_template=%s has_auth_key=%s",
+            self.slot_label,
+            getattr(sec, "game_version", None),
+            getattr(sec, "packet_key_sources", None) is not None,
+            getattr(sec, "client_verification_template", None) is not None,
+            getattr(sec, "auth_key", None) is not None,
+        )
+
+    async def _login_diag_set_language_sb(self, source, packet):
+        if getattr(source, "is_satellite", False):
+            return
+        if type(source).__name__ != "ClientConnection":
+            return
+        logger.info(
+            "Slot %s: [login][diag] client sent SetLanguagePacket toward server (after HandshakeResponse)",
+            self.slot_label,
+        )
 
     def _during_login_wait(self) -> bool:
         ev = self._login_success_event
@@ -245,6 +350,7 @@ class BanBotProxy(Proxy):
         if self._packet_login_task is not None and not self._packet_login_task.done():
             self._packet_login_task.cancel()
         self._packet_login_task = None
+        self._login_diag_upstream_cb_seq = 0
 
     async def _login_stall_watchdog(self) -> None:
         """Warn when the login pipeline stalls (helps diagnose silent upstream failures)."""
@@ -269,6 +375,11 @@ class BanBotProxy(Proxy):
                         f" (upstream TCP OK to {self._upstream_endpoint!r} but no HandshakeResponse — "
                         "wrong game_version/secrets, server drop, or packet parse issue)"
                     )
+                    if self._login_diag:
+                        detail += (
+                            f" [diag: upstream clientbound packets decoded before timeout="
+                            f"{self._login_diag_upstream_cb_seq}]"
+                        )
                 logger.warning(
                     "Slot %s: [login] no HandshakeResponse from upstream after 20s%s — "
                     "check UPSTREAM host/ports, game version vs secrets, firewall, or server load",
@@ -323,6 +434,12 @@ class BanBotProxy(Proxy):
             packet.auth_token,
             getattr(packet, "num_online_players", None),
         )
+        if self._login_diag and self._main_handshake_mono is not None:
+            logger.info(
+                "Slot %s: [login][diag] HandshakeResponse %.3fs after first MAIN HandshakePacket",
+                self.slot_label,
+                time.monotonic() - self._main_handshake_mono,
+            )
 
     async def _schedule_packet_login_after_sysinfo(self, source, packet):
         if getattr(source, "is_satellite", False):
@@ -728,6 +845,19 @@ class BanBotProxy(Proxy):
                 if self._bootstrap_secrets is not None:
                     server.secrets = client.secrets
 
+            if self._login_diag and self._bootstrap_secrets is not None:
+                bs = self._bootstrap_secrets
+                tok = getattr(bs, "connection_token", None) or ""
+                logger.info(
+                    "Slot %s: [login][diag] proxy legs seeded from bootstrap: game_version=%r "
+                    "connection_token_len=%s has_packet_key_sources=%s has_verification_template=%s",
+                    self.slot_label,
+                    getattr(bs, "game_version", None),
+                    len(tok) if isinstance(tok, str) else 0,
+                    getattr(bs, "packet_key_sources", None) is not None,
+                    getattr(bs, "client_verification_template", None) is not None,
+                )
+
             async with client:
                 await self.listen(client)
         except ValueError as e:
@@ -854,6 +984,12 @@ class BanBotProxy(Proxy):
         msg = f"OK  [slot {self.slot_label}] logged in as {user}"
         logger.info(msg)
         _safe_print(msg)
+        if self._login_diag:
+            logger.info(
+                "Slot %s: [login][diag] LoginSuccess — pipeline complete (session_id=%r)",
+                self.slot_label,
+                getattr(packet, "session_id", None),
+            )
         if self._login_success_event is not None:
             self._login_success_event.set()
 

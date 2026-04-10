@@ -197,6 +197,12 @@ def _run_one_slot_headless(
                 "Slot %s: [login] headless TCP session ended before LoginSuccess (disconnect or server closed)",
                 label,
             )
+            if bool(getattr(cfg, "PROXY_LOGIN_DIAGNOSTICS", True)):
+                logger.info(
+                    "Slot %s: [login][diag] headless client exited without LoginSuccess — check same slot’s "
+                    "[login][diag] lines (upstream EOF, srv→proxy packet #, HandshakeResponse timing)",
+                    label,
+                )
         else:
             logger.debug("Slot %s: headless session ended (connection closed)", label)
     except AccountError as e:

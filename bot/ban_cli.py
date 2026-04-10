@@ -204,6 +204,9 @@ def _run_slot_async(
                 log_all_main_packets=bool(
                     getattr(cfg, "PROXY_LOG_ALL_MAIN_PACKETS", False)
                 ),
+                login_diagnostics=bool(
+                    getattr(cfg, "PROXY_LOGIN_DIAGNOSTICS", True)
+                ),
                 packet_login_username=state.flash_username,
                 packet_login_password=state.flash_password,
                 packet_login_loader_url=state.packet_loader_url,
