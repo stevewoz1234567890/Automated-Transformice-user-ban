@@ -194,8 +194,7 @@ def _run_one_slot_headless(
         )
         if not state.login_success_event.is_set():
             logger.warning(
-                "Slot %s: [login] headless ended before LoginSuccess — see upstream [login][diag] "
-                "srv→ lines / HandshakeResponse / TCP errors above",
+                "Slot %s: [login] headless ended before LoginSuccess (upstream [login][diag] above)",
                 label,
             )
         else:

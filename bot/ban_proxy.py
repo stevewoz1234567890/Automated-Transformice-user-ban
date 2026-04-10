@@ -80,6 +80,43 @@ def _account_error_hint(code: int | None) -> str:
     )
 
 
+class _UpstreamDiagReader:
+    """Wrap asyncio StreamReader to log the first raw chunk from the game server (pre-parse)."""
+
+    __slots__ = ("_inner", "_proxy", "_logged")
+
+    def __init__(self, inner, proxy: object) -> None:
+        self._inner = inner
+        self._proxy = proxy
+        self._logged = False
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def _tap(self, data: bytes) -> None:
+        if self._logged or not data:
+            return
+        self._logged = True
+        self._proxy._upstream_raw_chunk_logged = True
+        if self._proxy._login_diag:
+            logger.info(
+                "Slot %s: [login][diag] upstream raw first chunk len=%s hex_head=%s",
+                self._proxy.slot_label,
+                len(data),
+                data[:48].hex(),
+            )
+
+    async def read(self, n=-1):
+        data = await self._inner.read(n)
+        self._tap(data)
+        return data
+
+    async def readexactly(self, n):
+        data = await self._inner.readexactly(n)
+        self._tap(data)
+        return data
+
+
 class BanBotProxy(Proxy):
     """One proxy port ↔ one game instance; sends slash-commands as CommandPacket (no leading /)."""
 
@@ -133,6 +170,7 @@ class BanBotProxy(Proxy):
         self._bootstrap_secrets = bootstrap_secrets
         self._login_diag = login_diagnostics
         self._login_diag_upstream_cb_seq = 0
+        self._upstream_raw_chunk_logged = False
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(
             self._log_client_verification_challenge,
@@ -179,6 +217,36 @@ class BanBotProxy(Proxy):
             return "local(client→proxy)"
         return name
 
+    async def _listen_to_packet(self, source_conn, packet):
+        """Like ``caseus.Proxy._listen_to_packet`` but run ``after=True`` listeners when a before-handler returns ``DO_NOTHING`` or ``REPLACE_PACKET`` (caseus skips them there; handshake uses ``DO_NOTHING``)."""
+        async with self.listener_task_group(listen_sequentially=source_conn._listen_sequentially) as group:
+            before_listeners = self.listeners_for_packet(packet, after=False)
+
+            async def proxy_wrapper():
+                results = await asyncio.gather(
+                    *[listener(source_conn, packet) for listener in before_listeners]
+                )
+
+                if self.DO_NOTHING in results:
+                    await self._invoke_after_packet_listeners(source_conn, packet)
+                    return
+
+                if self.REPLACE_PACKET in results:
+                    await source_conn.destination._replace_packet(packet)
+                    await self._invoke_after_packet_listeners(source_conn, packet)
+                    return
+
+                await source_conn.destination.write_packet_instance(packet)
+                await self._invoke_after_packet_listeners(source_conn, packet)
+
+            group.create_task(proxy_wrapper())
+
+    async def _invoke_after_packet_listeners(self, source_conn, packet) -> None:
+        after_listeners = self.listeners_for_packet(packet, after=True)
+        if not after_listeners:
+            return
+        await asyncio.gather(*[listener(source_conn, packet) for listener in after_listeners])
+
     async def _listen_impl(self, source_conn):
         """Same as ``caseus.Proxy._listen_impl`` but log parse/read errors to ``log.txt``."""
         label = self._listen_stream_label(source_conn)
@@ -195,9 +263,9 @@ class BanBotProxy(Proxy):
                 raise
             except BaseException as e:
                 logger.exception(
-                    "Slot %s: [login] MAIN listen stopped on %s — %s: %s "
+                    "Slot %s: [login] MAIN listen stopped on %s - %s: %s "
                     "(parse/decrypt vs secrets, wrong game_version, or truncated TCP; "
-                    "see [login][diag] lines if PROXY_LOGIN_DIAGNOSTICS is on)",
+                    "see [login][diag] if PROXY_LOGIN_DIAGNOSTICS is on)",
                     self.slot_label,
                     label,
                     type(e).__name__,
@@ -222,13 +290,15 @@ class BanBotProxy(Proxy):
             return
         extra = ""
         if label == "upstream(game→proxy)" and waiting and not success:
-            extra = (
-                " | if srv→proxy count=0 after Handshake: server closed with no reply or parse never saw a full packet"
-            )
+            if self._login_diag_upstream_cb_seq == 0 and not self._upstream_raw_chunk_logged:
+                extra = " | zero bytes from server before close - likely RST/FIN after handshake reject"
+            elif self._login_diag_upstream_cb_seq == 0:
+                extra = " | raw bytes seen but no full clientbound packet (length/parse mismatch vs secrets?)"
+            else:
+                extra = " | see srv->proxy packet lines above"
         log_fn = logger.warning if waiting and not success else logger.info
         log_fn(
-            "Slot %s: [login][diag] %s TCP closed. login_ok=%s hs_resp=%s sysinfo=%s login_sent=%s "
-            "srv_packets=%s%s",
+            "Slot %s: [login][diag] %s TCP closed. login_ok=%s hs_resp=%s sysinfo=%s login_sent=%s srv_packets=%s%s",
             self.slot_label,
             label,
             success,
@@ -341,6 +411,7 @@ class BanBotProxy(Proxy):
             self._packet_login_task.cancel()
         self._packet_login_task = None
         self._login_diag_upstream_cb_seq = 0
+        self._upstream_raw_chunk_logged = False
 
     async def _login_stall_watchdog(self) -> None:
         """Warn when the login pipeline stalls (helps diagnose silent upstream failures)."""
@@ -837,6 +908,8 @@ class BanBotProxy(Proxy):
                     await client.wait_closed()
                     raise
 
+                if self._login_diag:
+                    server_reader = _UpstreamDiagReader(server_reader, self)
                 server = self.ServerConnection(
                     self, destination=client, reader=server_reader, writer=server_writer
                 )
@@ -851,9 +924,8 @@ class BanBotProxy(Proxy):
             err_s = str(e)
             if "Unable to connect" in err_s:
                 logger.error(
-                    "Slot %s: [login] upstream TCP failed: %s — if winerror=121 use "
-                    "`python -m bot.upstream_probe <host> <ports>`; otherwise check tfm-secrets / "
-                    "UPSTREAM_SERVER_* in bot/config.py.",
+                    "Slot %s: [login] upstream TCP failed: %s - if winerror=121 use "
+                    "`python -m bot.upstream_probe <host> <ports>`; else tfm-secrets / UPSTREAM_SERVER_*.",
                     self.slot_label,
                     err_s,
                 )
