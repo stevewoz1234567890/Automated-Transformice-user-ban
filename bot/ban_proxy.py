@@ -166,11 +166,6 @@ class BanBotProxy(Proxy):
                 serverbound.HandshakePacket,
                 after=True,
             )
-            self.register_packet_listener(
-                self._login_diag_set_language_sb,
-                serverbound.SetLanguagePacket,
-                after=True,
-            )
 
     @staticmethod
     def _listen_stream_label(source_conn) -> str:
@@ -218,26 +213,28 @@ class BanBotProxy(Proxy):
         ev = self._login_success_event
         success = ev is not None and ev.is_set()
         waiting = self._during_login_wait()
+        if label == "local(client→proxy)":
+            if waiting and not success:
+                logger.debug(
+                    "Slot %s: [login][diag] local client disconnected (upstream failure or headless exit)",
+                    self.slot_label,
+                )
+            return
         extra = ""
         if label == "upstream(game→proxy)" and waiting and not success:
             extra = (
-                " If Handshake was sent but no HandshakeResponse was logged, the server likely "
-                "closed without answering or bytes could not be parsed as packets."
+                " | if srv→proxy count=0 after Handshake: server closed with no reply or parse never saw a full packet"
             )
         log_fn = logger.warning if waiting and not success else logger.info
         log_fn(
-            "Slot %s: [login][diag] %s read loop ended (EOF / peer closed TCP). "
-            "during_login_wait=%s login_success=%s handshake_auth_token=%s "
-            "sysinfo_received=%s login_packet_sent=%s upstream_tcp_ok=%s "
-            "upstream_clientbound_logged=%s%s",
+            "Slot %s: [login][diag] %s TCP closed. login_ok=%s hs_resp=%s sysinfo=%s login_sent=%s "
+            "srv_packets=%s%s",
             self.slot_label,
             label,
-            waiting,
             success,
             self._handshake_auth_token is not None,
             self._sysinfo_received,
             self._packet_login_sent,
-            self._upstream_tcp_established,
             self._login_diag_upstream_cb_seq,
             extra,
         )
@@ -275,24 +272,17 @@ class BanBotProxy(Proxy):
         if type(srv).__name__ != "ServerConnection":
             return
         sec = getattr(srv, "secrets", None)
+        tok = (getattr(sec, "connection_token", None) or "") if sec is not None else ""
+        tok_n = len(tok) if isinstance(tok, str) else 0
         logger.info(
-            "Slot %s: [login][diag] Handshake forwarded to upstream; server_conn ctx "
-            "game_version=%r has_packet_key_sources=%s has_verification_template=%s has_auth_key=%s",
+            "Slot %s: [login][diag] Handshake→upstream ctx game_version=%r token_len=%s "
+            "keys=%s verif_tpl=%s auth_key=%s",
             self.slot_label,
             getattr(sec, "game_version", None),
+            tok_n,
             getattr(sec, "packet_key_sources", None) is not None,
             getattr(sec, "client_verification_template", None) is not None,
             getattr(sec, "auth_key", None) is not None,
-        )
-
-    async def _login_diag_set_language_sb(self, source, packet):
-        if getattr(source, "is_satellite", False):
-            return
-        if type(source).__name__ != "ClientConnection":
-            return
-        logger.info(
-            "Slot %s: [login][diag] client sent SetLanguagePacket toward server (after HandshakeResponse)",
-            self.slot_label,
         )
 
     def _during_login_wait(self) -> bool:
@@ -729,6 +719,7 @@ class BanBotProxy(Proxy):
             tuple(ports_seq),
         )
         last_exc: BaseException | None = None
+        logged_win121_hint = False
         for port in order:
             try:
                 t0 = time.monotonic()
@@ -759,6 +750,15 @@ class BanBotProxy(Proxy):
                         v = getattr(e, name, None)
                         if v is not None:
                             extra += f" {name}={v}"
+                    if getattr(e, "winerror", None) == 121 and not logged_win121_hint:
+                        logged_win121_hint = True
+                        logger.warning(
+                            "Slot %s: [login] winerror=121: TCP connect timed out (firewall/VPN/path). "
+                            "Not fixed by tfm-secrets. Run `python -m bot.upstream_probe %s %s`.",
+                            self.slot_label,
+                            address,
+                            " ".join(str(p) for p in ports_seq),
+                        )
                 logger.warning(
                     "Slot %s: [login] upstream TCP attempt failed %s:%s — %s: %s%s",
                     self.slot_label,
@@ -845,28 +845,15 @@ class BanBotProxy(Proxy):
                 if self._bootstrap_secrets is not None:
                     server.secrets = client.secrets
 
-            if self._login_diag and self._bootstrap_secrets is not None:
-                bs = self._bootstrap_secrets
-                tok = getattr(bs, "connection_token", None) or ""
-                logger.info(
-                    "Slot %s: [login][diag] proxy legs seeded from bootstrap: game_version=%r "
-                    "connection_token_len=%s has_packet_key_sources=%s has_verification_template=%s",
-                    self.slot_label,
-                    getattr(bs, "game_version", None),
-                    len(tok) if isinstance(tok, str) else 0,
-                    getattr(bs, "packet_key_sources", None) is not None,
-                    getattr(bs, "client_verification_template", None) is not None,
-                )
-
             async with client:
                 await self.listen(client)
         except ValueError as e:
             err_s = str(e)
             if "Unable to connect" in err_s:
                 logger.error(
-                    "Slot %s: [login] upstream TCP failed: %s — refresh tfm-secrets for the "
-                    "current game build; check firewall/VPN; optionally set "
-                    "UPSTREAM_SERVER_ADDRESS and UPSTREAM_SERVER_PORTS in bot/config.py (try main port 11801).",
+                    "Slot %s: [login] upstream TCP failed: %s — if winerror=121 use "
+                    "`python -m bot.upstream_probe <host> <ports>`; otherwise check tfm-secrets / "
+                    "UPSTREAM_SERVER_* in bot/config.py.",
                     self.slot_label,
                     err_s,
                 )
@@ -984,12 +971,6 @@ class BanBotProxy(Proxy):
         msg = f"OK  [slot {self.slot_label}] logged in as {user}"
         logger.info(msg)
         _safe_print(msg)
-        if self._login_diag:
-            logger.info(
-                "Slot %s: [login][diag] LoginSuccess — pipeline complete (session_id=%r)",
-                self.slot_label,
-                getattr(packet, "session_id", None),
-            )
         if self._login_success_event is not None:
             self._login_success_event.set()
 

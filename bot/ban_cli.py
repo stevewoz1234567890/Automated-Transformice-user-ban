@@ -33,6 +33,7 @@ from caseus import Secrets
 from .ban_proxy import BanBotProxy
 from . import flash_launch
 from .headless_client import load_secrets_base, start_headless_client_threads
+from .upstream_probe import run_upstream_tcp_probe
 from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
 
 logger = logging.getLogger(__name__)
@@ -534,6 +535,10 @@ def main(argv: list[str] | None = None) -> None:
         packet_login_packet_key_sources_fallback=packet_key_sources_fallback,
         bootstrap_secrets=base_secrets if headless_auto else None,
     )
+
+    if headless_auto and upstream_addr and upstream_ports:
+        if bool(getattr(cfg, "UPSTREAM_TCP_PROBE_BEFORE_HEADLESS", True)):
+            run_upstream_tcp_probe(upstream_addr, upstream_ports, cfg)
 
     if headless_auto:
         start_headless_client_threads(

@@ -12,6 +12,8 @@ UPSTREAM_SERVER_ADDRESS = "51.38.60.113"
 UPSTREAM_SERVER_PORTS = (11801, 12801, 13801, 14801)
 ```
 
+Before headless login, the bot runs a **parallel TCP-only probe** to those ports (toggle with `UPSTREAM_TCP_PROBE_BEFORE_HEADLESS` in config; timeout `UPSTREAM_PROBE_TIMEOUT_SEC`). To test manually: `python -m bot.upstream_probe 51.38.60.113 11801 12801 13801 14801`. Windows **WinError 121** is a **connect timeout** (firewall/VPN/path), not a tfm-secrets problem.
+
 **Manual connector:** omit `--headless` and keep **`HEADLESS_AUTO_LOGIN`** false; attach your own client to each slot’s main port.
 
 ## What you need
