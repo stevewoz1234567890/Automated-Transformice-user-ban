@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from colorama import init as colorama_init
+from caseus import Secrets
 
 from .ban_proxy import BanBotProxy
 from . import flash_launch
@@ -186,6 +187,7 @@ def _run_slot_async(
     main_server_ports: tuple[int, ...] | None = None,
     packet_login_auth_key_fallback: int | None = None,
     packet_login_packet_key_sources_fallback: list | tuple | None = None,
+    bootstrap_secrets: Secrets | None = None,
 ) -> None:
     async def _run():
         try:
@@ -218,6 +220,7 @@ def _run_slot_async(
                 ),
                 packet_login_auth_key_fallback=packet_login_auth_key_fallback,
                 packet_login_packet_key_sources_fallback=packet_login_packet_key_sources_fallback,
+                bootstrap_secrets=bootstrap_secrets,
             )
             state.proxy = proxy
             await proxy.startup()
@@ -243,6 +246,7 @@ def start_all_slots(
     main_server_ports: tuple[int, ...] | None = None,
     packet_login_auth_key_fallback: int | None = None,
     packet_login_packet_key_sources_fallback: list | tuple | None = None,
+    bootstrap_secrets: Secrets | None = None,
 ) -> None:
     for s in states:
         for role, p in (
@@ -266,6 +270,7 @@ def start_all_slots(
                 "main_server_ports": main_server_ports,
                 "packet_login_auth_key_fallback": packet_login_auth_key_fallback,
                 "packet_login_packet_key_sources_fallback": packet_login_packet_key_sources_fallback,
+                "bootstrap_secrets": bootstrap_secrets,
             },
             name=f"tfm-ban-{s.port}",
             daemon=True,
@@ -524,6 +529,7 @@ def main(argv: list[str] | None = None) -> None:
         main_server_ports=upstream_ports,
         packet_login_auth_key_fallback=auth_key_fallback,
         packet_login_packet_key_sources_fallback=packet_key_sources_fallback,
+        bootstrap_secrets=base_secrets if headless_auto else None,
     )
 
     if headless_auto:

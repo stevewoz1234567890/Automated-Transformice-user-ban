@@ -24,7 +24,7 @@ from typing import Any
 import pak
 from caseus import Secrets
 from caseus.clients.client import AccountError, Client
-from caseus.packets import clientbound
+from caseus.packets import clientbound, serverbound
 from caseus.util.crypto import shakikoo
 
 logger = logging.getLogger(__name__)
@@ -80,10 +80,49 @@ class HeadlessProxyClient(Client):
     ) -> None:
         super().__init__(**kwargs)
         self._login_success_event = login_success_event
+        self._sysinfo_after_verification_pending = False
 
     async def login(self) -> None:
         """Do not send ``LoginPacket`` — ``BanBotProxy`` injects it after ``SystemInformationPacket``."""
         return
+
+    async def _emit_system_information_and_steam(self) -> None:
+        await self.main.write_packet(
+            serverbound.SystemInformationPacket,
+            language=self.system_language,
+            os=self.OS,
+            flash_version=self.FLASH_VERSION,
+        )
+        if self.steam_id is not None:
+            await self.main.write_packet(
+                serverbound.SteamInfoPacket,
+                user_id=self.steam_id,
+            )
+
+    @pak.packet_listener(clientbound.HandshakeResponsePacket)
+    async def _on_handshake_response(self, server, packet):
+        self.auth_token = packet.auth_token
+        await self.set_desired_language(fallback=packet.language)
+        if self.secrets.client_verification_template is not None:
+            self._sysinfo_after_verification_pending = True
+            return
+        await self._emit_system_information_and_steam()
+
+    @pak.packet_listener(clientbound.ClientVerificationPacket)
+    async def _on_client_verification(self, server, packet):
+        if self.secrets.client_verification_template is not None:
+            await self.main.write_packet(
+                serverbound.ClientVerificationPacket,
+                ciphered_data=self.secrets.client_verification_data(
+                    packet.verification_token,
+                    ctx=self.main.ctx,
+                ),
+            )
+        if self._sysinfo_after_verification_pending:
+            self._sysinfo_after_verification_pending = False
+            await self._emit_system_information_and_steam()
+        if self.username is not None:
+            await self.login()
 
     @pak.packet_listener(clientbound.LoginSuccessPacket)
     async def _on_login_success(self, server, packet):
@@ -113,16 +152,13 @@ async def _run_one_client(
     await client.start()
 
 
-def _slot_thread_main(
+def _run_one_slot_headless(
     *,
     state: Any,
     row: dict[str, object],
     cfg: object,
     base_secrets: Secrets,
-    stagger_sec: float,
 ) -> None:
-    if stagger_sec > 0:
-        time.sleep(stagger_sec)
     label = state.label
     main_port = state.port
     connect_host = state.proxy_bind_host if state.proxy_bind_host else "127.0.0.1"
@@ -178,23 +214,20 @@ def start_headless_client_threads(
     *,
     base_secrets: Secrets | None = None,
 ) -> None:
-    """Spawn one daemon thread per slot; each runs ``asyncio.run(HeadlessProxyClient.start())``."""
-    base = base_secrets if base_secrets is not None else load_secrets_base(cfg)
-    stagger = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 0.5) or 0.0)
-    stagger = max(0.0, stagger)
+    """
+    Run headless TCP login **one slot at a time** (main thread): each ``HeadlessProxyClient`` runs
+    to completion before the next starts. This avoids hammering the game server with parallel
+    handshakes from one host.
 
-    for i, (state, row) in enumerate(zip(states, raw_accounts)):
-        delay = stagger * i
-        t = threading.Thread(
-            target=_slot_thread_main,
-            kwargs={
-                "state": state,
-                "row": row,
-                "cfg": cfg,
-                "base_secrets": base,
-                "stagger_sec": delay,
-            },
-            name=f"headless-{state.label}",
-            daemon=True,
-        )
-        t.start()
+    ``HEADLESS_LOGIN_STAGGER_SEC`` (default 0.5) is the pause **between** finishing one slot and
+    starting the next (not used for overlapping parallel starts).
+    """
+    base = base_secrets if base_secrets is not None else load_secrets_base(cfg)
+    gap = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 0.5) or 0.0)
+    gap = max(0.0, gap)
+
+    pairs = list(zip(states, raw_accounts))
+    for i, (state, row) in enumerate(pairs):
+        if i > 0 and gap > 0:
+            time.sleep(gap)
+        _run_one_slot_headless(state=state, row=row, cfg=cfg, base_secrets=base)

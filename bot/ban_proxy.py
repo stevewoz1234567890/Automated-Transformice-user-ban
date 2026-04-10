@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import pak
-from caseus import Proxy
+from caseus import Proxy, Secrets
 from caseus.packets import Packet, ServerboundPacket, clientbound, serverbound
 from caseus.util.crypto import shakikoo
 
@@ -97,6 +97,7 @@ class BanBotProxy(Proxy):
         upstream_connect_diag: bool = True,
         packet_login_auth_key_fallback: int | None = None,
         packet_login_packet_key_sources_fallback: list | tuple | None = None,
+        bootstrap_secrets: Secrets | None = None,
         **kwargs,
     ):
         # Flash file:// SWF + Socket: use IPv4 literal so the client never targets the public
@@ -127,6 +128,7 @@ class BanBotProxy(Proxy):
         self._upstream_endpoint: tuple[str, int] | None = None
         self._packet_login_auth_key_fallback = packet_login_auth_key_fallback
         self._packet_login_packet_key_sources_fallback = packet_login_packet_key_sources_fallback
+        self._bootstrap_secrets = bootstrap_secrets
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(
             self._log_client_verification_challenge,
@@ -704,7 +706,30 @@ class BanBotProxy(Proxy):
             self._login_watchdog_task.cancel()
         self._login_watchdog_task = asyncio.create_task(self._login_stall_watchdog())
         try:
-            await super().new_main_connection(client_reader, client_writer)
+            client = self.ClientConnection(self, reader=client_reader, writer=client_writer)
+            if self._bootstrap_secrets is not None:
+                client.secrets = self._bootstrap_secrets.copy()
+
+            if self.main_server_address is not None and self.main_server_ports is not None:
+                try:
+                    server_reader, server_writer = await self.open_streams(
+                        self.main_server_address, self.main_server_ports
+                    )
+                except ValueError:
+                    client.close()
+                    await client.wait_closed()
+                    raise
+
+                server = self.ServerConnection(
+                    self, destination=client, reader=server_reader, writer=server_writer
+                )
+                client.destination = server
+                client.main.server = server
+                if self._bootstrap_secrets is not None:
+                    server.secrets = client.secrets
+
+            async with client:
+                await self.listen(client)
         except ValueError as e:
             err_s = str(e)
             if "Unable to connect" in err_s:
