@@ -1,16 +1,18 @@
 """
 CMD entry: multi-slot local proxies, /room on all clients, then staggered /ban.
 
-Enable automatic TCP login by setting ``HEADLESS_AUTO_LOGIN = True`` in ``bot/config.py`` or running
+Enable automatic TCP login with ``BOT_HEADLESS_AUTO_LOGIN=true`` in repo-root ``.env`` or by running
 ``python -m bot --headless``. That starts one **caseus** client per slot to each local proxy port
 (``HandshakePacket`` + ``SystemInformationPacket``); the proxy injects ``LoginPacket`` (see ``ban_proxy``).
-Requires repo-root ``.env`` with ``TFM_SECRETS_*`` vars (see ``.env.example``), or ``HEADLESS_SECRETS_INLINE``,
-or ``HEADLESS_SECRETS_DUMPER`` (subprocess prints JSON to stdout; no secret files). Optional
-``PIP_INSTALL_TFM_SECRETS_CLI`` + ``TFM_SECRETS_PIP_INSTALL_SPEC``; upstream from the dump or
-``UPSTREAM_SERVER_*`` (``UPSTREAM_FROM_SECRETS_DUMP_ONLY``, ``UPSTREAM_PORTS_MATCH_DUMP_ORDER``).
+Requires ``TFM_SECRETS_*`` in ``.env`` (see ``.env.example``), or ``BOT_HEADLESS_SECRETS_INLINE_JSON``,
+or ``BOT_HEADLESS_SECRETS_DUMPER`` (subprocess prints JSON to stdout; no secret files). Optional
+``BOT_PIP_INSTALL_TFM_SECRETS_CLI`` + ``BOT_TFM_SECRETS_PIP_INSTALL_SPEC``; upstream from the dump or
+``BOT_UPSTREAM_SERVER_*`` (``BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY``, ``BOT_UPSTREAM_PORTS_MATCH_DUMP_ORDER``).
+
+On startup the bot creates ``.env`` from ``.env.example`` when missing and appends default ``BOT_*`` keys.
 
 Use ``python -m bot --no-headless`` to force external connectors only. Row ``bind_ip`` is for Proxifier
-unless ``PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is True and that IP exists on this machine.
+unless ``BOT_PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is true and that IP exists on this machine.
 
 Loader URL fields for ``LoginPacket`` are built from ``TFMProxyLoader.swf`` metadata (see ``flash_launch``).
 """
@@ -19,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import importlib.util
 import logging
 import random
 import sys
@@ -34,6 +35,7 @@ from caseus import Secrets
 
 from .ban_proxy import BanBotProxy
 from . import flash_launch
+from .env_setup import load_bot_config, repo_root
 from .headless_client import load_secrets_base, resolve_headless_upstream, start_headless_client_threads
 from .upstream_probe import run_upstream_tcp_probe
 from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
@@ -72,42 +74,6 @@ def _pick_free_port(preferred: int, used: set[int], *, role: str, label: str) ->
     )
     logger.error(msg)
     raise SystemExit(msg)
-
-
-def _repo_root() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
-
-
-def _load_accounts_module():
-    if getattr(sys, "frozen", False):
-        path = _repo_root() / "bot" / "config.py"
-        if not path.is_file():
-            logger.error(
-                "Missing %s. Create bot/config.py beside this program (same layout as the repo).",
-                path,
-            )
-            raise SystemExit(1)
-        spec = importlib.util.spec_from_file_location("bot.config", path)
-        if spec is None or spec.loader is None:
-            logger.error("Could not load config from %s", path)
-            raise SystemExit(1)
-        cfg = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cfg)
-    else:
-        try:
-            import bot.config as cfg  # type: ignore
-        except ImportError as e:
-            logger.error(
-                "Missing bot.config. Create bot/config.py with ACCOUNTS (see README).",
-            )
-            raise SystemExit(1) from e
-    accounts = getattr(cfg, "ACCOUNTS", None)
-    if not accounts:
-        logger.error("config.ACCOUNTS is empty.")
-        raise SystemExit(1)
-    return cfg
 
 
 @dataclass
@@ -174,7 +140,7 @@ def _configure_logging() -> None:
     stderr_h.setFormatter(fmt)
     root.addHandler(stderr_h)
 
-    log_path = _repo_root() / "log.txt"
+    log_path = repo_root() / "log.txt"
     file_h = logging.FileHandler(log_path, encoding="utf-8", mode="a")
     file_h.setFormatter(fmt)
     root.addHandler(file_h)
@@ -371,12 +337,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         "--headless",
         action="store_true",
-        help="Start built-in caseus TCP clients per slot (needs HEADLESS_SECRETS_INLINE, dumper, or JSON + upstream).",
+        help="Start built-in caseus TCP clients per slot (needs TFM_SECRETS_* / inline JSON / dumper + upstream).",
     )
     p.add_argument(
         "--no-headless",
         action="store_true",
-        help="Do not start built-in caseus TCP clients (overrides config HEADLESS_AUTO_LOGIN).",
+        help="Do not start built-in caseus TCP clients (overrides BOT_HEADLESS_AUTO_LOGIN).",
     )
     return p.parse_args(argv)
 
@@ -402,7 +368,7 @@ def main(argv: list[str] | None = None) -> None:
                     pass
     _configure_logging()
     args = _parse_args(argv)
-    cfg = _load_accounts_module()
+    cfg = load_bot_config()
 
     this_exe = Path(sys.executable).resolve()
     allow_kill = not args.no_kill_stale
@@ -491,7 +457,7 @@ def main(argv: list[str] | None = None) -> None:
             else st.policy_port
         )
         row_dict["_flash_connect_host"] = st.proxy_bind_host if st.proxy_bind_host else "127.0.0.1"
-        st.packet_loader_url = flash_launch.loader_document_url_for_row(row_dict, _repo_root()) or ""
+        st.packet_loader_url = flash_launch.loader_document_url_for_row(row_dict, repo_root()) or ""
 
     headless_auto = (
         (bool(getattr(cfg, "HEADLESS_AUTO_LOGIN", False)) or args.headless)
@@ -507,7 +473,7 @@ def main(argv: list[str] | None = None) -> None:
         if not upstream_addr or not upstream_ports:
             logger.error(
                 "HEADLESS_AUTO_LOGIN needs server_address and server_ports from the live secrets dump "
-                "or set UPSTREAM_SERVER_ADDRESS and UPSTREAM_SERVER_PORTS in config."
+                "or set BOT_UPSTREAM_SERVER_ADDRESS and BOT_UPSTREAM_SERVER_PORTS in .env."
             )
             raise SystemExit(1)
         logger.info(

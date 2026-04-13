@@ -2,22 +2,22 @@
 
 **Git branch:** `cmd-option-a` (Git disallows a branch `cmd/option-a` while a branch named `cmd` exists — use `cmd-option-a` instead.)
 
-The bot **never** starts Flash Player or `TFMProxyLoader.swf`. The proxy **always** sends **`LoginPacket`** after **`SystemInformationPacket`** using credentials from `bot/config.py`. The **`LoginPacket.loader_url`** string is still built from **`TFMProxyLoader.swf`** on disk (same metadata a real loader would use); that is not the same as launching Flash.
+The bot **never** starts Flash Player or `TFMProxyLoader.swf`. The proxy **always** sends **`LoginPacket`** after **`SystemInformationPacket`** using credentials from **`BOT_ACCOUNTS_JSON`** in repo-root **`.env`**. The **`LoginPacket.loader_url`** string is still built from **`TFMProxyLoader.swf`** on disk (same metadata a real loader would use); that is not the same as launching Flash.
 
 ## Prerequisites
 
 - Python 3.10+ and `pip install -r requirements.txt` (see root `README.md`).
-- `bot/config.py` with **`ACCOUNTS`** rows: each slot needs **`proxy_port`**, **`username`**, **`password`**, and optional **`label`** / **`bind_ip`**.
-- **Either** enable **headless TCP** (`python -m bot --headless` or `HEADLESS_AUTO_LOGIN = True`) with **`.env` (`TFM_SECRETS_*`)**, **`HEADLESS_SECRETS_INLINE`**, or **`HEADLESS_SECRETS_DUMPER`**, **or** connect each slot yourself to MAIN TCP (`127.0.0.1:<proxy_port>`) through **`SystemInformationPacket`** (external client, Ruffle, etc.).
+- **`.env`** with **`BOT_ACCOUNTS_JSON`**: each slot needs **`proxy_port`**, **`username`**, **`password`**, and optional **`label`** / **`bind_ip`**. The first run copies **`.env.example`** → **`.env`** when missing and merges default **`BOT_*`** keys.
+- **Either** enable **headless TCP** (`python -m bot --headless` or **`BOT_HEADLESS_AUTO_LOGIN=true`**) with **`.env` (`TFM_SECRETS_*`)**, **`BOT_HEADLESS_SECRETS_INLINE_JSON`**, or **`BOT_HEADLESS_SECRETS_DUMPER`**, **or** connect each slot yourself to MAIN TCP (`127.0.0.1:<proxy_port>`) through **`SystemInformationPacket`** (external client, Ruffle, etc.).
 
 ## Configuration
 
-In **`bot/config.py`**:
+In **`.env`** (see **`.env.example`**):
 
-1. **`PACKET_LOGIN_DELAY_SEC`** / **`PACKET_LOGIN_START_ROOM`** — optional tuning for the injected login.
-2. **`ALL_SLOTS_LOGIN_TIMEOUT_SEC`** — max time to wait for **every** slot to show **`LoginSuccess`** before the ban prompt (no “press Enter when ready”).
+1. **`BOT_PACKET_LOGIN_DELAY_SEC`** / **`BOT_PACKET_LOGIN_START_ROOM`** — optional tuning for the injected login.
+2. **`BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC`** — max time to wait for **every** slot to show **`LoginSuccess`** before the ban prompt (no “press Enter when ready”).
 
-Optional: **`PROXY_VERBOSE_LOGIN_FLOW`**, **`SHARED_FLASH_SOCKET_POLICY_PORT`** (number embedded in **`loader_url`** only), etc.
+Optional: **`BOT_PROXY_VERBOSE_LOGIN_FLOW`**, **`BOT_SHARED_FLASH_SOCKET_POLICY_PORT`** (number embedded in **`loader_url`** only), etc.
 
 ## Command line
 
@@ -27,7 +27,7 @@ From the repository root:
 .\venv\Scripts\python.exe -m bot --headless
 ```
 
-Or with the frozen exe (from repo root, next to `bot\config.py`):
+Or with the frozen exe (from repo root, next to **`.env`** / **`.env.example`**):
 
 ```powershell
 .\ban_bot.exe --headless
@@ -35,7 +35,7 @@ Or with the frozen exe (from repo root, next to `bot\config.py`):
 
 Flags:
 
-- **`--headless`** — start built-in caseus clients (needs `.env` / `TFM_SECRETS_*`, inline secrets, or dumper; optional `UPSTREAM_SERVER_*`).
+- **`--headless`** — start built-in caseus clients (needs `.env` / `TFM_SECRETS_*`, inline secrets, or dumper; optional **`BOT_UPSTREAM_SERVER_*`**).
 - **`--no-headless`** — never start built-in clients (use an external connector).
 - **`--no-kill-stale`** — optional; do not kill processes already on your proxy ports.
 

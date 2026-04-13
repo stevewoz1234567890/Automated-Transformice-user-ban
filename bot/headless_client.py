@@ -6,7 +6,7 @@ Secrets (no ``tfm-secrets.json`` in this flow):
 1. Optional ``HEADLESS_SECRETS_DUMPER`` — run a subprocess that prints tfm-secrets JSON on stdout;
    parsed in memory only.
 2. Variables from the process environment, after loading repo-root ``.env`` (``TFM_SECRETS_*``).
-3. ``HEADLESS_SECRETS_INLINE`` dict in ``bot/config.py``.
+3. ``BOT_HEADLESS_SECRETS_INLINE_JSON`` (or ``HEADLESS_SECRETS_INLINE`` on ``cfg`` from ``.env``).
 
 Each client uses ``Secrets.copy(server_address=..., server_ports=(...))`` to target ``127.0.0.1:<proxy_port>``.
 The proxy injects ``LoginPacket`` after ``SystemInformationPacket``; this client must **not** send
@@ -29,6 +29,8 @@ from typing import Any
 
 import pak
 from caseus import Secrets
+
+from .env_setup import load_dotenv_file, repo_root
 from caseus.clients.client import AccountError, Client
 from caseus.packets import clientbound, serverbound
 from caseus.util.crypto import shakikoo
@@ -36,70 +38,12 @@ from caseus.util.crypto import shakikoo
 logger = logging.getLogger(__name__)
 
 
-def _secrets_repo_root() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
-
-
-def _load_dotenv_file(path: Path) -> None:
-    """Minimal KEY=VAL loader (no python-dotenv). Does not override keys already in ``os.environ``."""
-    if not path.is_file():
-        return
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        logger.warning("Could not read .env file %s", path)
-        return
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.lower().startswith("export "):
-            line = line[7:].strip()
-        if "=" not in line:
-            continue
-        key, _, rest = line.partition("=")
-        key = key.strip()
-        if not key:
-            continue
-        val = rest.strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
-            val = val[1:-1]
-        if key not in os.environ:
-            os.environ[key] = val
-
-
 def _resolved_dotenv_path(cfg: object) -> Path:
     rel = getattr(cfg, "HEADLESS_SECRETS_DOTENV_PATH", ".env")
     p = Path(str(rel).strip()).expanduser()
     if not p.is_absolute():
-        p = (_secrets_repo_root() / p).resolve()
+        p = (repo_root() / p).resolve()
     return p
-
-
-def _maybe_seed_dotenv_from_example(cfg: object) -> None:
-    """If ``.env`` is missing and ``.env.example`` exists, copy it once so users can fill values."""
-    if not getattr(cfg, "HEADLESS_SECRETS_SEED_DOTENV_FROM_EXAMPLE", True):
-        return
-    dot = _resolved_dotenv_path(cfg)
-    if dot.is_file():
-        return
-    ex = _secrets_repo_root() / ".env.example"
-    if not ex.is_file():
-        return
-    try:
-        dot.write_text(ex.read_text(encoding="utf-8"), encoding="utf-8")
-        logger.warning(
-            "Created %s from .env.example — fill TFM_SECRETS_* and run again.",
-            dot,
-        )
-    except OSError as e:
-        logger.warning("Could not create .env from .env.example: %s", e)
-
-
-def _load_dotenv_for_headless(cfg: object) -> None:
-    _load_dotenv_file(_resolved_dotenv_path(cfg))
 
 
 def _secrets_from_config_inline(cfg: object) -> Secrets | None:
@@ -115,7 +59,7 @@ def _secrets_from_config_inline(cfg: object) -> Secrets | None:
         )
         return None
     logger.info(
-        "Using HEADLESS_SECRETS_INLINE from config (fields: %s).",
+        "Using HEADLESS_SECRETS_INLINE from .env (fields: %s).",
         tuple(sorted(kwargs.keys())),
     )
     return Secrets(**kwargs)
@@ -261,8 +205,7 @@ def _secrets_from_env(cfg: object) -> Secrets | None:
 
 def load_secrets_base(cfg: object) -> Secrets:
     """Load server crypto: optional dumper (stdout JSON), then ``.env`` / env vars, then inline dict."""
-    _maybe_seed_dotenv_from_example(cfg)
-    _load_dotenv_for_headless(cfg)
+    load_dotenv_file(_resolved_dotenv_path(cfg))
 
     dumper = getattr(cfg, "HEADLESS_SECRETS_DUMPER", None)
     dumper_nonempty = False
@@ -283,7 +226,7 @@ def load_secrets_base(cfg: object) -> Secrets:
         bindir = Path(sys.executable).resolve().parent
         logger.warning(
             "HEADLESS_SECRETS_DUMPER is set but did not yield secrets (missing binary, failure, or timeout). "
-            "Checked PATH and %s for .exe/.cmd. Falling back to .env / HEADLESS_SECRETS_INLINE.",
+            "Checked PATH and %s for .exe/.cmd. Falling back to .env / BOT_HEADLESS_SECRETS_INLINE_JSON.",
             bindir,
         )
 
@@ -310,14 +253,14 @@ def load_secrets_base(cfg: object) -> Secrets:
         dot,
         dot.is_file(),
         pfx,
-        nonempty or "(none — fill .env or use HEADLESS_SECRETS_INLINE / DUMPER)",
+        nonempty or "(none — fill .env or use BOT_HEADLESS_SECRETS_INLINE_JSON / BOT_HEADLESS_SECRETS_DUMPER)",
     )
     msg = (
-        "Headless needs secrets: copy .env.example to .env in the repo root (same folder as this project), "
+        "Headless needs secrets: ensure .env exists in the repo root (created from .env.example on first run), "
         "set TFM_SECRETS_SERVER_ADDRESS, TFM_SECRETS_SERVER_PORTS, TFM_SECRETS_GAME_VERSION, "
         "TFM_SECRETS_CONNECTION_TOKEN, TFM_SECRETS_AUTH_KEY, TFM_SECRETS_PACKET_KEY_SOURCES, "
-        "TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE, or set HEADLESS_SECRETS_INLINE / HEADLESS_SECRETS_DUMPER. "
-        "Pull latest for .env.example if missing."
+        "TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE, or set BOT_HEADLESS_SECRETS_INLINE_JSON / "
+        "BOT_HEADLESS_SECRETS_DUMPER. Pull latest for .env.example if missing."
     )
     logger.error(msg)
     raise SystemExit(msg)
@@ -384,7 +327,7 @@ def resolve_headless_upstream(cfg: object, base_secrets: Secrets) -> tuple[str, 
                     f"UPSTREAM_SERVER_* ({chosen_a!r}, {chosen_p}) differs from this run's secrets "
                     f"dump ({dump_a!r}, {dump_p_i}). A wrong shard often accepts TCP then closes with "
                     "no handshake reply — align or clear UPSTREAM_SERVER_* or set "
-                    "UPSTREAM_FROM_SECRETS_DUMP_ONLY = True."
+                    "BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY = true."
                 )
                 if strict:
                     logger.error(msg)
@@ -403,7 +346,7 @@ def resolve_headless_upstream(cfg: object, base_secrets: Secrets) -> tuple[str, 
     if not dump_a or not dump_p:
         logger.error(
             "Headless needs server_address and server_ports from the secrets dump, or set "
-            "UPSTREAM_SERVER_ADDRESS and UPSTREAM_SERVER_PORTS in config."
+            "BOT_UPSTREAM_SERVER_ADDRESS and BOT_UPSTREAM_SERVER_PORTS in .env."
         )
         raise SystemExit(1)
     return str(dump_a).strip(), _upstream_ports_try_main_first(
@@ -512,7 +455,7 @@ def _run_one_slot_headless(
     username = str(row.get("username", "") or "").strip()
     password = str(row.get("password", "") or "")
     if not username or not password.strip():
-        logger.error("Slot %s: headless login needs username and password in config", label)
+        logger.error("Slot %s: headless login needs username and password in BOT_ACCOUNTS_JSON", label)
         return
 
     start_room = str(getattr(cfg, "PACKET_LOGIN_START_ROOM", "") or "")

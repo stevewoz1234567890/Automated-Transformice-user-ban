@@ -1,40 +1,37 @@
-"""Entry: optionally upgrade caseus from git before importing the rest of the package (see config)."""
+"""Entry: load ``.env``, optional pip installs, then run the CLI."""
 
 from __future__ import annotations
 
 import subprocess
 import sys
 
+from .env_setup import env_truthy, prepare_runtime_environment
+
+prepare_runtime_environment()
+
 
 def _maybe_pip_install_caseus_git() -> None:
-    try:
-        from . import config as cfg
-    except ImportError:
-        return
-    if not getattr(cfg, "PIP_INSTALL_CASEUS_GIT_UPGRADE", False):
-        return
     if getattr(sys, "frozen", False):
         return
-    spec = getattr(
-        cfg,
-        "CASEUS_GIT_PIP_SPEC",
-        "caseus @ git+https://github.com/friedkeenan/caseus.git",
-    )
-    cmd = [sys.executable, "-m", "pip", "install", "-U", str(spec).strip()]
-    subprocess.run(cmd, check=False)
+    if not env_truthy("BOT_PIP_INSTALL_CASEUS_GIT_UPGRADE"):
+        return
+    spec = (
+        sys.environ.get(
+            "BOT_CASEUS_GIT_PIP_SPEC",
+            "caseus @ git+https://github.com/friedkeenan/caseus.git",
+        )
+        or "caseus @ git+https://github.com/friedkeenan/caseus.git"
+    ).strip()
+    subprocess.run([sys.executable, "-m", "pip", "install", "-U", spec], check=False)
 
 
 def _maybe_pip_install_tfm_secrets_cli() -> None:
-    """If config sets a pip spec, install it so ``tfm-secrets`` may appear in the venv Scripts (before headless load)."""
-    try:
-        from . import config as cfg
-    except ImportError:
-        return
+    """If ``.env`` sets a pip spec, install it so ``tfm-secrets`` may appear in the venv Scripts."""
     if getattr(sys, "frozen", False):
         return
-    if not getattr(cfg, "PIP_INSTALL_TFM_SECRETS_CLI", False):
+    if not env_truthy("BOT_PIP_INSTALL_TFM_SECRETS_CLI"):
         return
-    spec = str(getattr(cfg, "TFM_SECRETS_PIP_INSTALL_SPEC", "") or "").strip()
+    spec = str(sys.environ.get("BOT_TFM_SECRETS_PIP_INSTALL_SPEC", "") or "").strip()
     if not spec:
         return
     subprocess.run(
