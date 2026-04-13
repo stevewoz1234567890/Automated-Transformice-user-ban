@@ -721,6 +721,8 @@ def start_headless_client_threads(
     **Sequential (** ``BOT_HEADLESS_PARALLEL_LOGIN=false``): one ``HeadlessProxyClient`` at a time on the
     main thread. ``BOT_HEADLESS_LOGIN_STAGGER_SEC`` is the pause between slots. Multi-slot ban mode will
     exit unless you use Flash clients, because ``HEADLESS_EXIT_AFTER_LOGIN_SUCCESS`` closes TCP after each login.
+    With multiple slots, ``BOT_HEADLESS_SEQUENTIAL_EARLY_EXIT_ON_WIN121`` (default true) stops after the first
+    slot that hits WinError 121 without LoginSuccess — other accounts would fail the same way.
 
     **Parallel (default,** ``BOT_HEADLESS_PARALLEL_LOGIN=true``): one daemon thread per slot, each runs its own
     ``asyncio`` loop so every account can stay connected at once. Sessions keep the TCP session open
@@ -915,6 +917,23 @@ def start_headless_client_threads(
                     adaptive_gap,
                     gap_cap,
                 )
+        if (
+            len(pairs) > 1
+            and bool(getattr(cfg, "HEADLESS_SEQUENTIAL_EARLY_EXIT_ON_WIN121", True))
+            and not state.login_success_event.is_set()
+            and w121_ev is not None
+            and w121_ev.is_set()
+        ):
+            logger.error(
+                "Sequential headless: slot %s hit WinError 121 without LoginSuccess — outbound TCP to the "
+                "game host is not completing. The other %s slot(s) use the same network path and would "
+                "typically fail the same way; stopping early (BOT_HEADLESS_SEQUENTIAL_EARLY_EXIT_ON_WIN121). "
+                "Fix firewall/VPN, run `python -m bot.upstream_probe <host> <ports>`, then prefer "
+                "BOT_HEADLESS_PARALLEL_LOGIN=true once TCP works. Set the env to false only to force every slot.",
+                state.label,
+                len(pairs) - i - 1,
+            )
+            return False
         if state.login_success_event.is_set():
             consec_fail = 0
         else:

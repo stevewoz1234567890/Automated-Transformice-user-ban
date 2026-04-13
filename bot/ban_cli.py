@@ -547,7 +547,8 @@ def main(argv: list[str] | None = None) -> None:
             if not pl:
                 logger.warning(
                     "With parallel login off, each slot drops TCP after LoginSuccess unless you use Flash; "
-                    "the bot will refuse /room prompts. Set BOT_HEADLESS_PARALLEL_LOGIN=true or use --no-headless.",
+                    "the bot will refuse /room prompts. Set BOT_HEADLESS_PARALLEL_LOGIN=true or use --no-headless. "
+                    "Turning parallel off does not fix WinError 121 — all slots share the same outbound path.",
                 )
         dump_host = getattr(base_secrets, "server_address", None)
         if dump_host:
