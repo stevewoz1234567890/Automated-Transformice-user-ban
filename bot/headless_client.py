@@ -717,7 +717,13 @@ def start_headless_client_threads(
     ``asyncio`` loop so every account can stay connected at once. Sessions keep the TCP session open
     (``exit_after_login_success`` is forced off for this path). Optional
     ``BOT_HEADLESS_PARALLEL_START_STAGGER_SEC`` offsets each thread's start by ``index * stagger`` to
-    reduce simultaneous connects (WinError 121). This function blocks until every slot reaches
+    reduce simultaneous connects (WinError 121 / server throttling). After
+    ``BOT_HEADLESS_PARALLEL_RETRY_AFTER_SEC``, failed slots (no ``LoginSuccess``, headless thread
+    finished) can be retried once if ``BOT_HEADLESS_PARALLEL_RETRY_FAILED_SLOTS`` is true.
+
+    Logs showing a second upstream host after login (e.g. shard IP) are normal game behavior.
+
+    This function blocks until every slot reaches
     ``LoginSuccess`` or ``BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC`` elapses.
 
     ``HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES`` applies only to sequential mode.
@@ -755,21 +761,73 @@ def start_headless_client_threads(
             )
 
         for i, (state, row) in enumerate(pairs):
-            threading.Thread(
+            t = threading.Thread(
                 target=_run_slot,
                 args=(i, state, row),
                 name=f"tfm-headless-{state.label}",
                 daemon=True,
-            ).start()
+            )
+            state.headless_thread = t
+            t.start()
 
         timeout_sec = float(getattr(cfg, "ALL_SLOTS_LOGIN_TIMEOUT_SEC", 7200.0) or 7200.0)
         timeout_sec = max(60.0, timeout_sec)
         deadline = time.monotonic() + timeout_sec
         poll_sec = 0.25
+        parallel_t0 = time.monotonic()
+        retry_wave_done = False
+        retry_after = float(getattr(cfg, "HEADLESS_PARALLEL_RETRY_AFTER_SEC", 90.0) or 90.0)
+        retry_after = max(15.0, retry_after)
+        retry_stagger = float(getattr(cfg, "HEADLESS_PARALLEL_RETRY_STAGGER_SEC", 5.0) or 0.0)
+        retry_stagger = max(0.0, retry_stagger)
+
+        def _retry_one(st: Any, rw: dict[str, object]) -> None:
+            _run_one_slot_headless(
+                state=st,
+                row=rw,
+                cfg=cfg,
+                base_secrets=base,
+                exit_after_login_success=False,
+            )
+
         while time.monotonic() < deadline:
             if all(st.login_success_event.is_set() for st, _ in pairs):
                 logger.info("Headless parallel login: all %s slot(s) reached LoginSuccess.", n)
                 return True
+            if (
+                not retry_wave_done
+                and bool(getattr(cfg, "HEADLESS_PARALLEL_RETRY_FAILED_SLOTS", True))
+                and (time.monotonic() - parallel_t0) >= retry_after
+            ):
+                retry_wave_done = True
+                to_retry: list[tuple[Any, dict[str, object]]] = []
+                for st, rw in pairs:
+                    if st.login_success_event.is_set():
+                        continue
+                    ht = getattr(st, "headless_thread", None)
+                    if ht is not None and ht.is_alive():
+                        continue
+                    to_retry.append((st, rw))
+                if to_retry:
+                    logger.info(
+                        "Headless parallel: retry wave for %s slot(s) (labels: %s) — "
+                        "first wave likely hit server load limits; increase "
+                        "BOT_HEADLESS_PARALLEL_START_STAGGER_SEC if this stays flaky.",
+                        len(to_retry),
+                        ", ".join(st.label for st, _ in to_retry),
+                    )
+                    for j, (st, rw) in enumerate(to_retry):
+                        if retry_stagger > 0 and j > 0:
+                            time.sleep(retry_stagger)
+                        st.login_success_event.clear()
+                        t2 = threading.Thread(
+                            target=_retry_one,
+                            args=(st, rw),
+                            name=f"tfm-headless-retry-{st.label}",
+                            daemon=True,
+                        )
+                        st.headless_thread = t2
+                        t2.start()
             time.sleep(poll_sec)
         pending = [st.label for st, _ in pairs if not st.login_success_event.is_set()]
         logger.error(

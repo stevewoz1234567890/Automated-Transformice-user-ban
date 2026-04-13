@@ -99,6 +99,8 @@ class SlotState:
     flash_password: str = ""
     # file:///…swf URL for LoginPacket.loader_url (same as patched loader).
     packet_loader_url: str = ""
+    # Last headless caseus.Client thread for this slot (parallel login / retries).
+    headless_thread: threading.Thread | None = None
 
 
 def _assign_listen_ports(
