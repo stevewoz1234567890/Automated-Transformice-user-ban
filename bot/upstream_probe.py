@@ -18,8 +18,18 @@ import logging
 import sys
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class UpstreamProbeOutcome:
+    """Result of ``run_upstream_tcp_probe`` (may include a final long-timeout round)."""
+
+    results: list[tuple[int, str, float | None]]
+    max_timeout_sec: float
+    final_long_round_ran: bool
 
 
 async def _probe_one_port(
@@ -105,7 +115,7 @@ async def log_upstream_tcp_probe_async(
     return results
 
 
-def run_upstream_tcp_probe(host: str, ports: tuple[int, ...], cfg: object) -> list[tuple[int, str, float | None]]:
+def run_upstream_tcp_probe(host: str, ports: tuple[int, ...], cfg: object) -> UpstreamProbeOutcome:
     """Log parallel TCP probes. Safe to call from sync code (uses asyncio.run).
 
     If every port fails, repeats up to ``UPSTREAM_PROBE_RETRIES`` extra times (see env), pausing
@@ -116,6 +126,7 @@ def run_upstream_tcp_probe(host: str, ports: tuple[int, ...], cfg: object) -> li
     """
     timeout = float(getattr(cfg, "UPSTREAM_PROBE_TIMEOUT_SEC", 10.0) or 10.0)
     timeout = max(1.0, min(timeout, 120.0))
+    max_used = timeout
     if timeout < 10.0:
         logger.warning(
             "[probe] BOT_UPSTREAM_PROBE_TIMEOUT_SEC=%.1fs is aggressive; slow Wi‑Fi/VPN often needs 10–15s "
@@ -142,8 +153,9 @@ def run_upstream_tcp_probe(host: str, ports: tuple[int, ...], cfg: object) -> li
             log_upstream_tcp_probe_async(host, ports, timeout_sec=timeout),
         )
         if any(status == "ok" for _port, status, _dt in last):
-            break
+            return UpstreamProbeOutcome(last, max_used, False)
 
+    ran_final_long = False
     if not any(status == "ok" for _port, status, _dt in last) and bool(
         getattr(cfg, "UPSTREAM_PROBE_FINAL_LONG_TIMEOUT", True)
     ):
@@ -164,7 +176,9 @@ def run_upstream_tcp_probe(host: str, ports: tuple[int, ...], cfg: object) -> li
             last = asyncio.run(
                 log_upstream_tcp_probe_async(host, ports, timeout_sec=final_t),
             )
-    return last
+            max_used = max(timeout, final_t)
+            ran_final_long = True
+    return UpstreamProbeOutcome(last, max_used, ran_final_long)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -190,8 +204,8 @@ def main(argv: list[str] | None = None) -> None:
     class _Cfg:
         UPSTREAM_PROBE_TIMEOUT_SEC = args.timeout
 
-    results = run_upstream_tcp_probe(args.host, tuple(args.ports), _Cfg())
-    if not any(status == "ok" for _port, status, _dt in results):
+    outcome = run_upstream_tcp_probe(args.host, tuple(args.ports), _Cfg())
+    if not any(status == "ok" for _port, status, _dt in outcome.results):
         sys.exit(1)
 
 

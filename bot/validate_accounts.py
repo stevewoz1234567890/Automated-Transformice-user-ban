@@ -127,7 +127,8 @@ def _validate_one_index(
         return False
 
     if run_probe and bool(getattr(cfg, "UPSTREAM_TCP_PROBE_BEFORE_HEADLESS", True)):
-        probe_results = run_upstream_tcp_probe(upstream_addr, upstream_ports, cfg)
+        probe_outcome = run_upstream_tcp_probe(upstream_addr, upstream_ports, cfg)
+        probe_results = probe_outcome.results
         if bool(getattr(cfg, "UPSTREAM_ABORT_ON_PROBE_ALL_FAILED", True)):
             n_ok = sum(1 for _p, st, _ in probe_results if st == "ok")
             if len(probe_results) > 0 and n_ok == 0:
@@ -136,6 +137,11 @@ def _validate_one_index(
                     len(probe_results),
                     upstream_addr,
                 )
+                if probe_outcome.final_long_round_ran and probe_outcome.max_timeout_sec >= 15.0:
+                    logger.error(
+                        "Long probe round (up to %.0fs per port) also failed — check VPN/firewall/network.",
+                        probe_outcome.max_timeout_sec,
+                    )
                 return False
 
     auth_key_fallback: int | None = None

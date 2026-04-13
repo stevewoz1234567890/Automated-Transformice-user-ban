@@ -576,18 +576,30 @@ def main(argv: list[str] | None = None) -> None:
 
     if headless_auto and upstream_addr and upstream_ports:
         if bool(getattr(cfg, "UPSTREAM_TCP_PROBE_BEFORE_HEADLESS", True)):
-            probe_results = run_upstream_tcp_probe(upstream_addr, upstream_ports, cfg)
+            probe_outcome = run_upstream_tcp_probe(upstream_addr, upstream_ports, cfg)
+            probe_results = probe_outcome.results
             if bool(getattr(cfg, "UPSTREAM_ABORT_ON_PROBE_ALL_FAILED", True)):
                 n_ok = sum(1 for _p, st, _ in probe_results if st == "ok")
                 if len(probe_results) > 0 and n_ok == 0:
                     logger.error(
-                        "Aborting: upstream TCP probe reached 0/%s ports on %r (after BOT_UPSTREAM_PROBE_RETRIES "
-                        "extra rounds if configured) — cannot reach game TCP (firewall, VPN, ISP, routing, or "
-                        "host down). Fix the network path, raise BOT_UPSTREAM_PROBE_TIMEOUT_SEC / retries, or set "
-                        "BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED=false to try headless login anyway.",
+                        "Aborting: upstream TCP probe reached 0/%s ports on %r (after retries and any "
+                        "long-timeout round) — no TCP handshake to the game host.",
                         len(probe_results),
                         upstream_addr,
                     )
+                    if probe_outcome.final_long_round_ran and probe_outcome.max_timeout_sec >= 15.0:
+                        logger.error(
+                            "Probe already used up to %.0fs per port and still failed — this is almost certainly "
+                            "a blocked or unroutable path (firewall, VPN, ISP, or wrong network), not a too-short "
+                            "timeout. Try another connection, or set BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED=false "
+                            "or BOT_UPSTREAM_TCP_PROBE_BEFORE_HEADLESS=false to attempt headless login anyway.",
+                            probe_outcome.max_timeout_sec,
+                        )
+                    else:
+                        logger.error(
+                            "Fix reachability, increase BOT_UPSTREAM_PROBE_TIMEOUT_SEC / retries, or set "
+                            "BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED=false to try headless login anyway.",
+                        )
                     raise SystemExit(1)
 
     start_all_slots(
