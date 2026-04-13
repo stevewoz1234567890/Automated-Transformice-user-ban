@@ -411,7 +411,7 @@ def main(argv: list[str] | None = None) -> None:
         logger.info(
             "PROXY_LISTEN_USE_ACCOUNT_BIND_IP is False: per-row bind_ip is ignored for listening "
             "(use it in Proxifier only). Proxies use distinct ports; clients typically use "
-            "127.0.0.1 unless PROXY_BIND_HOST is set."
+            "127.0.0.1 unless BOT_PROXY_BIND_HOST is set."
         )
 
     shared_flash_policy_port = _cfg_shared_flash_policy_port(cfg)

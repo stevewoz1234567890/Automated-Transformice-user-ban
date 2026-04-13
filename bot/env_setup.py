@@ -38,6 +38,8 @@ _ENV_DEFAULTS: dict[str, str] = {
     "BOT_HEADLESS_SECRETS_ENV_PREFIX": "TFM_SECRETS_",
     "BOT_HEADLESS_SECRETS_INLINE_JSON": "",
     "BOT_HEADLESS_SECRETS_DUMPER": "",
+    "BOT_HEADLESS_SECRETS_AUTO_DUMPER": "true",
+    "BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV": "true",
     "BOT_HEADLESS_SECRETS_DUMPER_TIMEOUT_SEC": "120",
     "BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY": "false",
     "BOT_UPSTREAM_PORTS_MATCH_DUMP_ORDER": "true",
@@ -120,6 +122,44 @@ def merge_defaults_into_dotenv(path: Path, defaults: dict[str, str]) -> None:
         return
     sep = "" if not text or text.endswith("\n") else "\n"
     path.write_text(text + sep + "\n".join(extra) + "\n", encoding="utf-8")
+
+
+def format_dotenv_value(val: str) -> str:
+    """Serialize a value for a ``KEY=value`` line (quote if needed)."""
+    if not val:
+        return ""
+    if any(c in val for c in "\n\r\"") or (val.startswith(" ") or val.endswith(" ")):
+        escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    if "#" in val:
+        escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return val
+
+
+def update_or_append_dotenv(path: Path, updates: dict[str, str]) -> None:
+    """Replace existing assignments or append keys at the end of a ``.env`` file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keys_done: set[str] = set()
+    out_lines: list[str] = []
+    if path.is_file():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        for raw in text.splitlines():
+            stripped = raw.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                k = stripped.partition("=")[0].strip()
+                if k in updates:
+                    out_lines.append(f"{k}={format_dotenv_value(updates[k])}")
+                    keys_done.add(k)
+                    continue
+            out_lines.append(raw)
+    for k, v in updates.items():
+        if k not in keys_done:
+            out_lines.append(f"{k}={format_dotenv_value(v)}")
+    path.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
 
 
 def _bootstrap_dotenv_path() -> Path:
@@ -273,6 +313,10 @@ def load_bot_config() -> SimpleNamespace:
         ),
         HEADLESS_SECRETS_INLINE=_headless_secrets_inline(),
         HEADLESS_SECRETS_DUMPER=_headless_secrets_dumper(),
+        HEADLESS_SECRETS_AUTO_DUMPER=_truthy("BOT_HEADLESS_SECRETS_AUTO_DUMPER", True),
+        HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV=_truthy(
+            "BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV", True
+        ),
         HEADLESS_SECRETS_DUMPER_TIMEOUT_SEC=_float("BOT_HEADLESS_SECRETS_DUMPER_TIMEOUT_SEC", 120.0),
         UPSTREAM_FROM_SECRETS_DUMP_ONLY=_truthy("BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY", False),
         UPSTREAM_PORTS_MATCH_DUMP_ORDER=_truthy("BOT_UPSTREAM_PORTS_MATCH_DUMP_ORDER", True),

@@ -3,10 +3,12 @@ One ``caseus.Client`` per slot connecting to the local BanBotProxy (no Flash).
 
 Secrets (no ``tfm-secrets.json`` in this flow):
 
-1. Optional ``HEADLESS_SECRETS_DUMPER`` — run a subprocess that prints tfm-secrets JSON on stdout;
-   parsed in memory only.
-2. Variables from the process environment, after loading repo-root ``.env`` (``TFM_SECRETS_*``).
-3. ``BOT_HEADLESS_SECRETS_INLINE_JSON`` (or ``HEADLESS_SECRETS_INLINE`` on ``cfg`` from ``.env``).
+1. Complete ``TFM_SECRETS_*`` in repo-root ``.env`` after ``load_dotenv_file``.
+2. Or ``BOT_HEADLESS_SECRETS_INLINE_JSON`` on ``cfg``.
+3. Or a subprocess dumper (JSON on stdout). If ``BOT_HEADLESS_SECRETS_DUMPER`` is empty but
+   ``BOT_HEADLESS_SECRETS_AUTO_DUMPER`` is true (default), ``tfm-secrets`` is run when ``.env`` is
+   incomplete. On success, values are written back to ``.env`` when
+   ``BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV`` is true (default).
 
 Each client uses ``Secrets.copy(server_address=..., server_ports=(...))`` to target ``127.0.0.1:<proxy_port>``.
 The proxy injects ``LoginPacket`` after ``SystemInformationPacket``; this client must **not** send
@@ -30,7 +32,7 @@ from typing import Any
 import pak
 from caseus import Secrets
 
-from .env_setup import load_dotenv_file, repo_root
+from .env_setup import load_dotenv_file, repo_root, update_or_append_dotenv
 from caseus.clients.client import AccountError, Client
 from caseus.packets import clientbound, serverbound
 from caseus.util.crypto import shakikoo
@@ -66,7 +68,7 @@ def _secrets_from_config_inline(cfg: object) -> Secrets | None:
 
 
 def _try_secrets_from_dumper_argv(argv: list[str], cfg: object) -> Secrets | None:
-    """Run a secrets dumper; parse JSON from stdout into ``Secrets``. No files read or written."""
+    """Run a secrets dumper; parse JSON from stdout into ``Secrets`` (``.env`` may be updated later)."""
     timeout = float(getattr(cfg, "HEADLESS_SECRETS_DUMPER_TIMEOUT_SEC", 120.0) or 120.0)
     try:
         proc = subprocess.run(
@@ -143,6 +145,44 @@ def _dumper_argv_from_config(dumper: Any) -> list[str] | None:
     return _try_argv_for_string_dumper(s)
 
 
+def _effective_dumper_spec(cfg: object) -> Any:
+    """Explicit ``HEADLESS_SECRETS_DUMPER``, else ``tfm-secrets`` when auto-dump is enabled."""
+    d = getattr(cfg, "HEADLESS_SECRETS_DUMPER", None)
+    if isinstance(d, (list, tuple)):
+        if any(str(x).strip() for x in d):
+            return d
+    elif d is not None and str(d).strip():
+        return d
+    if bool(getattr(cfg, "HEADLESS_SECRETS_AUTO_DUMPER", True)):
+        return "tfm-secrets"
+    return None
+
+
+def _secrets_to_tfm_env_updates(secrets: Secrets, prefix: str) -> dict[str, str]:
+    """Map a ``Secrets`` instance to ``TFM_SECRETS_*``-style keys for ``.env``."""
+    p = str(prefix).strip()
+    if not p.endswith("_"):
+        p = f"{p}_"
+    cvt = secrets.client_verification_template
+    if cvt is None:
+        cvt_s = ""
+    elif isinstance(cvt, (bytes, bytearray)):
+        cvt_s = bytes(cvt).hex()
+    else:
+        cvt_s = str(cvt)
+    ports = secrets.server_ports
+    pks = secrets.packet_key_sources
+    return {
+        f"{p}SERVER_ADDRESS": str(secrets.server_address),
+        f"{p}SERVER_PORTS": ",".join(str(int(x)) for x in ports),
+        f"{p}GAME_VERSION": str(int(secrets.game_version)),
+        f"{p}CONNECTION_TOKEN": str(secrets.connection_token),
+        f"{p}AUTH_KEY": str(int(secrets.auth_key)),
+        f"{p}PACKET_KEY_SOURCES": ",".join(str(int(x)) for x in pks),
+        f"{p}CLIENT_VERIFICATION_TEMPLATE": cvt_s,
+    }
+
+
 def _secrets_from_env(cfg: object) -> Secrets | None:
     """Build ``Secrets`` from ``TFM_SECRETS_*`` (prefix configurable) in ``os.environ``."""
     prefix = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_").strip()
@@ -189,8 +229,8 @@ def _secrets_from_env(cfg: object) -> Secrets | None:
 
     missing = [f for f in Secrets._FIELDS if f not in kwargs]
     if missing:
-        logger.warning(
-            "Incomplete %s* / .env: missing %s (filled: %s). Fill every field from .env.example.",
+        logger.debug(
+            "Incomplete %s* / .env: missing %s (filled: %s); may run tfm-secrets dumper next.",
             prefix,
             missing,
             tuple(sorted(kwargs.keys())) or "(none)",
@@ -204,31 +244,9 @@ def _secrets_from_env(cfg: object) -> Secrets | None:
 
 
 def load_secrets_base(cfg: object) -> Secrets:
-    """Load server crypto: optional dumper (stdout JSON), then ``.env`` / env vars, then inline dict."""
-    load_dotenv_file(_resolved_dotenv_path(cfg))
-
-    dumper = getattr(cfg, "HEADLESS_SECRETS_DUMPER", None)
-    dumper_nonempty = False
-    if isinstance(dumper, (list, tuple)):
-        dumper_nonempty = any(str(x).strip() for x in dumper)
-    elif dumper is not None:
-        dumper_nonempty = bool(str(dumper).strip())
-
-    if dumper_nonempty:
-        argv = _dumper_argv_from_config(dumper)
-        if argv:
-            sec = _try_secrets_from_dumper_argv(argv, cfg)
-            if sec is not None:
-                logger.info(
-                    "Secrets from HEADLESS_SECRETS_DUMPER (subprocess JSON on stdout; no secret files read)."
-                )
-                return sec
-        bindir = Path(sys.executable).resolve().parent
-        logger.warning(
-            "HEADLESS_SECRETS_DUMPER is set but did not yield secrets (missing binary, failure, or timeout). "
-            "Checked PATH and %s for .exe/.cmd. Falling back to .env / BOT_HEADLESS_SECRETS_INLINE_JSON.",
-            bindir,
-        )
+    """Load server crypto: full ``.env``, inline JSON, then dumper (default ``tfm-secrets``)."""
+    dot = _resolved_dotenv_path(cfg)
+    load_dotenv_file(dot)
 
     sec = _secrets_from_env(cfg)
     if sec is not None:
@@ -243,7 +261,42 @@ def load_secrets_base(cfg: object) -> Secrets:
     if sec is not None:
         return sec
 
-    dot = _resolved_dotenv_path(cfg)
+    dumper_spec = _effective_dumper_spec(cfg)
+    if dumper_spec is not None:
+        argv = _dumper_argv_from_config(dumper_spec)
+        if argv:
+            logger.info(
+                "TFM secrets incomplete in .env; running dumper argv=%r (set BOT_HEADLESS_SECRETS_AUTO_DUMPER=false to skip).",
+                argv,
+            )
+            sec = _try_secrets_from_dumper_argv(argv, cfg)
+            if sec is not None:
+                pfx = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_")
+                if bool(getattr(cfg, "HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV", True)):
+                    updates = _secrets_to_tfm_env_updates(sec, pfx)
+                    try:
+                        update_or_append_dotenv(dot, updates)
+                        for k, v in updates.items():
+                            os.environ[k] = v
+                        logger.info(
+                            "Wrote %s TFM secrets fields to %s (BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV).",
+                            len(updates),
+                            dot,
+                        )
+                    except OSError as e:
+                        logger.warning("Could not persist secrets to %s: %s", dot, e)
+                else:
+                    logger.info(
+                        "Not writing secrets to .env (BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV is false)."
+                    )
+                return sec
+        bindir = Path(sys.executable).resolve().parent
+        logger.warning(
+            "Secrets dumper did not yield secrets (argv=%r). Checked PATH and %s for tfm-secrets.",
+            argv,
+            bindir,
+        )
+
     pfx = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_").strip()
     if not pfx.endswith("_"):
         pfx = f"{pfx}_"
@@ -253,17 +306,15 @@ def load_secrets_base(cfg: object) -> Secrets:
         dot,
         dot.is_file(),
         pfx,
-        nonempty or "(none — fill .env or use BOT_HEADLESS_SECRETS_INLINE_JSON / BOT_HEADLESS_SECRETS_DUMPER)",
+        nonempty or "(none)",
     )
     msg = (
-        "Headless needs secrets: ensure .env exists in the repo root (created from .env.example on first run), "
-        "set TFM_SECRETS_SERVER_ADDRESS, TFM_SECRETS_SERVER_PORTS, TFM_SECRETS_GAME_VERSION, "
-        "TFM_SECRETS_CONNECTION_TOKEN, TFM_SECRETS_AUTH_KEY, TFM_SECRETS_PACKET_KEY_SOURCES, "
-        "TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE, or set BOT_HEADLESS_SECRETS_INLINE_JSON / "
-        "BOT_HEADLESS_SECRETS_DUMPER. Pull latest for .env.example if missing."
+        "Headless needs secrets: install `tfm-secrets` on PATH (venv Scripts) or set BOT_HEADLESS_SECRETS_DUMPER, "
+        "or fill every TFM_SECRETS_* in .env, or set BOT_HEADLESS_SECRETS_INLINE_JSON. "
+        "Optional: BOT_PIP_INSTALL_TFM_SECRETS_CLI + BOT_TFM_SECRETS_PIP_INSTALL_SPEC then re-run."
     )
     logger.error(msg)
-    raise SystemExit(msg)
+    raise SystemExit(1)
 
 
 def _upstream_ports_try_main_first(cfg: object, ports: tuple[int, ...]) -> tuple[int, ...]:
