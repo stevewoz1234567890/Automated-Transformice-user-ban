@@ -537,11 +537,29 @@ class HeadlessProxyClient(Client):
         self,
         *,
         login_success_event: threading.Event | None = None,
+        exit_after_login_success: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._login_success_event = login_success_event
+        self._exit_after_login_success = exit_after_login_success
         self._sysinfo_after_verification_pending = False
+
+    async def _close_bootstrap_connections(self) -> None:
+        """End ``listen()`` so ``start()`` returns; needed for multi-slot headless stagger."""
+        await asyncio.sleep(0)
+        try:
+            if self.satellite is not self.main and not self.satellite.is_closing():
+                self.satellite.close()
+                await self.satellite.wait_closed()
+        except (OSError, asyncio.CancelledError) as e:
+            logger.debug("Headless satellite close: %s", e)
+        try:
+            if not self.main.is_closing():
+                self.main.close()
+                await self.main.wait_closed()
+        except (OSError, asyncio.CancelledError) as e:
+            logger.debug("Headless main close: %s", e)
 
     async def login(self) -> None:
         """Do not send ``LoginPacket`` — ``BanBotProxy`` injects it after ``SystemInformationPacket``."""
@@ -590,6 +608,12 @@ class HeadlessProxyClient(Client):
         await super()._on_login_success(server, packet)
         if self._login_success_event is not None:
             self._login_success_event.set()
+        if self._exit_after_login_success:
+            logger.info(
+                "Headless: LoginSuccess — closing client TCP so the next slot can run "
+                "(BOT_HEADLESS_EXIT_AFTER_LOGIN_SUCCESS).",
+            )
+            asyncio.create_task(self._close_bootstrap_connections())
 
 
 async def _run_one_client(
@@ -600,6 +624,7 @@ async def _run_one_client(
     start_room: str,
     login_success_event: threading.Event,
     connect_to_satellite: bool,
+    exit_after_login_success: bool,
 ) -> None:
     pw_hash = shakikoo(password.strip())
     client = HeadlessProxyClient(
@@ -609,6 +634,7 @@ async def _run_one_client(
         start_room=start_room,
         login_success_event=login_success_event,
         connect_to_satellite=connect_to_satellite,
+        exit_after_login_success=exit_after_login_success,
     )
     await client.start()
 
@@ -651,6 +677,9 @@ def _run_one_slot_headless(
                 start_room=start_room,
                 login_success_event=state.login_success_event,
                 connect_to_satellite=bool(getattr(cfg, "HEADLESS_CONNECT_TO_SATELLITE", True)),
+                exit_after_login_success=bool(
+                    getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True)
+                ),
             )
         )
         if not state.login_success_event.is_set():
