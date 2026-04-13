@@ -527,6 +527,22 @@ def main(argv: list[str] | None = None) -> None:
         auth_key_fallback = getattr(base_secrets, "auth_key", None)
         packet_key_sources_fallback = getattr(base_secrets, "packet_key_sources", None)
 
+    if headless_auto and upstream_addr and upstream_ports:
+        if bool(getattr(cfg, "UPSTREAM_TCP_PROBE_BEFORE_HEADLESS", True)):
+            probe_results = run_upstream_tcp_probe(upstream_addr, upstream_ports, cfg)
+            if bool(getattr(cfg, "UPSTREAM_ABORT_ON_PROBE_ALL_FAILED", True)):
+                n_ok = sum(1 for _p, st, _ in probe_results if st == "ok")
+                if len(probe_results) > 0 and n_ok == 0:
+                    logger.error(
+                        "Aborting: upstream TCP probe reached 0/%s ports on %r — this process cannot reach "
+                        "the game TCP ports (firewall, VPN, ISP, or routing). Headless login would only repeat "
+                        "timeouts/WinError 121. Fix network path to the host or set "
+                        "BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED=false to try anyway.",
+                        len(probe_results),
+                        upstream_addr,
+                    )
+                    raise SystemExit(1)
+
     start_all_slots(
         states,
         this_exe=this_exe,
@@ -539,17 +555,19 @@ def main(argv: list[str] | None = None) -> None:
         bootstrap_secrets=base_secrets if headless_auto else None,
     )
 
-    if headless_auto and upstream_addr and upstream_ports:
-        if bool(getattr(cfg, "UPSTREAM_TCP_PROBE_BEFORE_HEADLESS", True)):
-            run_upstream_tcp_probe(upstream_addr, upstream_ports, cfg)
-
     if headless_auto:
-        start_headless_client_threads(
+        if not start_headless_client_threads(
             states,
             raw_accounts,
             cfg,
             base_secrets=base_secrets,
-        )
+        ):
+            logger.error(
+                "Aborting: headless login stopped early (BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES). "
+                "Remaining slots never attempted login — fix upstream reachability or credentials, raise the "
+                "threshold, or set it to 0 to attempt every slot.",
+            )
+            raise SystemExit(1)
 
     _wait_for_all_slots_logged_in(states, cfg)
 

@@ -674,7 +674,7 @@ def start_headless_client_threads(
     cfg: object,
     *,
     base_secrets: Secrets | None = None,
-) -> None:
+) -> bool:
     """
     Run headless TCP login **one slot at a time** (main thread): each ``HeadlessProxyClient`` runs
     to completion before the next starts. This avoids hammering the game server with parallel
@@ -690,6 +690,9 @@ def start_headless_client_threads(
 
     After a slot hits upstream **WinError 121**, the pause before the next slot increases by
     ``HEADLESS_STAGGER_WIN121_EXTRA_SEC`` up to ``HEADLESS_STAGGER_MAX_SEC``.
+
+    Returns ``False`` if the loop stopped early because of ``HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES``;
+    ``True`` if every slot received a headless attempt (even when some attempts fail).
     """
     base = base_secrets if base_secrets is not None else load_secrets_base(cfg)
     base_gap = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 6.0) or 0.0)
@@ -706,12 +709,13 @@ def start_headless_client_threads(
             logger.warning(
                 "Stopping headless logins: %s consecutive slot(s) without LoginSuccess "
                 "(BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES=%s). "
-                "Refresh TFM_SECRETS_*, align upstream with dump host, and increase "
-                "BOT_HEADLESS_LOGIN_STAGGER_SEC if you saw WinError 121 on later slots.",
+                "If the startup TCP probe showed 0 ports OK or you see WinError 121, fix firewall/VPN/path "
+                "to the game host first (secrets alone will not fix that). Otherwise refresh TFM_SECRETS_* "
+                "or increase BOT_HEADLESS_LOGIN_STAGGER_SEC.",
                 max_consec,
                 max_consec,
             )
-            break
+            return False
         if i > 0 and adaptive_gap > 0:
             time.sleep(adaptive_gap)
         w121_ev = getattr(state, "headless_seen_upstream_win121", None)
@@ -734,3 +738,4 @@ def start_headless_client_threads(
             consec_fail = 0
         else:
             consec_fail += 1
+    return True
