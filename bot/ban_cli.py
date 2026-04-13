@@ -538,18 +538,11 @@ def main(argv: list[str] | None = None) -> None:
             upstream_ports,
         )
         if len(states) > 1:
-            pl = bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", True))
             logger.info(
                 "Multi-slot headless (%s accounts): BOT_HEADLESS_PARALLEL_LOGIN=%s",
                 len(states),
-                pl,
+                bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", True)),
             )
-            if not pl:
-                logger.warning(
-                    "With parallel login off, each slot drops TCP after LoginSuccess unless you use Flash; "
-                    "the bot will refuse /room prompts. Set BOT_HEADLESS_PARALLEL_LOGIN=true or use --no-headless. "
-                    "Turning parallel off does not fix WinError 121 — all slots share the same outbound path.",
-                )
         dump_host = getattr(base_secrets, "server_address", None)
         if dump_host:
             ds = str(dump_host).strip()
@@ -603,6 +596,27 @@ def main(argv: list[str] | None = None) -> None:
                         )
                     raise SystemExit(1)
 
+        pl = bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", True))
+        exit_after = bool(getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True))
+        n_slots = len(states)
+        if not pl:
+            if n_slots > 1:
+                logger.error(
+                    "Refusing to start: BOT_HEADLESS_PARALLEL_LOGIN=false with %s slots — sequential headless "
+                    "cannot keep every account connected for /room and /ban. Set BOT_HEADLESS_PARALLEL_LOGIN=true "
+                    "in .env, or use Flash/Proxifier with --no-headless. (Turning parallel off does not fix "
+                    "WinError 121; all slots share the same outbound path.)",
+                    n_slots,
+                )
+                raise SystemExit(1)
+            if exit_after:
+                logger.error(
+                    "Refusing to start: BOT_HEADLESS_EXIT_AFTER_LOGIN_SUCCESS=true closes TCP after login, so "
+                    "there is no session for /room or /ban. Set BOT_HEADLESS_PARALLEL_LOGIN=true (multi-slot), "
+                    "or for a single account set BOT_HEADLESS_EXIT_AFTER_LOGIN_SUCCESS=false, or use Flash.",
+                )
+                raise SystemExit(1)
+
     start_all_slots(
         states,
         this_exe=this_exe,
@@ -638,15 +652,6 @@ def main(argv: list[str] | None = None) -> None:
                 "`python -m bot.validate_accounts --all`.",
                 len(missing_login),
                 ", ".join(s.label for s in missing_login),
-            )
-            raise SystemExit(1)
-        if not bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", True)) and bool(
-            getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True)
-        ):
-            logger.error(
-                "Refusing to continue: sequential headless closes TCP after each LoginSuccess, so no slot "
-                "stays in-game for /room or /ban. Set BOT_HEADLESS_PARALLEL_LOGIN=true in .env, or use "
-                "Flash/Proxifier clients with --no-headless.",
             )
             raise SystemExit(1)
 
