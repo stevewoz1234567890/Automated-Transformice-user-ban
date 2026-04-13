@@ -68,34 +68,61 @@ def _secrets_from_dumper_argv(argv: list[str]) -> Secrets:
     return Secrets(**data)
 
 
-def _dumper_argv_from_config(dumper: Any) -> list[str]:
+def _try_argv_for_string_dumper(name: str) -> list[str] | None:
+    """Resolve a single dumper token to argv, including venv ``Scripts`` on Windows."""
+    p = Path(name)
+    if p.is_file():
+        return [str(p.resolve())]
+    found = shutil.which(name)
+    if found:
+        return [found]
+    bindir = Path(sys.executable).resolve().parent
+    if sys.platform == "win32":
+        for suffix in (".exe", ".cmd", ".bat"):
+            cand = bindir / f"{name}{suffix}"
+            if cand.is_file():
+                return [str(cand.resolve())]
+    else:
+        cand = bindir / name
+        if cand.is_file():
+            return [str(cand.resolve())]
+    return None
+
+
+def _dumper_argv_from_config(dumper: Any) -> list[str] | None:
     if isinstance(dumper, (list, tuple)):
         parts = [str(x) for x in dumper if str(x).strip()]
+        if not parts:
+            return None
         if len(parts) == 1:
             return _dumper_argv_from_config(parts[0])
         return parts
     s = str(dumper).strip()
     if not s:
-        return []
-    p = Path(s)
+        return None
+    return _try_argv_for_string_dumper(s)
+
+
+def _resolve_secrets_json_path(json_path: str) -> Path | None:
+    p = Path(str(json_path).strip()).expanduser()
     if p.is_file():
-        return [str(p.resolve())]
-    found = shutil.which(s)
-    if found:
-        return [found]
-    msg = (
-        f"HEADLESS_SECRETS_DUMPER {s!r} is not a file and not on PATH. "
-        "Install tfm-secrets in this venv, pass the full path to the .exe, or use "
-        f"[{sys.executable!r}, '-m', '<module>'] if the tool is a Python module."
+        return p
+    root = (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parent.parent
     )
-    logger.error(msg)
-    raise SystemExit(msg)
+    alt = (root / p).resolve()
+    if alt.is_file():
+        return alt
+    return None
 
 
 def load_secrets_base(cfg: object) -> Secrets:
     """Load server crypto parameters (not per-slot). Prefer a live dumper each run over a JSON file."""
     json_path = getattr(cfg, "HEADLESS_SECRETS_JSON", None)
     dumper = getattr(cfg, "HEADLESS_SECRETS_DUMPER", None)
+    fallback_json = bool(getattr(cfg, "HEADLESS_FALLBACK_JSON_WHEN_DUMPER_UNAVAILABLE", True))
 
     dumper_nonempty = False
     if isinstance(dumper, (list, tuple)):
@@ -105,33 +132,44 @@ def load_secrets_base(cfg: object) -> Secrets:
 
     if dumper_nonempty:
         argv = _dumper_argv_from_config(dumper)
-        if not argv:
-            msg = "HEADLESS_SECRETS_DUMPER is empty"
-            logger.error(msg)
-            raise SystemExit(msg)
-        return _secrets_from_dumper_argv(argv)
+        if argv:
+            return _secrets_from_dumper_argv(argv)
+        if fallback_json:
+            jp: Path | None = None
+            if json_path and str(json_path).strip():
+                jp = _resolve_secrets_json_path(str(json_path))
+            if jp is None:
+                jp = _resolve_secrets_json_path("tfm-secrets.json")
+            if jp is not None:
+                logger.warning(
+                    "HEADLESS_SECRETS_DUMPER is not installed or not on PATH; using %s "
+                    "(install tfm-secrets into this venv or set HEADLESS_FALLBACK_JSON_WHEN_DUMPER_UNAVAILABLE = False).",
+                    jp,
+                )
+                data: dict[str, Any] = json.loads(jp.read_text(encoding="utf-8"))
+                return Secrets(**data)
+        bindir = Path(sys.executable).resolve().parent
+        msg = (
+            f"HEADLESS_SECRETS_DUMPER {dumper!r} not found (PATH and {bindir} checked for "
+            f"{dumper!r}.exe / .cmd). Install the tfm-secrets binary, add it to PATH, set the dumper "
+            f"to the full .exe path, use [{sys.executable!r}, '-m', '<module>'], or set "
+            "HEADLESS_SECRETS_JSON to a tfm-secrets JSON file (and enable fallback, default True)."
+        )
+        logger.error(msg)
+        raise SystemExit(msg)
 
     if json_path and str(json_path).strip():
-        p = Path(str(json_path).strip()).expanduser()
-        if not p.is_file():
-            root = (
-                Path(sys.executable).resolve().parent
-                if getattr(sys, "frozen", False)
-                else Path(__file__).resolve().parent.parent
-            )
-            alt = (root / p).resolve()
-            if alt.is_file():
-                p = alt
-        if not p.is_file():
-            msg = f"HEADLESS_SECRETS_JSON not found: {p}"
+        p = _resolve_secrets_json_path(str(json_path))
+        if p is None:
+            msg = f"HEADLESS_SECRETS_JSON not found: {json_path!r}"
             logger.error(msg)
             raise SystemExit(msg)
-        data: dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
         return Secrets(**data)
 
     msg = (
-        "Headless mode requires HEADLESS_SECRETS_DUMPER (e.g. 'tfm-secrets' on PATH) in bot/config.py "
-        "to refresh secrets each run, or set HEADLESS_SECRETS_JSON to a tfm-secrets JSON file."
+        "Headless mode requires HEADLESS_SECRETS_DUMPER (e.g. 'tfm-secrets' on PATH or in venv Scripts) "
+        "or HEADLESS_SECRETS_JSON in bot/config.py."
     )
     logger.error(msg)
     raise SystemExit(msg)
