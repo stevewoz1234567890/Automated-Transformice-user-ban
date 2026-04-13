@@ -4,10 +4,10 @@ This repository (**Automated-Transformice-user-ban**) is aimed at a **command-li
 
 The implementation is the Python package **`bot/`**: one **local TCP proxy per game client** (via **caseus**). The proxy injects **`LoginPacket`** after **`SystemInformationPacket`** using credentials from `bot/config.py`. The bot does **not** start Flash Player.
 
-**Automatic login (recommended):** run **`python -m bot --headless`** or set **`HEADLESS_AUTO_LOGIN = True`** in `bot/config.py`. The bot starts a built-in **caseus** TCP client per slot (see `bot/headless_client.py`, `HandshakePacket` → `SystemInformationPacket` → proxy-injected `LoginPacket`). You need **`HEADLESS_SECRETS_JSON`** (output from `tfm-secrets` / `tfm-secrets dump`) or **`HEADLESS_SECRETS_DUMPER`**. If both are set, **`UPSTREAM_SERVER_ADDRESS`** and **`UPSTREAM_SERVER_PORTS`** override the JSON host/ports (use this after a fresh secrets dump or to test connectivity, e.g. main port **11801**):
+**Automatic login (recommended):** run **`python -m bot --headless`** or set **`HEADLESS_AUTO_LOGIN = True`** in `bot/config.py`. The bot starts a built-in **caseus** TCP client per slot (see `bot/headless_client.py`, `HandshakePacket` → `SystemInformationPacket` → proxy-injected `LoginPacket`). You need **`TFM_SECRETS_*` in a repo-root `.env`** (see **`.env.example`**), or **`HEADLESS_SECRETS_INLINE`** in config, or **`HEADLESS_SECRETS_DUMPER`** (CLI that prints tfm-secrets JSON on stdout — nothing is read from `tfm-secrets.json` by default). **`UPSTREAM_SERVER_ADDRESS`** and **`UPSTREAM_SERVER_PORTS`** can override host/ports from secrets (e.g. main port **11801**):
 
 ```python
-# Optional — overrides server_address / server_ports from HEADLESS_SECRETS_JSON
+# Optional — overrides server_address / server_ports from secrets / .env
 UPSTREAM_SERVER_ADDRESS = "51.38.60.113"
 UPSTREAM_SERVER_PORTS = (11801, 12801, 13801, 14801)
 ```

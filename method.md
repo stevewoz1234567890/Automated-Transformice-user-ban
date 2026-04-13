@@ -8,7 +8,7 @@ The bot **never** starts Flash Player or `TFMProxyLoader.swf`. The proxy **alway
 
 - Python 3.10+ and `pip install -r requirements.txt` (see root `README.md`).
 - `bot/config.py` with **`ACCOUNTS`** rows: each slot needs **`proxy_port`**, **`username`**, **`password`**, and optional **`label`** / **`bind_ip`**.
-- **Either** enable **headless TCP** (`python -m bot --headless` or `HEADLESS_AUTO_LOGIN = True`) with **`HEADLESS_SECRETS_JSON`** (and upstream `server_address` / `server_ports` in that JSON), **or** connect each slot yourself to MAIN TCP (`127.0.0.1:<proxy_port>`) through **`SystemInformationPacket`** (external client, Ruffle, etc.).
+- **Either** enable **headless TCP** (`python -m bot --headless` or `HEADLESS_AUTO_LOGIN = True`) with **`.env` (`TFM_SECRETS_*`)**, **`HEADLESS_SECRETS_INLINE`**, or **`HEADLESS_SECRETS_DUMPER`**, **or** connect each slot yourself to MAIN TCP (`127.0.0.1:<proxy_port>`) through **`SystemInformationPacket`** (external client, Ruffle, etc.).
 
 ## Configuration
 
@@ -35,7 +35,7 @@ Or with the frozen exe (from repo root, next to `bot\config.py`):
 
 Flags:
 
-- **`--headless`** — start built-in caseus clients (needs secrets JSON + upstream server in JSON or `UPSTREAM_SERVER_*` in config).
+- **`--headless`** — start built-in caseus clients (needs `.env` / `TFM_SECRETS_*`, inline secrets, or dumper; optional `UPSTREAM_SERVER_*`).
 - **`--no-headless`** — never start built-in clients (use an external connector).
 - **`--no-kill-stale`** — optional; do not kill processes already on your proxy ports.
 

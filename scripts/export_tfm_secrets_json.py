@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 r"""
-Write repo-root ``tfm-secrets.json`` for ``HEADLESS_SECRETS_JSON`` / headless mode.
+Write repo-root ``tfm-secrets.json`` (optional). For headless mode, copy values into repo-root ``.env`` as ``TFM_SECRETS_*`` or use ``HEADLESS_SECRETS_DUMPER``.
 
 1. If ``tfm-secrets`` is on PATH, its stdout is written (must be JSON).
 2. Otherwise uses ``caseus.Secrets.load_from_leaker_swf`` with ``TFMSecretsLeaker.swf``

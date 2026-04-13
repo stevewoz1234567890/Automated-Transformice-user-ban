@@ -1,11 +1,14 @@
 """
 One ``caseus.Client`` per slot connecting to the local BanBotProxy (no Flash).
 
-Secrets come from (in order): ``HEADLESS_SECRETS_INLINE`` (dict in ``bot/config.py``, same keys as
-tfm-secrets JSON), ``HEADLESS_SECRETS_DUMPER``, or ``HEADLESS_SECRETS_JSON`` / file fallback.
-Each client uses ``Secrets.copy(server_address=..., server_ports=(...))`` to target ``127.0.0.1:<proxy_port>``
-while ``BanBotProxy`` is given the real upstream from config or the dump so the proxy connects immediately.
+Secrets (no ``tfm-secrets.json`` in this flow):
 
+1. Optional ``HEADLESS_SECRETS_DUMPER`` — run a subprocess that prints tfm-secrets JSON on stdout;
+   parsed in memory only.
+2. Variables from the process environment, after loading repo-root ``.env`` (``TFM_SECRETS_*``).
+3. ``HEADLESS_SECRETS_INLINE`` dict in ``bot/config.py``.
+
+Each client uses ``Secrets.copy(server_address=..., server_ports=(...))`` to target ``127.0.0.1:<proxy_port>``.
 The proxy injects ``LoginPacket`` after ``SystemInformationPacket``; this client must **not** send
 its own ``LoginPacket`` (see ``HeadlessProxyClient.login`` no-op).
 """
@@ -15,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -30,6 +34,48 @@ from caseus.packets import clientbound, serverbound
 from caseus.util.crypto import shakikoo
 
 logger = logging.getLogger(__name__)
+
+
+def _secrets_repo_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _load_dotenv_file(path: Path) -> None:
+    """Minimal KEY=VAL loader (no python-dotenv). Does not override keys already in ``os.environ``."""
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("Could not read .env file %s", path)
+        return
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, rest = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        val = rest.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        if key not in os.environ:
+            os.environ[key] = val
+
+
+def _load_dotenv_for_headless(cfg: object) -> None:
+    rel = getattr(cfg, "HEADLESS_SECRETS_DOTENV_PATH", ".env")
+    p = Path(str(rel).strip()).expanduser()
+    if not p.is_absolute():
+        p = (_secrets_repo_root() / p).resolve()
+    _load_dotenv_file(p)
 
 
 def _secrets_from_config_inline(cfg: object) -> Secrets | None:
@@ -51,40 +97,47 @@ def _secrets_from_config_inline(cfg: object) -> Secrets | None:
     return Secrets(**kwargs)
 
 
-def _secrets_from_dumper_argv(argv: list[str]) -> Secrets:
-    """Run a secrets dumper subprocess (same contract as ``Secrets.load_from_dumper``)."""
+def _try_secrets_from_dumper_argv(argv: list[str], cfg: object) -> Secrets | None:
+    """Run a secrets dumper; parse JSON from stdout into ``Secrets``. No files read or written."""
+    timeout = float(getattr(cfg, "HEADLESS_SECRETS_DUMPER_TIMEOUT_SEC", 120.0) or 120.0)
     try:
         proc = subprocess.run(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=max(1.0, timeout),
         )
     except FileNotFoundError:
-        msg = (
-            f"Cannot run HEADLESS_SECRETS_DUMPER argv={argv!r}: program not found. "
-            "Install the tool in this venv (e.g. `pip install tfm-secrets`), set "
-            "HEADLESS_SECRETS_DUMPER to the full path of tfm-secrets.exe, or use a list like "
-            f"[{sys.executable!r}, '-m', '<module>']. Or set HEADLESS_SECRETS_JSON to a static file."
-        )
-        logger.error(msg)
-        raise SystemExit(msg) from None
+        logger.warning("Secrets dumper not found: argv=%r", argv)
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("Secrets dumper timed out after %ss: argv=%r", timeout, argv)
+        return None
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", errors="replace")
         out = proc.stdout.decode("utf-8", errors="replace")
-        logger.error(
+        logger.warning(
             "Secrets dumper failed (exit %s): stderr=%r stdout_preview=%r",
             proc.returncode,
             err[:2000],
             out[:500],
         )
-        raise SystemExit(f"Secrets dumper failed with exit code {proc.returncode}")
+        return None
     try:
         data: dict[str, Any] = json.loads(proc.stdout.decode("utf-8"))
     except json.JSONDecodeError as e:
-        logger.error("Secrets dumper stdout is not JSON: %s", e)
-        raise SystemExit("Secrets dumper did not print valid JSON on stdout") from e
-    return Secrets(**data)
+        logger.warning("Secrets dumper stdout is not JSON: %s", e)
+        return None
+    kwargs = {k: data[k] for k in Secrets._FIELDS if k in data}
+    if not kwargs:
+        logger.warning("Dumper JSON had no recognized Secrets fields.")
+        return None
+    try:
+        return Secrets(**kwargs)
+    except (TypeError, ValueError) as e:
+        logger.warning("Could not build Secrets from dumper JSON: %s", e)
+        return None
 
 
 def _try_argv_for_string_dumper(name: str) -> list[str] | None:
@@ -122,31 +175,69 @@ def _dumper_argv_from_config(dumper: Any) -> list[str] | None:
     return _try_argv_for_string_dumper(s)
 
 
-def _resolve_secrets_json_path(json_path: str) -> Path | None:
-    p = Path(str(json_path).strip()).expanduser()
-    if p.is_file():
-        return p
-    root = (
-        Path(sys.executable).resolve().parent
-        if getattr(sys, "frozen", False)
-        else Path(__file__).resolve().parent.parent
-    )
-    alt = (root / p).resolve()
-    if alt.is_file():
-        return alt
-    return None
+def _secrets_from_env(cfg: object) -> Secrets | None:
+    """Build ``Secrets`` from ``TFM_SECRETS_*`` (prefix configurable) in ``os.environ``."""
+    prefix = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_").strip()
+    if not prefix.endswith("_"):
+        prefix = f"{prefix}_"
+
+    def ge(suffix: str) -> str | None:
+        v = os.environ.get(f"{prefix}{suffix}")
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    addr = ge("SERVER_ADDRESS")
+    ports_s = ge("SERVER_PORTS")
+    gv = ge("GAME_VERSION")
+    tok = ge("CONNECTION_TOKEN")
+    ak = ge("AUTH_KEY")
+    pks = ge("PACKET_KEY_SOURCES")
+    cvt = ge("CLIENT_VERIFICATION_TEMPLATE")
+
+    if not any((addr, ports_s, gv, tok, ak, pks, cvt)):
+        return None
+
+    kwargs: dict[str, Any] = {}
+    if addr:
+        kwargs["server_address"] = addr
+    if ports_s:
+        kwargs["server_ports"] = tuple(
+            int(x.strip()) for x in ports_s.replace(" ", "").split(",") if x.strip()
+        )
+    if gv:
+        kwargs["game_version"] = int(gv, 0)
+    if tok:
+        kwargs["connection_token"] = tok
+    if ak:
+        kwargs["auth_key"] = int(ak, 0)
+    if pks:
+        kwargs["packet_key_sources"] = tuple(
+            int(x.strip()) for x in pks.replace(" ", "").split(",") if x.strip()
+        )
+    if cvt:
+        kwargs["client_verification_template"] = cvt
+
+    missing = [f for f in Secrets._FIELDS if f not in kwargs]
+    if missing:
+        logger.warning(
+            "Some %s* variables are missing (still building Secrets): %s",
+            prefix,
+            missing,
+        )
+    try:
+        return Secrets(**kwargs)
+    except (TypeError, ValueError) as e:
+        logger.error("Invalid values in environment for Secrets: %s", e)
+        return None
 
 
 def load_secrets_base(cfg: object) -> Secrets:
-    """Load server crypto parameters (not per-slot). Inline config dict wins over dumper / files."""
-    sec = _secrets_from_config_inline(cfg)
-    if sec is not None:
-        return sec
+    """Load server crypto: optional dumper (stdout JSON), then ``.env`` / env vars, then inline dict."""
+    _load_dotenv_for_headless(cfg)
 
-    json_path = getattr(cfg, "HEADLESS_SECRETS_JSON", None)
     dumper = getattr(cfg, "HEADLESS_SECRETS_DUMPER", None)
-    fallback_json = bool(getattr(cfg, "HEADLESS_FALLBACK_JSON_WHEN_DUMPER_UNAVAILABLE", True))
-
     dumper_nonempty = False
     if isinstance(dumper, (list, tuple)):
         dumper_nonempty = any(str(x).strip() for x in dumper)
@@ -156,44 +247,37 @@ def load_secrets_base(cfg: object) -> Secrets:
     if dumper_nonempty:
         argv = _dumper_argv_from_config(dumper)
         if argv:
-            return _secrets_from_dumper_argv(argv)
-        if fallback_json:
-            jp: Path | None = None
-            if json_path and str(json_path).strip():
-                jp = _resolve_secrets_json_path(str(json_path))
-            if jp is None:
-                jp = _resolve_secrets_json_path("tfm-secrets.json")
-            if jp is not None:
-                logger.warning(
-                    "HEADLESS_SECRETS_DUMPER is not installed or not on PATH; using %s "
-                    "(install tfm-secrets into this venv or set HEADLESS_FALLBACK_JSON_WHEN_DUMPER_UNAVAILABLE = False).",
-                    jp,
+            sec = _try_secrets_from_dumper_argv(argv, cfg)
+            if sec is not None:
+                logger.info(
+                    "Secrets from HEADLESS_SECRETS_DUMPER (subprocess JSON on stdout; no secret files read)."
                 )
-                data: dict[str, Any] = json.loads(jp.read_text(encoding="utf-8"))
-                return Secrets(**data)
+                return sec
         bindir = Path(sys.executable).resolve().parent
-        msg = (
-            f"HEADLESS_SECRETS_DUMPER {dumper!r} not found (PATH and {bindir} checked for "
-            f"{dumper!r}.exe / .cmd). Install the binary, or set PIP_INSTALL_TFM_SECRETS_CLI = True and "
-            "TFM_SECRETS_PIP_INSTALL_SPEC to a pip-installable package that provides the dumper command, "
-            f"or use [{sys.executable!r}, '-m', '<module>'], set HEADLESS_SECRETS_JSON fallback, "
-            "or define HEADLESS_SECRETS_INLINE in config."
+        logger.warning(
+            "HEADLESS_SECRETS_DUMPER is set but did not yield secrets (missing binary, failure, or timeout). "
+            "Checked PATH and %s for .exe/.cmd. Falling back to .env / HEADLESS_SECRETS_INLINE.",
+            bindir,
         )
-        logger.error(msg)
-        raise SystemExit(msg)
 
-    if json_path and str(json_path).strip():
-        p = _resolve_secrets_json_path(str(json_path))
-        if p is None:
-            msg = f"HEADLESS_SECRETS_JSON not found: {json_path!r}"
-            logger.error(msg)
-            raise SystemExit(msg)
-        data = json.loads(p.read_text(encoding="utf-8"))
-        return Secrets(**data)
+    sec = _secrets_from_env(cfg)
+    if sec is not None:
+        logger.info(
+            "Secrets from environment / %s (prefix %r).",
+            getattr(cfg, "HEADLESS_SECRETS_DOTENV_PATH", ".env"),
+            str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_"),
+        )
+        return sec
+
+    sec = _secrets_from_config_inline(cfg)
+    if sec is not None:
+        return sec
 
     msg = (
-        "Headless mode requires HEADLESS_SECRETS_INLINE (dict), HEADLESS_SECRETS_DUMPER, "
-        "or HEADLESS_SECRETS_JSON in bot/config.py."
+        "Headless needs secrets: set repo-root .env with TFM_SECRETS_SERVER_ADDRESS, "
+        "TFM_SECRETS_SERVER_PORTS (comma-separated), TFM_SECRETS_GAME_VERSION, TFM_SECRETS_CONNECTION_TOKEN, "
+        "TFM_SECRETS_AUTH_KEY, TFM_SECRETS_PACKET_KEY_SOURCES, TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE (hex), "
+        "or HEADLESS_SECRETS_INLINE, or a working HEADLESS_SECRETS_DUMPER. See .env.example."
     )
     logger.error(msg)
     raise SystemExit(msg)
