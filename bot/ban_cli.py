@@ -568,6 +568,16 @@ def main(argv: list[str] | None = None) -> None:
                 "threshold, or set it to 0 to attempt every slot.",
             )
             raise SystemExit(1)
+        missing_login = [s for s in states if not s.login_success_event.is_set()]
+        if missing_login:
+            logger.error(
+                "Headless attempted every slot but %s never reached LoginSuccess (labels: %s). "
+                "Check AccountError / wrong password lines above; fix BOT_ACCOUNTS_JSON or run "
+                "`python -m bot.validate_accounts --all`.",
+                len(missing_login),
+                ", ".join(s.label for s in missing_login),
+            )
+            raise SystemExit(1)
 
     _wait_for_all_slots_logged_in(states, cfg)
 
