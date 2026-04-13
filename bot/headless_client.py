@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -30,13 +32,84 @@ from caseus.util.crypto import shakikoo
 logger = logging.getLogger(__name__)
 
 
+def _secrets_from_dumper_argv(argv: list[str]) -> Secrets:
+    """Run a secrets dumper subprocess (same contract as ``Secrets.load_from_dumper``)."""
+    try:
+        proc = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError:
+        msg = (
+            f"Cannot run HEADLESS_SECRETS_DUMPER argv={argv!r}: program not found. "
+            "Install the tool in this venv (e.g. `pip install tfm-secrets`), set "
+            "HEADLESS_SECRETS_DUMPER to the full path of tfm-secrets.exe, or use a list like "
+            f"[{sys.executable!r}, '-m', '<module>']. Or set HEADLESS_SECRETS_JSON to a static file."
+        )
+        logger.error(msg)
+        raise SystemExit(msg) from None
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace")
+        out = proc.stdout.decode("utf-8", errors="replace")
+        logger.error(
+            "Secrets dumper failed (exit %s): stderr=%r stdout_preview=%r",
+            proc.returncode,
+            err[:2000],
+            out[:500],
+        )
+        raise SystemExit(f"Secrets dumper failed with exit code {proc.returncode}")
+    try:
+        data: dict[str, Any] = json.loads(proc.stdout.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        logger.error("Secrets dumper stdout is not JSON: %s", e)
+        raise SystemExit("Secrets dumper did not print valid JSON on stdout") from e
+    return Secrets(**data)
+
+
+def _dumper_argv_from_config(dumper: Any) -> list[str]:
+    if isinstance(dumper, (list, tuple)):
+        parts = [str(x) for x in dumper if str(x).strip()]
+        if len(parts) == 1:
+            return _dumper_argv_from_config(parts[0])
+        return parts
+    s = str(dumper).strip()
+    if not s:
+        return []
+    p = Path(s)
+    if p.is_file():
+        return [str(p.resolve())]
+    found = shutil.which(s)
+    if found:
+        return [found]
+    msg = (
+        f"HEADLESS_SECRETS_DUMPER {s!r} is not a file and not on PATH. "
+        "Install tfm-secrets in this venv, pass the full path to the .exe, or use "
+        f"[{sys.executable!r}, '-m', '<module>'] if the tool is a Python module."
+    )
+    logger.error(msg)
+    raise SystemExit(msg)
+
+
 def load_secrets_base(cfg: object) -> Secrets:
     """Load server crypto parameters (not per-slot). Prefer a live dumper each run over a JSON file."""
     json_path = getattr(cfg, "HEADLESS_SECRETS_JSON", None)
     dumper = getattr(cfg, "HEADLESS_SECRETS_DUMPER", None)
 
-    if dumper and str(dumper).strip():
-        return Secrets.load_from_dumper(str(dumper).strip())
+    dumper_nonempty = False
+    if isinstance(dumper, (list, tuple)):
+        dumper_nonempty = any(str(x).strip() for x in dumper)
+    elif dumper is not None:
+        dumper_nonempty = bool(str(dumper).strip())
+
+    if dumper_nonempty:
+        argv = _dumper_argv_from_config(dumper)
+        if not argv:
+            msg = "HEADLESS_SECRETS_DUMPER is empty"
+            logger.error(msg)
+            raise SystemExit(msg)
+        return _secrets_from_dumper_argv(argv)
 
     if json_path and str(json_path).strip():
         p = Path(str(json_path).strip()).expanduser()
