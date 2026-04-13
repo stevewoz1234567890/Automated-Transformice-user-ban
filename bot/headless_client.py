@@ -151,9 +151,9 @@ def load_secrets_base(cfg: object) -> Secrets:
         bindir = Path(sys.executable).resolve().parent
         msg = (
             f"HEADLESS_SECRETS_DUMPER {dumper!r} not found (PATH and {bindir} checked for "
-            f"{dumper!r}.exe / .cmd). Install the tfm-secrets binary, add it to PATH, set the dumper "
-            f"to the full .exe path, use [{sys.executable!r}, '-m', '<module>'], or set "
-            "HEADLESS_SECRETS_JSON to a tfm-secrets JSON file (and enable fallback, default True)."
+            f"{dumper!r}.exe / .cmd). Install the binary, or set PIP_INSTALL_TFM_SECRETS_CLI = True and "
+            "TFM_SECRETS_PIP_INSTALL_SPEC to a pip-installable package that provides the dumper command, "
+            f"or use [{sys.executable!r}, '-m', '<module>'], or rely on HEADLESS_SECRETS_JSON fallback."
         )
         logger.error(msg)
         raise SystemExit(msg)
@@ -177,30 +177,56 @@ def load_secrets_base(cfg: object) -> Secrets:
 
 def resolve_headless_upstream(cfg: object, base_secrets: Secrets) -> tuple[str, tuple[int, ...]]:
     """Pick upstream host/ports; warn or exit if config overrides disagree with this run's dump."""
-    ua = getattr(cfg, "UPSTREAM_SERVER_ADDRESS", None)
-    up = getattr(cfg, "UPSTREAM_SERVER_PORTS", None)
     dump_a = getattr(base_secrets, "server_address", None)
     dump_p = getattr(base_secrets, "server_ports", None)
+
+    if bool(getattr(cfg, "UPSTREAM_FROM_SECRETS_DUMP_ONLY", False)):
+        if not dump_a or not dump_p:
+            logger.error(
+                "UPSTREAM_FROM_SECRETS_DUMP_ONLY is True but Secrets lack server_address / server_ports."
+            )
+            raise SystemExit(1)
+        return str(dump_a).strip(), tuple(int(x) for x in dump_p)
+
+    ua = getattr(cfg, "UPSTREAM_SERVER_ADDRESS", None)
+    up = getattr(cfg, "UPSTREAM_SERVER_PORTS", None)
 
     ua_s = str(ua).strip() if ua is not None else ""
     if ua_s and up is not None and len(tuple(up)) > 0:
         chosen_a = ua_s
         chosen_p = tuple(int(x) for x in up)
+        match_dump_order = bool(getattr(cfg, "UPSTREAM_PORTS_MATCH_DUMP_ORDER", True))
+        effective_p = chosen_p
         if dump_a and dump_p:
             dump_p_i = tuple(int(x) for x in dump_p)
             same_a = chosen_a == str(dump_a).strip()
-            same_p = chosen_p == dump_p_i
+            strict = bool(getattr(cfg, "UPSTREAM_STRICT_MATCH_SECRETS_DUMP", False))
+            if strict:
+                same_p = chosen_p == dump_p_i
+            else:
+                same_p = len(chosen_p) == len(dump_p_i) and sorted(chosen_p) == sorted(
+                    dump_p_i
+                )
             if not (same_a and same_p):
                 msg = (
                     f"UPSTREAM_SERVER_* ({chosen_a!r}, {chosen_p}) differs from this run's secrets "
                     f"dump ({dump_a!r}, {dump_p_i}). A wrong shard often accepts TCP then closes with "
-                    "no handshake reply — align or clear UPSTREAM_SERVER_* to use the dump."
+                    "no handshake reply — align or clear UPSTREAM_SERVER_* or set "
+                    "UPSTREAM_FROM_SECRETS_DUMP_ONLY = True."
                 )
-                if bool(getattr(cfg, "UPSTREAM_STRICT_MATCH_SECRETS_DUMP", False)):
+                if strict:
                     logger.error(msg)
                     raise SystemExit(msg)
                 logger.warning(msg)
-        return chosen_a, chosen_p
+            elif same_p and match_dump_order:
+                effective_p = dump_p_i
+                if chosen_p != dump_p_i:
+                    logger.info(
+                        "Upstream ports use secrets dump order %s (config listed %s).",
+                        dump_p_i,
+                        chosen_p,
+                    )
+        return chosen_a, effective_p
 
     if not dump_a or not dump_p:
         logger.error(

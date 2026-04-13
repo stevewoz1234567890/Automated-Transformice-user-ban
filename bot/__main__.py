@@ -24,6 +24,26 @@ def _maybe_pip_install_caseus_git() -> None:
     subprocess.run(cmd, check=False)
 
 
+def _maybe_pip_install_tfm_secrets_cli() -> None:
+    """If config sets a pip spec, install it so ``tfm-secrets`` may appear in the venv Scripts (before headless load)."""
+    try:
+        from . import config as cfg
+    except ImportError:
+        return
+    if getattr(sys, "frozen", False):
+        return
+    if not getattr(cfg, "PIP_INSTALL_TFM_SECRETS_CLI", False):
+        return
+    spec = str(getattr(cfg, "TFM_SECRETS_PIP_INSTALL_SPEC", "") or "").strip()
+    if not spec:
+        return
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-U", spec],
+        check=False,
+    )
+
+
+_maybe_pip_install_tfm_secrets_cli()
 _maybe_pip_install_caseus_git()
 
 from .ban_cli import main
