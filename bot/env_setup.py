@@ -2,15 +2,144 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
+
+_NEW_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _normalize_accounts_json_text(s: str) -> str:
+    s = s.strip().strip("\ufeff")
+    return (
+        s.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+
+
+def _strip_js_trailing_commas(s: str) -> str:
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r",\s*]", "]", s)
+        s = re.sub(r",\s*}", "}", s)
+    return s
+
+
+def _parse_accounts_list(raw: str) -> list:
+    """Parse ``BOT_ACCOUNTS_JSON`` with JSON, trailing-comma cleanup, or Python ``literal_eval``."""
+    s = _normalize_accounts_json_text(raw)
+    if not s:
+        raise ValueError("empty string")
+    loose = _strip_js_trailing_commas(s)
+    errors: list[str] = []
+    for label, candidate in (
+        ("json", s),
+        ("json+trailing_commas", loose),
+    ):
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, list) and data:
+                if candidate != s:
+                    logger.info("BOT_ACCOUNTS_JSON: accepted as %s (normalized).", label)
+                return data
+        except json.JSONDecodeError as e:
+            errors.append(f"{label}: {e}")
+    for label, candidate in (("literal_eval", s), ("literal_eval+trailing_commas", loose)):
+        try:
+            data = ast.literal_eval(candidate)
+            if isinstance(data, list) and data:
+                logger.info("BOT_ACCOUNTS_JSON: parsed via %s (Python-style list).", label)
+                return data
+        except (ValueError, SyntaxError) as e:
+            errors.append(f"{label}: {e}")
+    bracket = s.find("[")
+    if bracket > 0:
+        try:
+            return _parse_accounts_list(s[bracket:])
+        except ValueError:
+            pass
+    raise ValueError("; ".join(errors) if errors else "no parse strategy matched")
+
+
+def _try_parse_accounts_list(raw: str) -> bool:
+    try:
+        _parse_accounts_list(raw)
+        return True
+    except ValueError:
+        return False
+
+
+def _raw_bot_accounts_json_from_dotenv(dot: Path) -> str | None:
+    """
+    Read ``BOT_ACCOUNTS_JSON`` from ``.env`` with multiline / bracket continuation.
+    The line-based ``load_dotenv_file`` only keeps the first line of an unquoted value.
+    """
+    if not dot.is_file():
+        return None
+    try:
+        text = dot.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    lines = text.splitlines()
+    for i, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, val0 = line.partition("=")
+        if key.strip().lower() != "bot_accounts_json":
+            continue
+        val0 = val0.strip()
+        if not val0:
+            return None
+        if val0.startswith('"'):
+            try:
+                decoded = json.loads(val0)
+                if isinstance(decoded, str):
+                    val0 = decoded
+                elif isinstance(decoded, list):
+                    return json.dumps(decoded, separators=(",", ":"))
+            except json.JSONDecodeError:
+                pass
+        elif len(val0) >= 2 and val0[0] == val0[-1] == "'":
+            val0 = val0[1:-1].replace("\\'", "'")
+        if _try_parse_accounts_list(val0):
+            return val0
+        parts: list[str] = [val0]
+        for j in range(i + 1, len(lines)):
+            nxt = lines[j].strip()
+            if not nxt or nxt.startswith("#"):
+                continue
+            if _NEW_ENV_ASSIGN.match(nxt):
+                break
+            parts.append(nxt)
+            merged = "".join(parts)
+            if _try_parse_accounts_list(merged):
+                logger.info(
+                    "BOT_ACCOUNTS_JSON: merged %s lines from .env (multiline value).",
+                    len(parts),
+                )
+                return merged
+        merged = "".join(parts)
+        return merged
+    return None
+
 
 # Non-secret bot knobs: merged into ``.env`` when the key is missing or has an empty value.
 # Game secrets use ``TFM_SECRETS_*`` from ``.env.example`` (filled by the user).
@@ -274,14 +403,20 @@ def load_bot_config() -> SimpleNamespace:
     """Load ``cfg`` with the same attribute names as the former ``bot/config.py`` module."""
     prepare_runtime_environment()
 
-    accounts_raw = os.environ.get("BOT_ACCOUNTS_JSON", "").strip()
+    dot = _bootstrap_dotenv_path()
+    accounts_raw = _raw_bot_accounts_json_from_dotenv(dot)
+    if accounts_raw is None or not str(accounts_raw).strip():
+        accounts_raw = os.environ.get("BOT_ACCOUNTS_JSON", "").strip()
     if not accounts_raw:
         logger.error("BOT_ACCOUNTS_JSON is empty in .env (see .env.example).")
         raise SystemExit(1)
     try:
-        accounts = json.loads(accounts_raw)
-    except json.JSONDecodeError as e:
-        logger.error("BOT_ACCOUNTS_JSON is not valid JSON: %s", e)
+        accounts = _parse_accounts_list(accounts_raw)
+    except ValueError as e:
+        logger.error(
+            "BOT_ACCOUNTS_JSON could not be parsed (use strict JSON array or Python list syntax): %s",
+            e,
+        )
         raise SystemExit(1) from e
     if not isinstance(accounts, list) or not accounts:
         logger.error("BOT_ACCOUNTS_JSON must be a non-empty JSON array of account objects.")

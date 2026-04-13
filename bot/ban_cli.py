@@ -378,6 +378,23 @@ def main(argv: list[str] | None = None) -> None:
         proxy_bind = proxy_bind.strip() or None
 
     raw_accounts = cfg.ACCOUNTS
+    headless_auto = (
+        (bool(getattr(cfg, "HEADLESS_AUTO_LOGIN", False)) or args.headless)
+        and not args.no_headless
+    )
+    for i, row in enumerate(raw_accounts):
+        label = str(row.get("label", i + 1))
+        u = str(row.get("username", "") or "").strip()
+        pw = str(row.get("password", "") or "")
+        if not u or not pw.strip():
+            logger.error(
+                "BOT_ACCOUNTS_JSON slot %s: username and password must be non-empty "
+                "(required for proxy LoginPacket%s).",
+                label,
+                " and headless TCP login" if headless_auto else "",
+            )
+            raise SystemExit(1)
+
     # False: listen on PROXY_BIND_HOST or all interfaces; row bind_ip is Proxifier reference only.
     # True only if each bind_ip is assigned to a NIC on *this* machine (otherwise bind() fails).
     use_account_bind_ip = getattr(cfg, "PROXY_LISTEN_USE_ACCOUNT_BIND_IP", False)
@@ -459,10 +476,6 @@ def main(argv: list[str] | None = None) -> None:
         row_dict["_flash_connect_host"] = st.proxy_bind_host if st.proxy_bind_host else "127.0.0.1"
         st.packet_loader_url = flash_launch.loader_document_url_for_row(row_dict, repo_root()) or ""
 
-    headless_auto = (
-        (bool(getattr(cfg, "HEADLESS_AUTO_LOGIN", False)) or args.headless)
-        and not args.no_headless
-    )
     upstream_addr: str | None = None
     upstream_ports: tuple[int, ...] | None = None
     base_secrets = None
