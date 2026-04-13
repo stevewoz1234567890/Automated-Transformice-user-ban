@@ -7,6 +7,7 @@ Same architecture as stevewoz1234567890/transformice-bot (caseus.Proxy + tfm-pro
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import random
 import sys
@@ -78,6 +79,30 @@ def _account_error_hint(code: int | None) -> str:
         int(code),
         "no local mapping — compare with in-game message / community",
     )
+
+
+def _tcp_teardown_after_login_ok(ev: threading.Event | None, exc: BaseException) -> bool:
+    """True when the session died with a normal \"connection lost\" after ``LoginSuccess`` (e.g. headless closes TCP)."""
+    if ev is None or not ev.is_set():
+        return False
+    if isinstance(exc, asyncio.CancelledError):
+        return False
+    if isinstance(exc, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+        return True
+    if isinstance(exc, OSError):
+        w = getattr(exc, "winerror", None)
+        if w in (64, 995):
+            return True
+        en = getattr(exc, "errno", None)
+        if en is not None and en in (
+            errno.ECONNRESET,
+            errno.EPIPE,
+            errno.ECONNABORTED,
+        ):
+            return True
+    if type(exc).__name__ == "IncompleteReadError":
+        return True
+    return False
 
 
 class _UpstreamDiagReader:
@@ -276,6 +301,15 @@ class BanBotProxy(Proxy):
             except asyncio.CancelledError:
                 raise
             except BaseException as e:
+                if _tcp_teardown_after_login_ok(self._login_success_event, e):
+                    logger.info(
+                        "Slot %s: [login] %s closed after LoginSuccess (%s: %s) — expected when headless drops TCP",
+                        self.slot_label,
+                        label,
+                        type(e).__name__,
+                        e,
+                    )
+                    return
                 logger.exception(
                     "Slot %s: [login] MAIN listen stopped on %s - %s: %s "
                     "(parse/decrypt vs secrets, wrong game_version, or truncated TCP; "
@@ -970,6 +1004,18 @@ class BanBotProxy(Proxy):
                     "`python -m bot.upstream_probe <host> <ports>`; else tfm-secrets / UPSTREAM_SERVER_*.",
                     self.slot_label,
                     err_s,
+                )
+                return
+            raise
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            if _tcp_teardown_after_login_ok(self._login_success_event, e):
+                logger.info(
+                    "Slot %s: [login] main session ended after LoginSuccess (%s: %s)",
+                    self.slot_label,
+                    type(e).__name__,
+                    e,
                 )
                 return
             raise
