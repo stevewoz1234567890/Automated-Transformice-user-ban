@@ -5,10 +5,12 @@ Secrets (no ``tfm-secrets.json`` in this flow):
 
 1. Complete ``TFM_SECRETS_*`` in repo-root ``.env`` after ``load_dotenv_file``.
 2. Or ``BOT_HEADLESS_SECRETS_INLINE_JSON`` on ``cfg``.
-3. Or a subprocess dumper (JSON on stdout). If ``BOT_HEADLESS_SECRETS_DUMPER`` is empty but
-   ``BOT_HEADLESS_SECRETS_AUTO_DUMPER`` is true (default), ``tfm-secrets`` is run when ``.env`` is
-   incomplete. On success, values are written back to ``.env`` when
-   ``BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV`` is true (default).
+3. Or ``tfm-secrets`` on stdout when ``BOT_HEADLESS_SECRETS_AUTO_DUMPER`` is true (default).
+4. Or TFMSecretsLeaker.swf via Flash debug projector when ``BOT_HEADLESS_SECRETS_AUTO_LEAKER_SWF``
+   is true (default): place ``flashplayer_32_sa_debug.exe`` in the repo root or set
+   ``FLASHPLAYER_DEBUG``; the leaker SWF is downloaded to ``tmp/`` automatically.
+   On success, values are written back to ``.env`` when ``BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV``
+   is true (default).
 
 Each client uses ``Secrets.copy(server_address=..., server_ports=(...))`` to target ``127.0.0.1:<proxy_port>``.
 The proxy injects ``LoginPacket`` after ``SystemInformationPacket``; this client must **not** send
@@ -33,6 +35,7 @@ import pak
 from caseus import Secrets
 
 from .env_setup import load_dotenv_file, repo_root, update_or_append_dotenv
+from .tfm_secrets_acquire import try_load_secrets_via_leaker
 from caseus.clients.client import AccountError, Client
 from caseus.packets import clientbound, serverbound
 from caseus.util.crypto import shakikoo
@@ -183,6 +186,27 @@ def _secrets_to_tfm_env_updates(secrets: Secrets, prefix: str) -> dict[str, str]
     }
 
 
+def _persist_secrets_to_dotenv(sec: Secrets, cfg: object, dot: Path) -> None:
+    pfx = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_")
+    if bool(getattr(cfg, "HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV", True)):
+        updates = _secrets_to_tfm_env_updates(sec, pfx)
+        try:
+            update_or_append_dotenv(dot, updates)
+            for k, v in updates.items():
+                os.environ[k] = v
+            logger.info(
+                "Wrote %s TFM secrets fields to %s (BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV).",
+                len(updates),
+                dot,
+            )
+        except OSError as e:
+            logger.warning("Could not persist secrets to %s: %s", dot, e)
+    else:
+        logger.info(
+            "Not writing secrets to .env (BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV is false)."
+        )
+
+
 def _secrets_from_env(cfg: object) -> Secrets | None:
     """Build ``Secrets`` from ``TFM_SECRETS_*`` (prefix configurable) in ``os.environ``."""
     prefix = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_").strip()
@@ -264,6 +288,22 @@ def load_secrets_base(cfg: object) -> Secrets:
     dumper_spec = _effective_dumper_spec(cfg)
     if dumper_spec is not None:
         argv = _dumper_argv_from_config(dumper_spec)
+        spec = str(getattr(cfg, "TFM_SECRETS_PIP_INSTALL_SPEC", "") or "").strip()
+        if (
+            argv is None
+            and spec
+            and not getattr(sys, "frozen", False)
+            and bool(getattr(cfg, "HEADLESS_SECRETS_AUTO_PIP_BEFORE_DUMPER", True))
+        ):
+            logger.info(
+                "tfm-secrets not found; running pip install -U %s (BOT_TFM_SECRETS_PIP_INSTALL_SPEC).",
+                spec,
+            )
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-U", spec],
+                check=False,
+            )
+            argv = _dumper_argv_from_config(dumper_spec)
         if argv:
             logger.info(
                 "TFM secrets incomplete in .env; running dumper argv=%r (set BOT_HEADLESS_SECRETS_AUTO_DUMPER=false to skip).",
@@ -271,31 +311,23 @@ def load_secrets_base(cfg: object) -> Secrets:
             )
             sec = _try_secrets_from_dumper_argv(argv, cfg)
             if sec is not None:
-                pfx = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_")
-                if bool(getattr(cfg, "HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV", True)):
-                    updates = _secrets_to_tfm_env_updates(sec, pfx)
-                    try:
-                        update_or_append_dotenv(dot, updates)
-                        for k, v in updates.items():
-                            os.environ[k] = v
-                        logger.info(
-                            "Wrote %s TFM secrets fields to %s (BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV).",
-                            len(updates),
-                            dot,
-                        )
-                    except OSError as e:
-                        logger.warning("Could not persist secrets to %s: %s", dot, e)
-                else:
-                    logger.info(
-                        "Not writing secrets to .env (BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV is false)."
-                    )
+                _persist_secrets_to_dotenv(sec, cfg, dot)
                 return sec
-        bindir = Path(sys.executable).resolve().parent
-        logger.warning(
-            "Secrets dumper did not yield secrets (argv=%r). Checked PATH and %s for tfm-secrets.",
-            argv,
-            bindir,
-        )
+            logger.warning("Secrets dumper ran but did not return usable secrets.")
+        else:
+            bindir = Path(sys.executable).resolve().parent
+            logger.info(
+                "tfm-secrets executable not found (checked PATH and %s). "
+                "Install the CLI, set BOT_TFM_SECRETS_PIP_INSTALL_SPEC + pip retry, or use Flash leaker below.",
+                bindir,
+            )
+
+    if bool(getattr(cfg, "HEADLESS_SECRETS_AUTO_LEAKER_SWF", True)):
+        sec = try_load_secrets_via_leaker(repo_root())
+        if sec is not None:
+            logger.info("Secrets from TFMSecretsLeaker.swf (Flash debug projector).")
+            _persist_secrets_to_dotenv(sec, cfg, dot)
+            return sec
 
     pfx = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_").strip()
     if not pfx.endswith("_"):
@@ -309,9 +341,10 @@ def load_secrets_base(cfg: object) -> Secrets:
         nonempty or "(none)",
     )
     msg = (
-        "Headless needs secrets: install `tfm-secrets` on PATH (venv Scripts) or set BOT_HEADLESS_SECRETS_DUMPER, "
-        "or fill every TFM_SECRETS_* in .env, or set BOT_HEADLESS_SECRETS_INLINE_JSON. "
-        "Optional: BOT_PIP_INSTALL_TFM_SECRETS_CLI + BOT_TFM_SECRETS_PIP_INSTALL_SPEC then re-run."
+        "Headless needs secrets: (1) Place flashplayer_32_sa_debug.exe in the repo root (or set FLASHPLAYER_DEBUG) "
+        "so TFMSecretsLeaker.swf can run; (2) or install tfm-secrets on PATH / set BOT_TFM_SECRETS_PIP_INSTALL_SPEC; "
+        "(3) or fill TFM_SECRETS_* in .env; (4) or set BOT_HEADLESS_SECRETS_INLINE_JSON. "
+        "Disable Flash fallback with BOT_HEADLESS_SECRETS_AUTO_LEAKER_SWF=false if undesired."
     )
     logger.error(msg)
     raise SystemExit(1)

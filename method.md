@@ -8,7 +8,7 @@ The bot **never** starts Flash Player or `TFMProxyLoader.swf`. The proxy **alway
 
 - Python 3.10+ and `pip install -r requirements.txt` (see root `README.md`).
 - **`.env`** with **`BOT_ACCOUNTS_JSON`**: each slot needs **`proxy_port`**, **`username`**, **`password`**, and optional **`label`** / **`bind_ip`**. The first run copies **`.env.example`** → **`.env`** when missing and merges default **`BOT_*`** keys.
-- **Either** enable **headless TCP** (`python -m bot --headless` or **`BOT_HEADLESS_AUTO_LOGIN=true`**) with **`.env`**: full **`TFM_SECRETS_*`**, or leave them blank and rely on **`tfm-secrets`** (auto-run when incomplete; results saved to **`.env`** by default), or **`BOT_HEADLESS_SECRETS_INLINE_JSON`** / **`BOT_HEADLESS_SECRETS_DUMPER`**. **Or** connect each slot yourself to MAIN TCP (`127.0.0.1:<proxy_port>`) through **`SystemInformationPacket`** (external client, Ruffle, etc.).
+- **Either** enable **headless TCP** (`python -m bot --headless` or **`BOT_HEADLESS_AUTO_LOGIN=true`**) with **`.env`**: full **`TFM_SECRETS_*`**, or leave them blank and rely on auto **`tfm-secrets`** / optional pip spec, then **TFMSecretsLeaker.swf** + **Flash debug projector** in the repo root (see **`README.md`**), or **`BOT_HEADLESS_SECRETS_INLINE_JSON`** / **`BOT_HEADLESS_SECRETS_DUMPER`**. **Or** connect each slot yourself to MAIN TCP (`127.0.0.1:<proxy_port>`) through **`SystemInformationPacket`** (external client, Ruffle, etc.).
 
 ## Configuration
 
