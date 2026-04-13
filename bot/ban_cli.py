@@ -2,7 +2,8 @@
 CMD entry: multi-slot local proxies, /room on all clients, then staggered /ban.
 
 Enable automatic TCP login with ``BOT_HEADLESS_AUTO_LOGIN=true`` in repo-root ``.env`` or by running
-``python -m bot --headless``. That starts one **caseus** client per slot to each local proxy port
+``python -m bot --headless``. That starts one **caseus** client per slot to each local proxy port.
+Set ``BOT_HEADLESS_PARALLEL_LOGIN=true`` so every slot logs in at the same time (persistent TCP per slot).
 (``HandshakePacket`` + ``SystemInformationPacket``); the proxy injects ``LoginPacket`` (see ``ban_proxy``).
 Requires ``TFM_SECRETS_*`` in ``.env`` (see ``.env.example``), or ``BOT_HEADLESS_SECRETS_INLINE_JSON``,
 or ``BOT_HEADLESS_SECRETS_DUMPER`` (subprocess prints JSON to stdout; no secret files). Optional
@@ -263,37 +264,69 @@ def start_all_slots(
     time.sleep(1.0)
 
 
-def _wait_for_all_slots_logged_in(states: list[SlotState], cfg: object) -> None:
-    """Block until every slot has received LoginSuccessPacket (or timeout)."""
+def _slots_login_pending(states: list[SlotState]) -> tuple[list[str], list[str]]:
+    """Return (labels waiting on proxy startup, labels waiting on LoginSuccess)."""
+    no_proxy: list[str] = []
+    no_login: list[str] = []
+    for s in states:
+        if s.proxy is None:
+            no_proxy.append(s.label)
+        elif not s.login_success_event.is_set():
+            no_login.append(s.label)
+    return no_proxy, no_login
+
+
+def _wait_for_all_slots_logged_in(states: list[SlotState], cfg: object) -> bool:
+    """
+    Block until every slot has a running proxy and has received LoginSuccessPacket.
+
+    Returns True when all accounts are ready; False if ``ALL_SLOTS_LOGIN_TIMEOUT_SEC`` elapses first.
+    """
     timeout_sec = float(getattr(cfg, "ALL_SLOTS_LOGIN_TIMEOUT_SEC", 7200.0) or 7200.0)
     timeout_sec = max(60.0, timeout_sec)
     n = len(states)
     logger.info(
-        "Waiting until all %s slot(s) report login success (timeout %.0fs)...",
+        "Waiting until all %s slot(s) have proxy + login success (timeout %.0fs)...",
         n,
         timeout_sec,
     )
     deadline = time.monotonic() + timeout_sec
     poll_sec = 2.0
+    heartbeat_sec = 30.0
+    last_hb = time.monotonic()
     while time.monotonic() < deadline:
-        pending = [
-            s
-            for s in states
-            if s.proxy is not None and not s.login_success_event.is_set()
-        ]
-        if not pending:
-            logger.info("All %s slot(s) logged in.", n)
-            return
+        no_proxy, no_login = _slots_login_pending(states)
+        if not no_proxy and not no_login:
+            labels = ", ".join(s.label for s in states)
+            logger.info(
+                "Confirmed: all %s account(s) logged in (slots: %s).",
+                n,
+                labels,
+            )
+            return True
+        now = time.monotonic()
+        if now - last_hb >= heartbeat_sec:
+            logger.info(
+                "Still waiting for all accounts: %s slot(s) without proxy, %s without LoginSuccess "
+                "(labels: proxy=%s login=%s)",
+                len(no_proxy),
+                len(no_login),
+                ", ".join(no_proxy) if no_proxy else "—",
+                ", ".join(no_login) if no_login else "—",
+            )
+            last_hb = now
         time.sleep(poll_sec)
-    labels = [
-        s.label
-        for s in states
-        if s.proxy is not None and not s.login_success_event.is_set()
-    ]
-    logger.warning(
-        "Timeout waiting for login — missing slot(s): %s. Continuing anyway.",
-        ", ".join(labels) if labels else "(none)",
+    no_proxy, no_login = _slots_login_pending(states)
+    parts: list[str] = []
+    if no_proxy:
+        parts.append(f"no proxy ({', '.join(no_proxy)})")
+    if no_login:
+        parts.append(f"no LoginSuccess ({', '.join(no_login)})")
+    logger.error(
+        "Timeout: not all accounts ready before room prompt — %s",
+        "; ".join(parts) if parts else "unknown",
     )
+    return False
 
 
 def _run_coro_on_slot(state: SlotState, coro):
@@ -563,9 +596,11 @@ def main(argv: list[str] | None = None) -> None:
             base_secrets=base_secrets,
         ):
             logger.error(
-                "Aborting: headless login stopped early (BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES). "
-                "Remaining slots never attempted login — fix upstream reachability or credentials, raise the "
-                "threshold, or set it to 0 to attempt every slot.",
+                "Aborting: headless login did not complete for all slots. Sequential mode: "
+                "BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES stopped the loop, or a slot never reached "
+                "LoginSuccess. Parallel mode (BOT_HEADLESS_PARALLEL_LOGIN): timed out per "
+                "BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC or some slots never logged in. Fix credentials/upstream, "
+                "adjust stagger/timeouts, or set BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES=0 for sequential.",
             )
             raise SystemExit(1)
         missing_login = [s for s in states if not s.login_success_event.is_set()]
@@ -578,8 +613,23 @@ def main(argv: list[str] | None = None) -> None:
                 ", ".join(s.label for s in missing_login),
             )
             raise SystemExit(1)
+        if not bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", False)) and bool(
+            getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True)
+        ):
+            logger.error(
+                "Refusing to continue: sequential headless closes TCP after each LoginSuccess, so no slot "
+                "stays in-game for /room or /ban. Set BOT_HEADLESS_PARALLEL_LOGIN=true in .env, or use "
+                "Flash/Proxifier clients with --no-headless.",
+            )
+            raise SystemExit(1)
 
-    _wait_for_all_slots_logged_in(states, cfg)
+    if not _wait_for_all_slots_logged_in(states, cfg):
+        logger.error(
+            "Aborting: not every account reached login success within the timeout. "
+            "Fix credentials, upstream, or BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC; for headless multi-slot use "
+            "BOT_HEADLESS_PARALLEL_LOGIN=true.",
+        )
+        raise SystemExit(1)
 
     while True:
         room = input("Target room (text after /room, e.g. *Racing1): ").strip()

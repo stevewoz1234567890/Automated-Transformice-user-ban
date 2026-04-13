@@ -645,6 +645,7 @@ def _run_one_slot_headless(
     row: dict[str, object],
     cfg: object,
     base_secrets: Secrets,
+    exit_after_login_success: bool | None = None,
 ) -> None:
     label = state.label
     main_port = state.port
@@ -668,6 +669,9 @@ def _run_one_slot_headless(
         connect_host,
         main_port,
     )
+    exit_after = exit_after_login_success
+    if exit_after is None:
+        exit_after = bool(getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True))
     try:
         asyncio.run(
             _run_one_client(
@@ -677,9 +681,7 @@ def _run_one_slot_headless(
                 start_room=start_room,
                 login_success_event=state.login_success_event,
                 connect_to_satellite=bool(getattr(cfg, "HEADLESS_CONNECT_TO_SATELLITE", True)),
-                exit_after_login_success=bool(
-                    getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True)
-                ),
+                exit_after_login_success=exit_after,
             )
         )
         if not state.login_success_event.is_set():
@@ -705,25 +707,78 @@ def start_headless_client_threads(
     base_secrets: Secrets | None = None,
 ) -> bool:
     """
-    Run headless TCP login **one slot at a time** (main thread): each ``HeadlessProxyClient`` runs
-    to completion before the next starts. This avoids hammering the game server with parallel
-    handshakes from one host.
+    Run headless TCP login for every slot.
 
-    ``HEADLESS_LOGIN_STAGGER_SEC`` (default 6) is the pause **between** finishing one slot and
-    starting the next (not used for overlapping parallel starts). Increase if you see WinError 121
-    on later slots (rate limiting / connect timeouts).
+    **Sequential (default,** ``BOT_HEADLESS_PARALLEL_LOGIN=false``): one ``HeadlessProxyClient`` at a
+    time on the main thread. Avoids hammering the game server with parallel handshakes from one host.
+    ``BOT_HEADLESS_LOGIN_STAGGER_SEC`` is the pause between finishing one slot and starting the next.
 
-    ``HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES`` (default 3): if > 0, stop after that many slots
-    in a row without ``LoginSuccess`` (avoids hammering upstream when the first slots fail). Set to 0
-    to disable.
+    **Parallel (** ``BOT_HEADLESS_PARALLEL_LOGIN=true``): one daemon thread per slot, each runs its own
+    ``asyncio`` loop so every account can stay connected at once. Sessions keep the TCP session open
+    (``exit_after_login_success`` is forced off for this path). Optional
+    ``BOT_HEADLESS_PARALLEL_START_STAGGER_SEC`` offsets each thread's start by ``index * stagger`` to
+    reduce simultaneous connects (WinError 121). This function blocks until every slot reaches
+    ``LoginSuccess`` or ``BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC`` elapses.
 
-    After a slot hits upstream **WinError 121**, the pause before the next slot increases by
-    ``HEADLESS_STAGGER_WIN121_EXTRA_SEC`` up to ``HEADLESS_STAGGER_MAX_SEC``.
+    ``HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES`` applies only to sequential mode.
 
-    Returns ``False`` if the loop stopped early because of ``HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES``;
-    ``True`` if every slot received a headless attempt (even when some attempts fail).
+    Returns ``False`` if sequential mode stopped early (consecutive failures) or parallel mode timed
+    out before all slots logged in; ``True`` otherwise.
     """
     base = base_secrets if base_secrets is not None else load_secrets_base(cfg)
+    pairs = list(zip(states, raw_accounts))
+
+    if bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", False)):
+        if int(getattr(cfg, "HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES", 0) or 0) > 0:
+            logger.info(
+                "BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES is ignored when "
+                "BOT_HEADLESS_PARALLEL_LOGIN is true.",
+            )
+        start_stagger = float(getattr(cfg, "HEADLESS_PARALLEL_START_STAGGER_SEC", 0.0) or 0.0)
+        start_stagger = max(0.0, start_stagger)
+        n = len(pairs)
+        logger.info(
+            "Headless parallel login: starting %s caseus.Client thread(s); "
+            "sessions stay open after LoginSuccess.",
+            n,
+        )
+
+        def _run_slot(idx: int, st: Any, rw: dict[str, object]) -> None:
+            if start_stagger > 0 and idx > 0:
+                time.sleep(start_stagger * idx)
+            _run_one_slot_headless(
+                state=st,
+                row=rw,
+                cfg=cfg,
+                base_secrets=base,
+                exit_after_login_success=False,
+            )
+
+        for i, (state, row) in enumerate(pairs):
+            threading.Thread(
+                target=_run_slot,
+                args=(i, state, row),
+                name=f"tfm-headless-{state.label}",
+                daemon=True,
+            ).start()
+
+        timeout_sec = float(getattr(cfg, "ALL_SLOTS_LOGIN_TIMEOUT_SEC", 7200.0) or 7200.0)
+        timeout_sec = max(60.0, timeout_sec)
+        deadline = time.monotonic() + timeout_sec
+        poll_sec = 0.25
+        while time.monotonic() < deadline:
+            if all(st.login_success_event.is_set() for st, _ in pairs):
+                logger.info("Headless parallel login: all %s slot(s) reached LoginSuccess.", n)
+                return True
+            time.sleep(poll_sec)
+        pending = [st.label for st, _ in pairs if not st.login_success_event.is_set()]
+        logger.error(
+            "Headless parallel login timed out after %.0fs — missing LoginSuccess for slot(s): %s",
+            timeout_sec,
+            ", ".join(pending) if pending else "(unknown)",
+        )
+        return False
+
     base_gap = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 6.0) or 0.0)
     base_gap = max(0.0, base_gap)
     adaptive_gap = base_gap
@@ -731,7 +786,6 @@ def start_headless_client_threads(
     gap_cap = float(getattr(cfg, "HEADLESS_STAGGER_MAX_SEC", 15.0) or 15.0)
     max_consec = int(getattr(cfg, "HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES", 0) or 0)
 
-    pairs = list(zip(states, raw_accounts))
     consec_fail = 0
     for i, (state, row) in enumerate(pairs):
         if max_consec > 0 and consec_fail >= max_consec:
