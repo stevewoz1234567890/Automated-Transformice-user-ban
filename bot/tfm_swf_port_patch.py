@@ -113,7 +113,7 @@ def build_patched_loader_swf(
     # Bump name so caches built with the old (wrong FileLength) patcher are ignored.
     out = cache_dir / f"TFMProxyLoader_patched_{safe_host}_{port}_zwsflen.swf"
     if out.is_file() and out.stat().st_size > 0:
-        logger.info("Using cached patched loader port %s -> %s", port, out)
+        logger.debug("Using cached patched loader port %s -> %s", port, out)
         return out
 
     raw = source_zws.read_bytes()

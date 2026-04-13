@@ -17,9 +17,9 @@ build/
 .mypy_cache/
 
 # Local overrides / secrets
-bot/config.py
 config.py
 .env
+tfm-secrets.json
 *.log
 log.txt
 
