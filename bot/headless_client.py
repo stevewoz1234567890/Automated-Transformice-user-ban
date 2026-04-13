@@ -70,12 +70,36 @@ def _load_dotenv_file(path: Path) -> None:
             os.environ[key] = val
 
 
-def _load_dotenv_for_headless(cfg: object) -> None:
+def _resolved_dotenv_path(cfg: object) -> Path:
     rel = getattr(cfg, "HEADLESS_SECRETS_DOTENV_PATH", ".env")
     p = Path(str(rel).strip()).expanduser()
     if not p.is_absolute():
         p = (_secrets_repo_root() / p).resolve()
-    _load_dotenv_file(p)
+    return p
+
+
+def _maybe_seed_dotenv_from_example(cfg: object) -> None:
+    """If ``.env`` is missing and ``.env.example`` exists, copy it once so users can fill values."""
+    if not getattr(cfg, "HEADLESS_SECRETS_SEED_DOTENV_FROM_EXAMPLE", True):
+        return
+    dot = _resolved_dotenv_path(cfg)
+    if dot.is_file():
+        return
+    ex = _secrets_repo_root() / ".env.example"
+    if not ex.is_file():
+        return
+    try:
+        dot.write_text(ex.read_text(encoding="utf-8"), encoding="utf-8")
+        logger.warning(
+            "Created %s from .env.example — fill TFM_SECRETS_* and run again.",
+            dot,
+        )
+    except OSError as e:
+        logger.warning("Could not create .env from .env.example: %s", e)
+
+
+def _load_dotenv_for_headless(cfg: object) -> None:
+    _load_dotenv_file(_resolved_dotenv_path(cfg))
 
 
 def _secrets_from_config_inline(cfg: object) -> Secrets | None:
@@ -222,10 +246,12 @@ def _secrets_from_env(cfg: object) -> Secrets | None:
     missing = [f for f in Secrets._FIELDS if f not in kwargs]
     if missing:
         logger.warning(
-            "Some %s* variables are missing (still building Secrets): %s",
+            "Incomplete %s* / .env: missing %s (filled: %s). Fill every field from .env.example.",
             prefix,
             missing,
+            tuple(sorted(kwargs.keys())) or "(none)",
         )
+        return None
     try:
         return Secrets(**kwargs)
     except (TypeError, ValueError) as e:
@@ -235,6 +261,7 @@ def _secrets_from_env(cfg: object) -> Secrets | None:
 
 def load_secrets_base(cfg: object) -> Secrets:
     """Load server crypto: optional dumper (stdout JSON), then ``.env`` / env vars, then inline dict."""
+    _maybe_seed_dotenv_from_example(cfg)
     _load_dotenv_for_headless(cfg)
 
     dumper = getattr(cfg, "HEADLESS_SECRETS_DUMPER", None)
@@ -273,11 +300,24 @@ def load_secrets_base(cfg: object) -> Secrets:
     if sec is not None:
         return sec
 
+    dot = _resolved_dotenv_path(cfg)
+    pfx = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_").strip()
+    if not pfx.endswith("_"):
+        pfx = f"{pfx}_"
+    nonempty = sorted(k for k in os.environ if k.startswith(pfx) and str(os.environ.get(k, "")).strip())
+    logger.error(
+        "Expected secrets file: %s (exists=%s). Non-empty %s* keys after load: %s",
+        dot,
+        dot.is_file(),
+        pfx,
+        nonempty or "(none — fill .env or use HEADLESS_SECRETS_INLINE / DUMPER)",
+    )
     msg = (
-        "Headless needs secrets: set repo-root .env with TFM_SECRETS_SERVER_ADDRESS, "
-        "TFM_SECRETS_SERVER_PORTS (comma-separated), TFM_SECRETS_GAME_VERSION, TFM_SECRETS_CONNECTION_TOKEN, "
-        "TFM_SECRETS_AUTH_KEY, TFM_SECRETS_PACKET_KEY_SOURCES, TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE (hex), "
-        "or HEADLESS_SECRETS_INLINE, or a working HEADLESS_SECRETS_DUMPER. See .env.example."
+        "Headless needs secrets: copy .env.example to .env in the repo root (same folder as this project), "
+        "set TFM_SECRETS_SERVER_ADDRESS, TFM_SECRETS_SERVER_PORTS, TFM_SECRETS_GAME_VERSION, "
+        "TFM_SECRETS_CONNECTION_TOKEN, TFM_SECRETS_AUTH_KEY, TFM_SECRETS_PACKET_KEY_SOURCES, "
+        "TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE, or set HEADLESS_SECRETS_INLINE / HEADLESS_SECRETS_DUMPER. "
+        "Pull latest for .env.example if missing."
     )
     logger.error(msg)
     raise SystemExit(msg)
