@@ -406,12 +406,28 @@ def resolve_headless_upstream(cfg: object, base_secrets: Secrets) -> tuple[str, 
                 same_p = len(chosen_p) == len(dump_p_i) and sorted(chosen_p) == sorted(
                     dump_p_i
                 )
-            if not (same_a and same_p):
+            if not same_a:
+                if not bool(getattr(cfg, "UPSTREAM_ALLOW_ADDRESS_MISMATCH", False)):
+                    logger.error(
+                        "BOT_UPSTREAM_SERVER_ADDRESS %r does not match TFM_SECRETS_SERVER_ADDRESS / "
+                        "dump host %r. The handshake uses crypto tied to the dump; TCP to another IP "
+                        "often connects then closes with zero bytes (no HandshakeResponse). "
+                        "Clear BOT_UPSTREAM_SERVER_ADDRESS and BOT_UPSTREAM_SERVER_PORTS, or set "
+                        "BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY=true, or set "
+                        "BOT_UPSTREAM_ALLOW_ADDRESS_MISMATCH=true to force (may still fail).",
+                        chosen_a,
+                        str(dump_a).strip(),
+                    )
+                    raise SystemExit(1)
+                logger.warning(
+                    "BOT_UPSTREAM_ALLOW_ADDRESS_MISMATCH=true: using upstream %r (dump host is %r).",
+                    chosen_a,
+                    str(dump_a).strip(),
+                )
+            if not same_p:
                 msg = (
-                    f"UPSTREAM_SERVER_* ({chosen_a!r}, {chosen_p}) differs from this run's secrets "
-                    f"dump ({dump_a!r}, {dump_p_i}). A wrong shard often accepts TCP then closes with "
-                    "no handshake reply — align or clear UPSTREAM_SERVER_* or set "
-                    "BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY = true."
+                    f"BOT_UPSTREAM_SERVER_PORTS {chosen_p} differs from dump {dump_p_i}. "
+                    "Wrong port set can accept TCP then drop the handshake — align ports or clear the override."
                 )
                 if strict:
                     logger.error(msg)
