@@ -175,6 +175,28 @@ def load_secrets_base(cfg: object) -> Secrets:
     raise SystemExit(msg)
 
 
+def _upstream_ports_try_main_first(cfg: object, ports: tuple[int, ...]) -> tuple[int, ...]:
+    """Put the main game TCP port first (default 11801). Connecting to satellite (e.g. 12801) first often gets zero-byte closes for a main HandshakePacket."""
+    if not ports:
+        return ports
+    v = getattr(cfg, "UPSTREAM_MAIN_GAME_PORT_TRY_FIRST", 11801)
+    if v is False or v is None:
+        return ports
+    m = int(v)
+    if m not in ports:
+        return ports
+    lst = list(ports)
+    lst.remove(m)
+    out = (m,) + tuple(lst)
+    if out != ports:
+        logger.info(
+            "Upstream TCP try order: main port %s first (was %s).",
+            m,
+            ports,
+        )
+    return out
+
+
 def resolve_headless_upstream(cfg: object, base_secrets: Secrets) -> tuple[str, tuple[int, ...]]:
     """Pick upstream host/ports; warn or exit if config overrides disagree with this run's dump."""
     dump_a = getattr(base_secrets, "server_address", None)
@@ -186,7 +208,9 @@ def resolve_headless_upstream(cfg: object, base_secrets: Secrets) -> tuple[str, 
                 "UPSTREAM_FROM_SECRETS_DUMP_ONLY is True but Secrets lack server_address / server_ports."
             )
             raise SystemExit(1)
-        return str(dump_a).strip(), tuple(int(x) for x in dump_p)
+        return str(dump_a).strip(), _upstream_ports_try_main_first(
+            cfg, tuple(int(x) for x in dump_p)
+        )
 
     ua = getattr(cfg, "UPSTREAM_SERVER_ADDRESS", None)
     up = getattr(cfg, "UPSTREAM_SERVER_PORTS", None)
@@ -226,7 +250,7 @@ def resolve_headless_upstream(cfg: object, base_secrets: Secrets) -> tuple[str, 
                         dump_p_i,
                         chosen_p,
                     )
-        return chosen_a, effective_p
+        return chosen_a, _upstream_ports_try_main_first(cfg, effective_p)
 
     if not dump_a or not dump_p:
         logger.error(
@@ -234,7 +258,9 @@ def resolve_headless_upstream(cfg: object, base_secrets: Secrets) -> tuple[str, 
             "UPSTREAM_SERVER_ADDRESS and UPSTREAM_SERVER_PORTS in config."
         )
         raise SystemExit(1)
-    return str(dump_a).strip(), tuple(int(x) for x in dump_p)
+    return str(dump_a).strip(), _upstream_ports_try_main_first(
+        cfg, tuple(int(x) for x in dump_p)
+    )
 
 
 class HeadlessProxyClient(Client):
