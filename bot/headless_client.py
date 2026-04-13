@@ -709,11 +709,11 @@ def start_headless_client_threads(
     """
     Run headless TCP login for every slot.
 
-    **Sequential (default,** ``BOT_HEADLESS_PARALLEL_LOGIN=false``): one ``HeadlessProxyClient`` at a
-    time on the main thread. Avoids hammering the game server with parallel handshakes from one host.
-    ``BOT_HEADLESS_LOGIN_STAGGER_SEC`` is the pause between finishing one slot and starting the next.
+    **Sequential (** ``BOT_HEADLESS_PARALLEL_LOGIN=false``): one ``HeadlessProxyClient`` at a time on the
+    main thread. ``BOT_HEADLESS_LOGIN_STAGGER_SEC`` is the pause between slots. Multi-slot ban mode will
+    exit unless you use Flash clients, because ``HEADLESS_EXIT_AFTER_LOGIN_SUCCESS`` closes TCP after each login.
 
-    **Parallel (** ``BOT_HEADLESS_PARALLEL_LOGIN=true``): one daemon thread per slot, each runs its own
+    **Parallel (default,** ``BOT_HEADLESS_PARALLEL_LOGIN=true``): one daemon thread per slot, each runs its own
     ``asyncio`` loop so every account can stay connected at once. Sessions keep the TCP session open
     (``exit_after_login_success`` is forced off for this path). Optional
     ``BOT_HEADLESS_PARALLEL_START_STAGGER_SEC`` offsets each thread's start by ``index * stagger`` to
@@ -728,7 +728,7 @@ def start_headless_client_threads(
     base = base_secrets if base_secrets is not None else load_secrets_base(cfg)
     pairs = list(zip(states, raw_accounts))
 
-    if bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", False)):
+    if bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", True)):
         if int(getattr(cfg, "HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES", 0) or 0) > 0:
             logger.info(
                 "BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES is ignored when "

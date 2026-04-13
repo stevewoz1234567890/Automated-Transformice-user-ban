@@ -3,7 +3,7 @@ CMD entry: multi-slot local proxies, /room on all clients, then staggered /ban.
 
 Enable automatic TCP login with ``BOT_HEADLESS_AUTO_LOGIN=true`` in repo-root ``.env`` or by running
 ``python -m bot --headless``. That starts one **caseus** client per slot to each local proxy port.
-Set ``BOT_HEADLESS_PARALLEL_LOGIN=true`` so every slot logs in at the same time (persistent TCP per slot).
+``BOT_HEADLESS_PARALLEL_LOGIN`` defaults to true so every slot can stay connected (needed for multi-slot /ban); set false only for single-slot or special cases.
 (``HandshakePacket`` + ``SystemInformationPacket``); the proxy injects ``LoginPacket`` (see ``ban_proxy``).
 Requires ``TFM_SECRETS_*`` in ``.env`` (see ``.env.example``), or ``BOT_HEADLESS_SECRETS_INLINE_JSON``,
 or ``BOT_HEADLESS_SECRETS_DUMPER`` (subprocess prints JSON to stdout; no secret files). Optional
@@ -535,6 +535,18 @@ def main(argv: list[str] | None = None) -> None:
             upstream_addr,
             upstream_ports,
         )
+        if len(states) > 1:
+            pl = bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", True))
+            logger.info(
+                "Multi-slot headless (%s accounts): BOT_HEADLESS_PARALLEL_LOGIN=%s",
+                len(states),
+                pl,
+            )
+            if not pl:
+                logger.warning(
+                    "With parallel login off, each slot drops TCP after LoginSuccess unless you use Flash; "
+                    "the bot will refuse /room prompts. Set BOT_HEADLESS_PARALLEL_LOGIN=true or use --no-headless.",
+                )
         dump_host = getattr(base_secrets, "server_address", None)
         if dump_host:
             ds = str(dump_host).strip()
@@ -613,7 +625,7 @@ def main(argv: list[str] | None = None) -> None:
                 ", ".join(s.label for s in missing_login),
             )
             raise SystemExit(1)
-        if not bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", False)) and bool(
+        if not bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", True)) and bool(
             getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True)
         ):
             logger.error(
