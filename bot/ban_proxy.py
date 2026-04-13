@@ -81,7 +81,12 @@ def _account_error_hint(code: int | None) -> str:
 
 
 class _UpstreamDiagReader:
-    """Wrap asyncio StreamReader to log the first raw chunk from the game server (pre-parse)."""
+    """Wrap asyncio StreamReader to log the first raw chunk from the game server (pre-parse).
+
+    caseus reads packets via ``readexactly`` (see pak ``Connection.read_data``). If the server
+    closes mid-packet, ``IncompleteReadError.partial`` may hold bytes that never become a parsed
+    packet — log those so diagnostics distinguish "hard RST with no payload" from decrypt/parse issues.
+    """
 
     __slots__ = ("_inner", "_proxy", "_logged")
 
@@ -112,7 +117,12 @@ class _UpstreamDiagReader:
         return data
 
     async def readexactly(self, n):
-        data = await self._inner.readexactly(n)
+        try:
+            data = await self._inner.readexactly(n)
+        except asyncio.IncompleteReadError as e:
+            if e.partial:
+                self._tap(e.partial)
+            raise
         self._tap(data)
         return data
 
