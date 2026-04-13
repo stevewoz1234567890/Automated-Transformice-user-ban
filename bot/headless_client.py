@@ -699,6 +699,15 @@ def _run_one_slot_headless(
         logger.exception("Slot %s: headless client failed", label)
 
 
+def _count_win121_slots(states: list[Any]) -> int:
+    n = 0
+    for st in states:
+        ev = getattr(st, "headless_seen_upstream_win121", None)
+        if ev is not None and ev.is_set():
+            n += 1
+    return n
+
+
 def start_headless_client_threads(
     states: list[Any],
     raw_accounts: list[dict[str, object]],
@@ -809,13 +818,35 @@ def start_headless_client_threads(
                         continue
                     to_retry.append((st, rw))
                 if to_retry:
-                    logger.info(
-                        "Headless parallel: retry wave for %s slot(s) (labels: %s) — "
-                        "first wave likely hit server load limits; increase "
-                        "BOT_HEADLESS_PARALLEL_START_STAGGER_SEC if this stays flaky.",
-                        len(to_retry),
-                        ", ".join(st.label for st, _ in to_retry),
-                    )
+                    retry_states = [st for st, _ in to_retry]
+                    w121_n = _count_win121_slots(retry_states)
+                    if w121_n >= len(retry_states) and len(retry_states) >= 2:
+                        logger.info(
+                            "Headless parallel: retry wave for %s slot(s) (labels: %s) — "
+                            "each failed slot reported WinError 121 (TCP connect timed out). That is almost "
+                            "always firewall/VPN/ISP or Windows choking on many parallel outbound connects, "
+                            "not game 'load limits'. Try: allow python.exe in Windows Firewall, another "
+                            "network/VPN, BOT_HEADLESS_PARALLEL_LOGIN=false for sequential login, or a much "
+                            "larger BOT_HEADLESS_PARALLEL_START_STAGGER_SEC.",
+                            len(to_retry),
+                            ", ".join(st.label for st, _ in to_retry),
+                        )
+                    elif w121_n * 2 >= len(retry_states):
+                        logger.info(
+                            "Headless parallel: retry wave for %s slot(s) (labels: %s) — "
+                            "most failures saw WinError 121 (connect timeout). Check firewall/VPN and consider "
+                            "sequential headless (BOT_HEADLESS_PARALLEL_LOGIN=false) or higher stagger.",
+                            len(to_retry),
+                            ", ".join(st.label for st, _ in to_retry),
+                        )
+                    else:
+                        logger.info(
+                            "Headless parallel: retry wave for %s slot(s) (labels: %s) — "
+                            "first wave did not reach LoginSuccess (mixed causes); try "
+                            "BOT_HEADLESS_PARALLEL_START_STAGGER_SEC if only some slots fail.",
+                            len(to_retry),
+                            ", ".join(st.label for st, _ in to_retry),
+                        )
                     for j, (st, rw) in enumerate(to_retry):
                         if retry_stagger > 0 and j > 0:
                             time.sleep(retry_stagger)
@@ -829,12 +860,21 @@ def start_headless_client_threads(
                         st.headless_thread = t2
                         t2.start()
             time.sleep(poll_sec)
-        pending = [st.label for st, _ in pairs if not st.login_success_event.is_set()]
+        pending_states = [st for st, _ in pairs if not st.login_success_event.is_set()]
+        pending = [st.label for st in pending_states]
         logger.error(
             "Headless parallel login timed out after %.0fs — missing LoginSuccess for slot(s): %s",
             timeout_sec,
             ", ".join(pending) if pending else "(unknown)",
         )
+        if pending_states:
+            w121_n = _count_win121_slots(pending_states)
+            if w121_n >= len(pending_states):
+                logger.error(
+                    "All failing slots reported WinError 121 — TCP to the game host is not completing from "
+                    "this PC (firewall, VPN, routing, or overload from parallel connects). tfm-secrets will not "
+                    "fix this; use `python -m bot.upstream_probe <host> <ports>` from the same machine.",
+                )
         return False
 
     base_gap = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 6.0) or 0.0)
