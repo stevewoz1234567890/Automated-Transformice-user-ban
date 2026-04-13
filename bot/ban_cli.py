@@ -581,10 +581,10 @@ def main(argv: list[str] | None = None) -> None:
                 n_ok = sum(1 for _p, st, _ in probe_results if st == "ok")
                 if len(probe_results) > 0 and n_ok == 0:
                     logger.error(
-                        "Aborting: upstream TCP probe reached 0/%s ports on %r — this process cannot reach "
-                        "the game TCP ports (firewall, VPN, ISP, or routing). Headless login would only repeat "
-                        "timeouts/WinError 121. Fix network path to the host or set "
-                        "BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED=false to try anyway.",
+                        "Aborting: upstream TCP probe reached 0/%s ports on %r (after BOT_UPSTREAM_PROBE_RETRIES "
+                        "extra rounds if configured) — cannot reach game TCP (firewall, VPN, ISP, routing, or "
+                        "host down). Fix the network path, raise BOT_UPSTREAM_PROBE_TIMEOUT_SEC / retries, or set "
+                        "BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED=false to try headless login anyway.",
                         len(probe_results),
                         upstream_addr,
                     )

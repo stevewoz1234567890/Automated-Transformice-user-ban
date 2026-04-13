@@ -106,12 +106,35 @@ async def log_upstream_tcp_probe_async(
 
 
 def run_upstream_tcp_probe(host: str, ports: tuple[int, ...], cfg: object) -> list[tuple[int, str, float | None]]:
-    """Log parallel TCP probes. Safe to call from sync code (uses asyncio.run)."""
-    timeout = float(getattr(cfg, "UPSTREAM_PROBE_TIMEOUT_SEC", 6.0) or 6.0)
+    """Log parallel TCP probes. Safe to call from sync code (uses asyncio.run).
+
+    If every port fails, repeats up to ``UPSTREAM_PROBE_RETRIES`` extra times (see env), pausing
+    ``UPSTREAM_PROBE_RETRY_PAUSE_SEC`` between rounds — helps transient WiFi / VPN / routing glitches.
+    """
+    timeout = float(getattr(cfg, "UPSTREAM_PROBE_TIMEOUT_SEC", 10.0) or 10.0)
     timeout = max(1.0, min(timeout, 120.0))
-    return asyncio.run(
-        log_upstream_tcp_probe_async(host, ports, timeout_sec=timeout),
-    )
+    extra_rounds = int(getattr(cfg, "UPSTREAM_PROBE_RETRIES", 0) or 0)
+    extra_rounds = max(0, min(extra_rounds, 10))
+    pause_sec = float(getattr(cfg, "UPSTREAM_PROBE_RETRY_PAUSE_SEC", 3.0) or 3.0)
+    pause_sec = max(0.0, min(pause_sec, 60.0))
+    max_attempts = 1 + extra_rounds
+    last: list[tuple[int, str, float | None]] = []
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            logger.info(
+                "[probe] round %s/%s after %.1fs pause (previous round: 0/%s ports ok)",
+                attempt + 1,
+                max_attempts,
+                pause_sec,
+                len(ports),
+            )
+            time.sleep(pause_sec)
+        last = asyncio.run(
+            log_upstream_tcp_probe_async(host, ports, timeout_sec=timeout),
+        )
+        if any(status == "ok" for _port, status, _dt in last):
+            break
+    return last
 
 
 def main(argv: list[str] | None = None) -> None:
