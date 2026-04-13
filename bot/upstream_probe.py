@@ -110,9 +110,18 @@ def run_upstream_tcp_probe(host: str, ports: tuple[int, ...], cfg: object) -> li
 
     If every port fails, repeats up to ``UPSTREAM_PROBE_RETRIES`` extra times (see env), pausing
     ``UPSTREAM_PROBE_RETRY_PAUSE_SEC`` between rounds — helps transient WiFi / VPN / routing glitches.
+
+    If still no success and the configured timeout is below the final floor, runs one more round with a
+    longer per-port timeout (slow Wi‑Fi often fails at 6s but succeeds at 20s).
     """
     timeout = float(getattr(cfg, "UPSTREAM_PROBE_TIMEOUT_SEC", 10.0) or 10.0)
     timeout = max(1.0, min(timeout, 120.0))
+    if timeout < 10.0:
+        logger.warning(
+            "[probe] BOT_UPSTREAM_PROBE_TIMEOUT_SEC=%.1fs is aggressive; slow Wi‑Fi/VPN often needs 10–15s "
+            "and will look like a dead host at 6s.",
+            timeout,
+        )
     extra_rounds = int(getattr(cfg, "UPSTREAM_PROBE_RETRIES", 0) or 0)
     extra_rounds = max(0, min(extra_rounds, 10))
     pause_sec = float(getattr(cfg, "UPSTREAM_PROBE_RETRY_PAUSE_SEC", 3.0) or 3.0)
@@ -134,6 +143,27 @@ def run_upstream_tcp_probe(host: str, ports: tuple[int, ...], cfg: object) -> li
         )
         if any(status == "ok" for _port, status, _dt in last):
             break
+
+    if not any(status == "ok" for _port, status, _dt in last) and bool(
+        getattr(cfg, "UPSTREAM_PROBE_FINAL_LONG_TIMEOUT", True)
+    ):
+        final_cap = float(getattr(cfg, "UPSTREAM_PROBE_FINAL_TIMEOUT_CAP_SEC", 35.0) or 35.0)
+        final_cap = max(15.0, min(final_cap, 120.0))
+        final_floor = float(getattr(cfg, "UPSTREAM_PROBE_FINAL_TIMEOUT_FLOOR_SEC", 20.0) or 20.0)
+        final_floor = max(10.0, min(final_floor, final_cap))
+        if timeout < final_floor:
+            final_t = min(final_cap, max(final_floor, timeout * 3.0))
+            logger.info(
+                "[probe] all rounds failed at %.1fs — trying once more at %.1fs (slow path; set "
+                "BOT_UPSTREAM_PROBE_TIMEOUT_SEC higher to skip this)",
+                timeout,
+                final_t,
+            )
+            if pause_sec > 0:
+                time.sleep(min(pause_sec, 2.0))
+            last = asyncio.run(
+                log_upstream_tcp_probe_async(host, ports, timeout_sec=final_t),
+            )
     return last
 
 
