@@ -172,6 +172,8 @@ _ENV_DEFAULTS: dict[str, str] = {
     "BOT_HEADLESS_SECRETS_AUTO_PIP_BEFORE_DUMPER": "true",
     "BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV": "true",
     "BOT_HEADLESS_SECRETS_DUMPER_TIMEOUT_SEC": "120",
+    "BOT_HEADLESS_SECRETS_ALWAYS_REFRESH": "true",
+    "BOT_UPSTREAM_AUTO_SYNC_FROM_SECRETS": "true",
     "BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY": "false",
     "BOT_UPSTREAM_PORTS_MATCH_DUMP_ORDER": "true",
     "BOT_UPSTREAM_STRICT_MATCH_SECRETS_DUMP": "false",
@@ -182,7 +184,10 @@ _ENV_DEFAULTS: dict[str, str] = {
     "BOT_UPSTREAM_TCP_PROBE_BEFORE_HEADLESS": "true",
     "BOT_UPSTREAM_PROBE_TIMEOUT_SEC": "6",
     "BOT_HEADLESS_CONNECT_TO_SATELLITE": "true",
-    "BOT_HEADLESS_LOGIN_STAGGER_SEC": "2.5",
+    "BOT_HEADLESS_LOGIN_STAGGER_SEC": "6",
+    "BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES": "3",
+    "BOT_HEADLESS_STAGGER_WIN121_EXTRA_SEC": "4",
+    "BOT_HEADLESS_STAGGER_MAX_SEC": "15",
     "BOT_PIP_INSTALL_CASEUS_GIT_UPGRADE": "false",
     "BOT_CASEUS_GIT_PIP_SPEC": "caseus @ git+https://github.com/friedkeenan/caseus.git",
     "BOT_PIP_INSTALL_TFM_SECRETS_CLI": "false",
@@ -333,6 +338,13 @@ def _truthy(key: str, default: bool = False) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _int_ge_zero(key: str, default: int) -> int:
+    v = os.environ.get(key, "").strip()
+    if not v:
+        return default
+    return max(0, int(v, 0))
+
+
 def _float(key: str, default: float) -> float:
     v = os.environ.get(key)
     if v is None or not str(v).strip():
@@ -460,6 +472,8 @@ def load_bot_config() -> SimpleNamespace:
             "BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV", True
         ),
         HEADLESS_SECRETS_DUMPER_TIMEOUT_SEC=_float("BOT_HEADLESS_SECRETS_DUMPER_TIMEOUT_SEC", 120.0),
+        HEADLESS_SECRETS_ALWAYS_REFRESH=_truthy("BOT_HEADLESS_SECRETS_ALWAYS_REFRESH", True),
+        UPSTREAM_AUTO_SYNC_FROM_SECRETS=_truthy("BOT_UPSTREAM_AUTO_SYNC_FROM_SECRETS", True),
         UPSTREAM_FROM_SECRETS_DUMP_ONLY=_truthy("BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY", False),
         UPSTREAM_PORTS_MATCH_DUMP_ORDER=_truthy("BOT_UPSTREAM_PORTS_MATCH_DUMP_ORDER", True),
         UPSTREAM_STRICT_MATCH_SECRETS_DUMP=_truthy("BOT_UPSTREAM_STRICT_MATCH_SECRETS_DUMP", False),
@@ -470,7 +484,12 @@ def load_bot_config() -> SimpleNamespace:
         UPSTREAM_TCP_PROBE_BEFORE_HEADLESS=_truthy("BOT_UPSTREAM_TCP_PROBE_BEFORE_HEADLESS", True),
         UPSTREAM_PROBE_TIMEOUT_SEC=_float("BOT_UPSTREAM_PROBE_TIMEOUT_SEC", 6.0),
         HEADLESS_CONNECT_TO_SATELLITE=_truthy("BOT_HEADLESS_CONNECT_TO_SATELLITE", True),
-        HEADLESS_LOGIN_STAGGER_SEC=_float("BOT_HEADLESS_LOGIN_STAGGER_SEC", 2.5),
+        HEADLESS_LOGIN_STAGGER_SEC=_float("BOT_HEADLESS_LOGIN_STAGGER_SEC", 6.0),
+        HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES=_int_ge_zero(
+            "BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES", 3
+        ),
+        HEADLESS_STAGGER_WIN121_EXTRA_SEC=_float("BOT_HEADLESS_STAGGER_WIN121_EXTRA_SEC", 4.0),
+        HEADLESS_STAGGER_MAX_SEC=_float("BOT_HEADLESS_STAGGER_MAX_SEC", 15.0),
         PIP_INSTALL_CASEUS_GIT_UPGRADE=_truthy("BOT_PIP_INSTALL_CASEUS_GIT_UPGRADE", False),
         CASEUS_GIT_PIP_SPEC=str(
             os.environ.get(

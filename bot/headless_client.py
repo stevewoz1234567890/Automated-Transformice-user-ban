@@ -12,6 +12,9 @@ Secrets (no ``tfm-secrets.json`` in this flow):
    On success, values are written back to ``.env`` when ``BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV``
    is true (default).
 
+With ``BOT_HEADLESS_SECRETS_ALWAYS_REFRESH`` (default true), tfm-secrets / leaker run **before** trusting
+cached ``TFM_SECRETS_*``. ``sync_upstream_cfg_from_secrets`` then aligns ``BOT_UPSTREAM_*`` with the dump.
+
 Each client uses ``Secrets.copy(server_address=..., server_ports=(...))`` to target ``127.0.0.1:<proxy_port>``.
 The proxy injects ``LoginPacket`` after ``SystemInformationPacket``; this client must **not** send
 its own ``LoginPacket`` (see ``HeadlessProxyClient.login`` no-op).
@@ -267,24 +270,8 @@ def _secrets_from_env(cfg: object) -> Secrets | None:
         return None
 
 
-def load_secrets_base(cfg: object) -> Secrets:
-    """Load server crypto: full ``.env``, inline JSON, then dumper (default ``tfm-secrets``)."""
-    dot = _resolved_dotenv_path(cfg)
-    load_dotenv_file(dot)
-
-    sec = _secrets_from_env(cfg)
-    if sec is not None:
-        logger.info(
-            "Secrets from environment / %s (prefix %r).",
-            getattr(cfg, "HEADLESS_SECRETS_DOTENV_PATH", ".env"),
-            str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_"),
-        )
-        return sec
-
-    sec = _secrets_from_config_inline(cfg)
-    if sec is not None:
-        return sec
-
+def _try_acquire_secrets_from_dumpers(cfg: object, dot: Path, *, reason: str) -> Secrets | None:
+    """Run ``tfm-secrets`` and/or Flash leaker; persist to ``.env`` on success. ``reason`` selects log wording."""
     dumper_spec = _effective_dumper_spec(cfg)
     if dumper_spec is not None:
         argv = _dumper_argv_from_config(dumper_spec)
@@ -305,10 +292,16 @@ def load_secrets_base(cfg: object) -> Secrets:
             )
             argv = _dumper_argv_from_config(dumper_spec)
         if argv:
-            logger.info(
-                "TFM secrets incomplete in .env; running dumper argv=%r (set BOT_HEADLESS_SECRETS_AUTO_DUMPER=false to skip).",
-                argv,
-            )
+            if reason == "always_refresh":
+                logger.info(
+                    "Running secrets dumper argv=%r (BOT_HEADLESS_SECRETS_ALWAYS_REFRESH).",
+                    argv,
+                )
+            else:
+                logger.info(
+                    "TFM secrets incomplete in .env; running dumper argv=%r (set BOT_HEADLESS_SECRETS_AUTO_DUMPER=false to skip).",
+                    argv,
+                )
             sec = _try_secrets_from_dumper_argv(argv, cfg)
             if sec is not None:
                 _persist_secrets_to_dotenv(sec, cfg, dot)
@@ -325,8 +318,49 @@ def load_secrets_base(cfg: object) -> Secrets:
     if bool(getattr(cfg, "HEADLESS_SECRETS_AUTO_LEAKER_SWF", True)):
         sec = try_load_secrets_via_leaker(repo_root())
         if sec is not None:
-            logger.info("Secrets from TFMSecretsLeaker.swf (Flash debug projector).")
+            if reason == "always_refresh":
+                logger.info("Secrets from TFMSecretsLeaker.swf (always-refresh path).")
+            else:
+                logger.info("Secrets from TFMSecretsLeaker.swf (Flash debug projector).")
             _persist_secrets_to_dotenv(sec, cfg, dot)
+            return sec
+    return None
+
+
+def load_secrets_base(cfg: object) -> Secrets:
+    """Load server crypto: optional live dumper/leaker first, then ``.env``, inline, then dumper fallback."""
+    dot = _resolved_dotenv_path(cfg)
+    load_dotenv_file(dot)
+
+    tried_live = False
+    if bool(getattr(cfg, "HEADLESS_SECRETS_ALWAYS_REFRESH", True)):
+        logger.info(
+            "BOT_HEADLESS_SECRETS_ALWAYS_REFRESH: attempting live tfm-secrets / Flash leaker before cached .env.",
+        )
+        sec = _try_acquire_secrets_from_dumpers(cfg, dot, reason="always_refresh")
+        tried_live = True
+        if sec is not None:
+            return sec
+        logger.warning(
+            "Live secrets refresh failed or was skipped; using complete TFM_SECRETS_* from .env if available.",
+        )
+
+    sec = _secrets_from_env(cfg)
+    if sec is not None:
+        logger.info(
+            "Secrets from environment / %s (prefix %r).",
+            getattr(cfg, "HEADLESS_SECRETS_DOTENV_PATH", ".env"),
+            str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_"),
+        )
+        return sec
+
+    sec = _secrets_from_config_inline(cfg)
+    if sec is not None:
+        return sec
+
+    if not tried_live:
+        sec = _try_acquire_secrets_from_dumpers(cfg, dot, reason="env_incomplete")
+        if sec is not None:
             return sec
 
     pfx = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_").strip()
@@ -348,6 +382,48 @@ def load_secrets_base(cfg: object) -> Secrets:
     )
     logger.error(msg)
     raise SystemExit(1)
+
+
+def sync_upstream_cfg_from_secrets(cfg: object, secrets: Secrets) -> None:
+    """
+    Align ``BOT_UPSTREAM_*`` with the secrets dump (host + ports), force dump-only upstream, and turn off
+    address mismatch — avoids zero-byte handshake closes from TCP to the wrong IP while using another dump's crypto.
+    """
+    if not bool(getattr(cfg, "UPSTREAM_AUTO_SYNC_FROM_SECRETS", True)):
+        return
+    addr = str(getattr(secrets, "server_address", "") or "").strip()
+    ports_raw = getattr(secrets, "server_ports", None)
+    if not addr or not ports_raw:
+        logger.warning(
+            "BOT_UPSTREAM_AUTO_SYNC_FROM_SECRETS: dump missing server_address/server_ports; skip sync.",
+        )
+        return
+    ports = tuple(int(x) for x in ports_raw)
+    ports_s = ",".join(str(p) for p in ports)
+    updates = {
+        "BOT_UPSTREAM_SERVER_ADDRESS": addr,
+        "BOT_UPSTREAM_SERVER_PORTS": ports_s,
+        "BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY": "true",
+        "BOT_UPSTREAM_ALLOW_ADDRESS_MISMATCH": "false",
+    }
+    dot = _resolved_dotenv_path(cfg)
+    try:
+        update_or_append_dotenv(dot, updates)
+    except OSError as e:
+        logger.warning("Could not persist upstream sync to %s: %s", dot, e)
+        return
+    for k, v in updates.items():
+        os.environ[k] = v
+    cfg.UPSTREAM_SERVER_ADDRESS = addr
+    cfg.UPSTREAM_SERVER_PORTS = ports
+    cfg.UPSTREAM_FROM_SECRETS_DUMP_ONLY = True
+    cfg.UPSTREAM_ALLOW_ADDRESS_MISMATCH = False
+    logger.info(
+        "Synced BOT_UPSTREAM_* from secrets dump (host=%s ports=%s); "
+        "BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY=true, BOT_UPSTREAM_ALLOW_ADDRESS_MISMATCH=false.",
+        addr,
+        ports,
+    )
 
 
 def _upstream_ports_try_main_first(cfg: object, ports: tuple[int, ...]) -> tuple[int, ...]:
@@ -604,16 +680,57 @@ def start_headless_client_threads(
     to completion before the next starts. This avoids hammering the game server with parallel
     handshakes from one host.
 
-    ``HEADLESS_LOGIN_STAGGER_SEC`` (default 2.5) is the pause **between** finishing one slot and
+    ``HEADLESS_LOGIN_STAGGER_SEC`` (default 6) is the pause **between** finishing one slot and
     starting the next (not used for overlapping parallel starts). Increase if you see WinError 121
     on later slots (rate limiting / connect timeouts).
+
+    ``HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES`` (default 3): if > 0, stop after that many slots
+    in a row without ``LoginSuccess`` (avoids hammering upstream when the first slots fail). Set to 0
+    to disable.
+
+    After a slot hits upstream **WinError 121**, the pause before the next slot increases by
+    ``HEADLESS_STAGGER_WIN121_EXTRA_SEC`` up to ``HEADLESS_STAGGER_MAX_SEC``.
     """
     base = base_secrets if base_secrets is not None else load_secrets_base(cfg)
-    gap = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 2.5) or 0.0)
-    gap = max(0.0, gap)
+    base_gap = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 6.0) or 0.0)
+    base_gap = max(0.0, base_gap)
+    adaptive_gap = base_gap
+    win121_extra = float(getattr(cfg, "HEADLESS_STAGGER_WIN121_EXTRA_SEC", 4.0) or 0.0)
+    gap_cap = float(getattr(cfg, "HEADLESS_STAGGER_MAX_SEC", 15.0) or 15.0)
+    max_consec = int(getattr(cfg, "HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES", 0) or 0)
 
     pairs = list(zip(states, raw_accounts))
+    consec_fail = 0
     for i, (state, row) in enumerate(pairs):
-        if i > 0 and gap > 0:
-            time.sleep(gap)
+        if max_consec > 0 and consec_fail >= max_consec:
+            logger.warning(
+                "Stopping headless logins: %s consecutive slot(s) without LoginSuccess "
+                "(BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES=%s). "
+                "Refresh TFM_SECRETS_*, align upstream with dump host, and increase "
+                "BOT_HEADLESS_LOGIN_STAGGER_SEC if you saw WinError 121 on later slots.",
+                max_consec,
+                max_consec,
+            )
+            break
+        if i > 0 and adaptive_gap > 0:
+            time.sleep(adaptive_gap)
+        w121_ev = getattr(state, "headless_seen_upstream_win121", None)
+        if w121_ev is not None:
+            w121_ev.clear()
         _run_one_slot_headless(state=state, row=row, cfg=cfg, base_secrets=base)
+        if w121_ev is not None and w121_ev.is_set() and win121_extra > 0:
+            before = adaptive_gap
+            adaptive_gap = min(gap_cap, adaptive_gap + win121_extra)
+            if adaptive_gap > before:
+                logger.info(
+                    "WinError 121 on slot %s: increasing inter-slot pause %.2fs → %.2fs "
+                    "(cap %.2fs; BOT_HEADLESS_STAGGER_WIN121_EXTRA_SEC / BOT_HEADLESS_STAGGER_MAX_SEC).",
+                    state.label,
+                    before,
+                    adaptive_gap,
+                    gap_cap,
+                )
+        if state.login_success_event.is_set():
+            consec_fail = 0
+        else:
+            consec_fail += 1

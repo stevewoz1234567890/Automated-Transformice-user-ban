@@ -36,7 +36,12 @@ from caseus import Secrets
 from .ban_proxy import BanBotProxy
 from . import flash_launch
 from .env_setup import load_bot_config, repo_root
-from .headless_client import load_secrets_base, resolve_headless_upstream, start_headless_client_threads
+from .headless_client import (
+    load_secrets_base,
+    resolve_headless_upstream,
+    start_headless_client_threads,
+    sync_upstream_cfg_from_secrets,
+)
 from .upstream_probe import run_upstream_tcp_probe
 from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
 
@@ -84,6 +89,7 @@ class SlotState:
     policy_port: int | None = None
     proxy_bind_host: str | None = None
     login_success_event: threading.Event = field(default_factory=threading.Event)
+    headless_seen_upstream_win121: threading.Event = field(default_factory=threading.Event)
     proxy: BanBotProxy | None = None
     loop: asyncio.AbstractEventLoop | None = None
     thread: threading.Thread | None = None
@@ -167,6 +173,7 @@ def _run_slot_async(
                 host_socket_policy_port=None,
                 slot_label=state.label,
                 login_success_event=state.login_success_event,
+                upstream_win121_event=state.headless_seen_upstream_win121,
                 verbose_login_flow=bool(
                     getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", False)
                 ),
@@ -482,6 +489,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if headless_auto:
         base_secrets = load_secrets_base(cfg)
+        sync_upstream_cfg_from_secrets(cfg, base_secrets)
         upstream_addr, upstream_ports = resolve_headless_upstream(cfg, base_secrets)
         if not upstream_addr or not upstream_ports:
             logger.error(
@@ -494,6 +502,24 @@ def main(argv: list[str] | None = None) -> None:
             upstream_addr,
             upstream_ports,
         )
+        dump_host = getattr(base_secrets, "server_address", None)
+        if dump_host:
+            ds = str(dump_host).strip()
+            us = str(upstream_addr).strip()
+            if ds != us:
+                logger.warning(
+                    "TFM_SECRETS_SERVER_ADDRESS is %r but headless upstream is %r — if ALLOW_ADDRESS_MISMATCH is on, "
+                    "zero-byte handshake closes often mean this pairing is wrong; prefer matching hosts or dump-only upstream.",
+                    ds,
+                    us,
+                )
+            else:
+                logger.info(
+                    "Upstream host matches TFM_SECRETS_SERVER_ADDRESS (%r). Zero-byte closes usually mean stale "
+                    "TFM_SECRETS_* (re-run leaker) or server policy; WinError 121 on later slots: increase "
+                    "BOT_HEADLESS_LOGIN_STAGGER_SEC or set BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES.",
+                    ds,
+                )
 
     auth_key_fallback: int | None = None
     packet_key_sources_fallback: list | tuple | None = None

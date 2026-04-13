@@ -135,6 +135,7 @@ class BanBotProxy(Proxy):
         *,
         slot_label: str = "",
         login_success_event: threading.Event | None = None,
+        upstream_win121_event: threading.Event | None = None,
         verbose_login_flow: bool = False,
         log_all_main_packets: bool = False,
         packet_login_username: str = "",
@@ -157,6 +158,7 @@ class BanBotProxy(Proxy):
         super().__init__(**kwargs)
         self.slot_label = slot_label
         self._login_success_event = login_success_event
+        self._upstream_win121_event = upstream_win121_event
         self._loop: asyncio.AbstractEventLoop | None = None
         self._own_username: str | None = None
         self._verbose_login_flow = verbose_login_flow
@@ -860,6 +862,9 @@ class BanBotProxy(Proxy):
                             extra += f" {name}={v}"
                     if getattr(e, "winerror", None) == 121 and not logged_win121_hint:
                         logged_win121_hint = True
+                        ev = self._upstream_win121_event
+                        if ev is not None:
+                            ev.set()
                         logger.warning(
                             "Slot %s: [login] winerror=121: TCP connect timed out (firewall/VPN/path). "
                             "Not fixed by tfm-secrets. Run `python -m bot.upstream_probe %s %s`.",
