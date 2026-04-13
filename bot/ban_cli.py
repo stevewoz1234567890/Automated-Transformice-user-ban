@@ -4,10 +4,10 @@ CMD entry: multi-slot local proxies, /room on all clients, then staggered /ban.
 Enable automatic TCP login by setting ``HEADLESS_AUTO_LOGIN = True`` in ``bot/config.py`` or running
 ``python -m bot --headless``. That starts one **caseus** client per slot to each local proxy port
 (``HandshakePacket`` + ``SystemInformationPacket``); the proxy injects ``LoginPacket`` (see ``ban_proxy``).
-Requires ``HEADLESS_SECRETS_DUMPER`` (live dump each run) or ``HEADLESS_SECRETS_JSON``, optional
-``PIP_INSTALL_TFM_SECRETS_CLI`` + ``TFM_SECRETS_PIP_INSTALL_SPEC`` in config to pip-install a CLI
-before startup, and upstream from the dump or ``UPSTREAM_SERVER_*`` (see ``UPSTREAM_FROM_SECRETS_DUMP_ONLY``,
-``UPSTREAM_PORTS_MATCH_DUMP_ORDER`` in ``headless_client.resolve_headless_upstream``).
+Requires ``HEADLESS_SECRETS_INLINE`` (dict, same keys as tfm-secrets JSON), or ``HEADLESS_SECRETS_DUMPER``,
+or ``HEADLESS_SECRETS_JSON``. Optional ``PIP_INSTALL_TFM_SECRETS_CLI`` + ``TFM_SECRETS_PIP_INSTALL_SPEC``
+to pip-install a CLI before startup; upstream from the dump or ``UPSTREAM_SERVER_*`` (see
+``UPSTREAM_FROM_SECRETS_DUMP_ONLY``, ``UPSTREAM_PORTS_MATCH_DUMP_ORDER`` in ``headless_client``).
 
 Use ``python -m bot --no-headless`` to force external connectors only. Row ``bind_ip`` is for Proxifier
 unless ``PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is True and that IP exists on this machine.
@@ -371,7 +371,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         "--headless",
         action="store_true",
-        help="Start built-in caseus TCP clients per slot (needs HEADLESS_SECRETS_DUMPER or JSON + upstream).",
+        help="Start built-in caseus TCP clients per slot (needs HEADLESS_SECRETS_INLINE, dumper, or JSON + upstream).",
     )
     p.add_argument(
         "--no-headless",

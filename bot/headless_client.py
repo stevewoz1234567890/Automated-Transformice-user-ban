@@ -1,10 +1,10 @@
 """
 One ``caseus.Client`` per slot connecting to the local BanBotProxy (no Flash).
 
-Requires ``Secrets`` from ``HEADLESS_SECRETS_DUMPER`` (e.g. ``tfm-secrets``) each run, or optionally
-``HEADLESS_SECRETS_JSON`` for a static file. Each client uses ``Secrets.copy(server_address=..., server_ports=(...))``
-to target ``127.0.0.1:<proxy_port>`` while ``BanBotProxy`` is given the real upstream from config
-or the dump so the proxy connects immediately.
+Secrets come from (in order): ``HEADLESS_SECRETS_INLINE`` (dict in ``bot/config.py``, same keys as
+tfm-secrets JSON), ``HEADLESS_SECRETS_DUMPER``, or ``HEADLESS_SECRETS_JSON`` / file fallback.
+Each client uses ``Secrets.copy(server_address=..., server_ports=(...))`` to target ``127.0.0.1:<proxy_port>``
+while ``BanBotProxy`` is given the real upstream from config or the dump so the proxy connects immediately.
 
 The proxy injects ``LoginPacket`` after ``SystemInformationPacket``; this client must **not** send
 its own ``LoginPacket`` (see ``HeadlessProxyClient.login`` no-op).
@@ -30,6 +30,25 @@ from caseus.packets import clientbound, serverbound
 from caseus.util.crypto import shakikoo
 
 logger = logging.getLogger(__name__)
+
+
+def _secrets_from_config_inline(cfg: object) -> Secrets | None:
+    """Build ``Secrets`` from ``HEADLESS_SECRETS_INLINE`` if it is a non-empty dict with known fields."""
+    raw = getattr(cfg, "HEADLESS_SECRETS_INLINE", None)
+    if not isinstance(raw, dict) or not raw:
+        return None
+    kwargs = {k: raw[k] for k in Secrets._FIELDS if k in raw}
+    if not kwargs:
+        logger.warning(
+            "HEADLESS_SECRETS_INLINE is set but contains no recognized Secrets keys %s; ignored.",
+            Secrets._FIELDS,
+        )
+        return None
+    logger.info(
+        "Using HEADLESS_SECRETS_INLINE from config (fields: %s).",
+        tuple(sorted(kwargs.keys())),
+    )
+    return Secrets(**kwargs)
 
 
 def _secrets_from_dumper_argv(argv: list[str]) -> Secrets:
@@ -119,7 +138,11 @@ def _resolve_secrets_json_path(json_path: str) -> Path | None:
 
 
 def load_secrets_base(cfg: object) -> Secrets:
-    """Load server crypto parameters (not per-slot). Prefer a live dumper each run over a JSON file."""
+    """Load server crypto parameters (not per-slot). Inline config dict wins over dumper / files."""
+    sec = _secrets_from_config_inline(cfg)
+    if sec is not None:
+        return sec
+
     json_path = getattr(cfg, "HEADLESS_SECRETS_JSON", None)
     dumper = getattr(cfg, "HEADLESS_SECRETS_DUMPER", None)
     fallback_json = bool(getattr(cfg, "HEADLESS_FALLBACK_JSON_WHEN_DUMPER_UNAVAILABLE", True))
@@ -153,7 +176,8 @@ def load_secrets_base(cfg: object) -> Secrets:
             f"HEADLESS_SECRETS_DUMPER {dumper!r} not found (PATH and {bindir} checked for "
             f"{dumper!r}.exe / .cmd). Install the binary, or set PIP_INSTALL_TFM_SECRETS_CLI = True and "
             "TFM_SECRETS_PIP_INSTALL_SPEC to a pip-installable package that provides the dumper command, "
-            f"or use [{sys.executable!r}, '-m', '<module>'], or rely on HEADLESS_SECRETS_JSON fallback."
+            f"or use [{sys.executable!r}, '-m', '<module>'], set HEADLESS_SECRETS_JSON fallback, "
+            "or define HEADLESS_SECRETS_INLINE in config."
         )
         logger.error(msg)
         raise SystemExit(msg)
@@ -168,7 +192,7 @@ def load_secrets_base(cfg: object) -> Secrets:
         return Secrets(**data)
 
     msg = (
-        "Headless mode requires HEADLESS_SECRETS_DUMPER (e.g. 'tfm-secrets' on PATH or in venv Scripts) "
+        "Headless mode requires HEADLESS_SECRETS_INLINE (dict), HEADLESS_SECRETS_DUMPER, "
         "or HEADLESS_SECRETS_JSON in bot/config.py."
     )
     logger.error(msg)
