@@ -303,7 +303,11 @@ class BanBotProxy(Proxy):
         extra = ""
         if label == "upstream(game→proxy)" and waiting and not success:
             if self._login_diag_upstream_cb_seq == 0 and not self._upstream_raw_chunk_logged:
-                extra = " | zero bytes from server before close - likely RST/FIN after handshake reject"
+                extra = (
+                    " | zero bytes before close — server may drop handshake (version/policy/shard) or reset "
+                    "early; wrong UPSTREAM vs dump also does this. A raw first-chunk line means bytes arrived "
+                    "(then check parse/decrypt vs secrets)."
+                )
             elif self._login_diag_upstream_cb_seq == 0:
                 extra = " | raw bytes seen but no full clientbound packet (length/parse mismatch vs secrets?)"
             else:

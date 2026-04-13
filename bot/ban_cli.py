@@ -4,8 +4,8 @@ CMD entry: multi-slot local proxies, /room on all clients, then staggered /ban.
 Enable automatic TCP login by setting ``HEADLESS_AUTO_LOGIN = True`` in ``bot/config.py`` or running
 ``python -m bot --headless``. That starts one **caseus** client per slot to each local proxy port
 (``HandshakePacket`` + ``SystemInformationPacket``); the proxy injects ``LoginPacket`` (see ``ban_proxy``).
-Requires ``HEADLESS_SECRETS_JSON`` or ``HEADLESS_SECRETS_DUMPER`` and upstream ``server_address`` /
-``server_ports`` in that JSON (or ``UPSTREAM_SERVER_*`` in config).
+Requires ``HEADLESS_SECRETS_DUMPER`` (live dump each run) or ``HEADLESS_SECRETS_JSON``, and upstream
+from the dump or ``UPSTREAM_SERVER_*`` in config (validated against the dump when both are set).
 
 Use ``python -m bot --no-headless`` to force external connectors only. Row ``bind_ip`` is for Proxifier
 unless ``PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is True and that IP exists on this machine.
@@ -32,7 +32,7 @@ from caseus import Secrets
 
 from .ban_proxy import BanBotProxy
 from . import flash_launch
-from .headless_client import load_secrets_base, start_headless_client_threads
+from .headless_client import load_secrets_base, resolve_headless_upstream, start_headless_client_threads
 from .upstream_probe import run_upstream_tcp_probe
 from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
 
@@ -369,7 +369,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         "--headless",
         action="store_true",
-        help="Start built-in caseus TCP clients per slot (needs HEADLESS_SECRETS_JSON or dumper + upstream).",
+        help="Start built-in caseus TCP clients per slot (needs HEADLESS_SECRETS_DUMPER or JSON + upstream).",
     )
     p.add_argument(
         "--no-headless",
@@ -501,18 +501,11 @@ def main(argv: list[str] | None = None) -> None:
 
     if headless_auto:
         base_secrets = load_secrets_base(cfg)
-        ua = getattr(cfg, "UPSTREAM_SERVER_ADDRESS", None)
-        up = getattr(cfg, "UPSTREAM_SERVER_PORTS", None)
-        if ua and up:
-            upstream_addr = str(ua).strip()
-            upstream_ports = tuple(int(x) for x in up)
-        else:
-            upstream_addr = base_secrets.server_address
-            upstream_ports = base_secrets.server_ports
+        upstream_addr, upstream_ports = resolve_headless_upstream(cfg, base_secrets)
         if not upstream_addr or not upstream_ports:
             logger.error(
-                "HEADLESS_AUTO_LOGIN needs server_address and server_ports in the secrets JSON "
-                "(from tfm-secrets) or set UPSTREAM_SERVER_ADDRESS and UPSTREAM_SERVER_PORTS in config."
+                "HEADLESS_AUTO_LOGIN needs server_address and server_ports from the live secrets dump "
+                "or set UPSTREAM_SERVER_ADDRESS and UPSTREAM_SERVER_PORTS in config."
             )
             raise SystemExit(1)
         logger.info(

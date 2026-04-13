@@ -1,10 +1,10 @@
 """
 One ``caseus.Client`` per slot connecting to the local BanBotProxy (no Flash).
 
-Requires ``Secrets`` (game keys) from ``HEADLESS_SECRETS_JSON`` or ``HEADLESS_SECRETS_DUMPER`` in
-``bot/config.py``. Each client uses ``Secrets.copy(server_address=..., server_ports=(...))`` to
-target ``127.0.0.1:<proxy_port>`` while ``BanBotProxy`` is given the real ``server_address`` /
-``server_ports`` from the same JSON so the proxy connects upstream immediately.
+Requires ``Secrets`` from ``HEADLESS_SECRETS_DUMPER`` (e.g. ``tfm-secrets``) each run, or optionally
+``HEADLESS_SECRETS_JSON`` for a static file. Each client uses ``Secrets.copy(server_address=..., server_ports=(...))``
+to target ``127.0.0.1:<proxy_port>`` while ``BanBotProxy`` is given the real upstream from config
+or the dump so the proxy connects immediately.
 
 The proxy injects ``LoginPacket`` after ``SystemInformationPacket``; this client must **not** send
 its own ``LoginPacket`` (see ``HeadlessProxyClient.login`` no-op).
@@ -31,11 +31,14 @@ logger = logging.getLogger(__name__)
 
 
 def load_secrets_base(cfg: object) -> Secrets:
-    """Load server crypto parameters (not per-slot); address/ports are overridden per slot."""
+    """Load server crypto parameters (not per-slot). Prefer a live dumper each run over a JSON file."""
     json_path = getattr(cfg, "HEADLESS_SECRETS_JSON", None)
     dumper = getattr(cfg, "HEADLESS_SECRETS_DUMPER", None)
 
-    if json_path:
+    if dumper and str(dumper).strip():
+        return Secrets.load_from_dumper(str(dumper).strip())
+
+    if json_path and str(json_path).strip():
         p = Path(str(json_path).strip()).expanduser()
         if not p.is_file():
             root = (
@@ -53,20 +56,48 @@ def load_secrets_base(cfg: object) -> Secrets:
         data: dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
         return Secrets(**data)
 
-    if dumper:
-        cmd = str(dumper).strip()
-        if not cmd:
-            msg = "HEADLESS_SECRETS_DUMPER is empty"
-            logger.error(msg)
-            raise SystemExit(msg)
-        return Secrets.load_from_dumper(cmd)
-
     msg = (
-        "Headless mode requires HEADLESS_SECRETS_JSON (path to JSON from tfm-secrets) "
-        "or HEADLESS_SECRETS_DUMPER (e.g. 'tfm-secrets') in bot/config.py"
+        "Headless mode requires HEADLESS_SECRETS_DUMPER (e.g. 'tfm-secrets' on PATH) in bot/config.py "
+        "to refresh secrets each run, or set HEADLESS_SECRETS_JSON to a tfm-secrets JSON file."
     )
     logger.error(msg)
     raise SystemExit(msg)
+
+
+def resolve_headless_upstream(cfg: object, base_secrets: Secrets) -> tuple[str, tuple[int, ...]]:
+    """Pick upstream host/ports; warn or exit if config overrides disagree with this run's dump."""
+    ua = getattr(cfg, "UPSTREAM_SERVER_ADDRESS", None)
+    up = getattr(cfg, "UPSTREAM_SERVER_PORTS", None)
+    dump_a = getattr(base_secrets, "server_address", None)
+    dump_p = getattr(base_secrets, "server_ports", None)
+
+    ua_s = str(ua).strip() if ua is not None else ""
+    if ua_s and up is not None and len(tuple(up)) > 0:
+        chosen_a = ua_s
+        chosen_p = tuple(int(x) for x in up)
+        if dump_a and dump_p:
+            dump_p_i = tuple(int(x) for x in dump_p)
+            same_a = chosen_a == str(dump_a).strip()
+            same_p = chosen_p == dump_p_i
+            if not (same_a and same_p):
+                msg = (
+                    f"UPSTREAM_SERVER_* ({chosen_a!r}, {chosen_p}) differs from this run's secrets "
+                    f"dump ({dump_a!r}, {dump_p_i}). A wrong shard often accepts TCP then closes with "
+                    "no handshake reply — align or clear UPSTREAM_SERVER_* to use the dump."
+                )
+                if bool(getattr(cfg, "UPSTREAM_STRICT_MATCH_SECRETS_DUMP", False)):
+                    logger.error(msg)
+                    raise SystemExit(msg)
+                logger.warning(msg)
+        return chosen_a, chosen_p
+
+    if not dump_a or not dump_p:
+        logger.error(
+            "Headless needs server_address and server_ports from the secrets dump, or set "
+            "UPSTREAM_SERVER_ADDRESS and UPSTREAM_SERVER_PORTS in config."
+        )
+        raise SystemExit(1)
+    return str(dump_a).strip(), tuple(int(x) for x in dump_p)
 
 
 class HeadlessProxyClient(Client):
