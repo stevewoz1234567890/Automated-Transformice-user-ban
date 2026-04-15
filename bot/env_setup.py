@@ -36,7 +36,7 @@ def _strip_js_trailing_commas(s: str) -> str:
     return s
 
 
-def _parse_accounts_list(raw: str) -> list:
+def _parse_accounts_list(raw: str, *, quiet: bool = False) -> list:
     """Parse ``BOT_ACCOUNTS_JSON`` with JSON, trailing-comma cleanup, or Python ``literal_eval``."""
     s = _normalize_accounts_json_text(raw)
     if not s:
@@ -50,7 +50,7 @@ def _parse_accounts_list(raw: str) -> list:
         try:
             data = json.loads(candidate)
             if isinstance(data, list) and data:
-                if candidate != s:
+                if not quiet and candidate != s:
                     logger.info("BOT_ACCOUNTS_JSON: accepted as %s (normalized).", label)
                 return data
         except json.JSONDecodeError as e:
@@ -59,14 +59,15 @@ def _parse_accounts_list(raw: str) -> list:
         try:
             data = ast.literal_eval(candidate)
             if isinstance(data, list) and data:
-                logger.info("BOT_ACCOUNTS_JSON: parsed via %s (Python-style list).", label)
+                if not quiet:
+                    logger.info("BOT_ACCOUNTS_JSON: parsed via %s (Python-style list).", label)
                 return data
         except (ValueError, SyntaxError) as e:
             errors.append(f"{label}: {e}")
     bracket = s.find("[")
     if bracket > 0:
         try:
-            return _parse_accounts_list(s[bracket:])
+            return _parse_accounts_list(s[bracket:], quiet=quiet)
         except ValueError:
             pass
     raise ValueError("; ".join(errors) if errors else "no parse strategy matched")
@@ -74,7 +75,7 @@ def _parse_accounts_list(raw: str) -> list:
 
 def _try_parse_accounts_list(raw: str) -> bool:
     try:
-        _parse_accounts_list(raw)
+        _parse_accounts_list(raw, quiet=True)
         return True
     except ValueError:
         return False

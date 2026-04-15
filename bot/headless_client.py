@@ -37,7 +37,7 @@ from typing import Any
 import pak
 from caseus import Secrets
 
-from .env_setup import load_dotenv_file, repo_root, update_or_append_dotenv
+from .env_setup import env_truthy, load_dotenv_file, repo_root, update_or_append_dotenv
 from .tfm_secrets_acquire import try_load_secrets_via_leaker
 from caseus.clients.client import AccountError, Client
 from caseus.packets import clientbound
@@ -347,11 +347,12 @@ def load_secrets_base(cfg: object) -> Secrets:
 
     sec = _secrets_from_env(cfg)
     if sec is not None:
-        logger.info(
-            "Secrets from environment / %s (prefix %r).",
-            getattr(cfg, "HEADLESS_SECRETS_DOTENV_PATH", ".env"),
-            str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_"),
-        )
+        _pfx = str(getattr(cfg, "HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_")
+        _dot = getattr(cfg, "HEADLESS_SECRETS_DOTENV_PATH", ".env")
+        if os.environ.get("BOT_SLOT_SPAWN_CHILD_INDEX", "").strip():
+            logger.debug("Secrets from environment / %s (prefix %r).", _dot, _pfx)
+        else:
+            logger.info("Secrets from environment / %s (prefix %r).", _dot, _pfx)
         return sec
 
     sec = _secrets_from_config_inline(cfg)
@@ -407,23 +408,27 @@ def sync_upstream_cfg_from_secrets(cfg: object, secrets: Secrets) -> None:
         "BOT_UPSTREAM_ALLOW_ADDRESS_MISMATCH": "false",
     }
     dot = _resolved_dotenv_path(cfg)
-    try:
-        update_or_append_dotenv(dot, updates)
-    except OSError as e:
-        logger.warning("Could not persist upstream sync to %s: %s", dot, e)
-        return
+    skip_disk = env_truthy("BOT_SKIP_UPSTREAM_SYNC_DOTENV_PERSIST")
+    if not skip_disk:
+        try:
+            update_or_append_dotenv(dot, updates)
+        except OSError as e:
+            logger.warning("Could not persist upstream sync to %s: %s", dot, e)
+            return
     for k, v in updates.items():
         os.environ[k] = v
     cfg.UPSTREAM_SERVER_ADDRESS = addr
     cfg.UPSTREAM_SERVER_PORTS = ports
     cfg.UPSTREAM_FROM_SECRETS_DUMP_ONLY = True
     cfg.UPSTREAM_ALLOW_ADDRESS_MISMATCH = False
-    logger.info(
+    _sync_msg = (
         "Synced BOT_UPSTREAM_* from secrets dump (host=%s ports=%s); "
-        "BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY=true, BOT_UPSTREAM_ALLOW_ADDRESS_MISMATCH=false.",
-        addr,
-        ports,
-    )
+        "BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY=true, BOT_UPSTREAM_ALLOW_ADDRESS_MISMATCH=false."
+    ) % (addr, ports)
+    if skip_disk:
+        logger.debug("%s (skipped .env write to %s.)", _sync_msg, dot)
+    else:
+        logger.info("%s", _sync_msg)
 
 
 def _upstream_ports_try_main_first(cfg: object, ports: tuple[int, ...]) -> tuple[int, ...]:
@@ -707,19 +712,32 @@ def start_headless_client_threads(
     pairs = list(zip(states, raw_accounts))
 
     if bool(getattr(cfg, "HEADLESS_PARALLEL_LOGIN", True)):
+        n = len(pairs)
         if int(getattr(cfg, "HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES", 0) or 0) > 0:
-            logger.info(
-                "BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES is ignored when "
-                "BOT_HEADLESS_PARALLEL_LOGIN is true.",
-            )
+            if n > 1:
+                logger.info(
+                    "BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES is ignored when "
+                    "BOT_HEADLESS_PARALLEL_LOGIN is true.",
+                )
+            else:
+                logger.debug(
+                    "BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES is ignored when "
+                    "BOT_HEADLESS_PARALLEL_LOGIN is true (single-slot process).",
+                )
         start_stagger = float(getattr(cfg, "HEADLESS_PARALLEL_START_STAGGER_SEC", 0.0) or 0.0)
         start_stagger = max(0.0, start_stagger)
-        n = len(pairs)
-        logger.info(
-            "Headless parallel login: starting %s caseus.Client thread(s); "
-            "sessions stay open after LoginSuccess.",
-            n,
-        )
+        if n > 1:
+            logger.info(
+                "Headless parallel login: starting %s caseus.Client thread(s); "
+                "sessions stay open after LoginSuccess.",
+                n,
+            )
+        else:
+            logger.debug(
+                "Headless parallel login: starting %s caseus.Client thread(s); "
+                "sessions stay open after LoginSuccess.",
+                n,
+            )
 
         def _run_slot(idx: int, st: Any, rw: dict[str, object]) -> None:
             if start_stagger > 0 and idx > 0:
@@ -764,7 +782,10 @@ def start_headless_client_threads(
 
         while time.monotonic() < deadline:
             if all(st.login_success_event.is_set() for st, _ in pairs):
-                logger.info("Headless parallel login: all %s slot(s) reached LoginSuccess.", n)
+                if n > 1:
+                    logger.info("Headless parallel login: all %s slot(s) reached LoginSuccess.", n)
+                else:
+                    logger.debug("Headless parallel login: all %s slot(s) reached LoginSuccess.", n)
                 return True
             if (
                 not retry_wave_done
@@ -803,12 +824,21 @@ def start_headless_client_threads(
                             ", ".join(st.label for st, _ in to_retry),
                         )
                     else:
+                        extra = ""
+                        if len(to_retry) == 1:
+                            extra = (
+                                " If many `--slot-index` / minimized spawn bots run together, each process opens "
+                                "upstream TCP independently — increase BOT_SPAWN_SLOT_CONSOLE_STAGGER_SEC and "
+                                "BOT_SPAWN_CHILD_HEADLESS_DELAY_PER_INDEX_SEC (spawn children force "
+                                "BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS=1 per process)."
+                            )
                         logger.info(
                             "Headless parallel: retry wave for %s slot(s) (labels: %s) — "
                             "first wave did not reach LoginSuccess (mixed causes); try "
-                            "BOT_HEADLESS_PARALLEL_START_STAGGER_SEC if only some slots fail.",
+                            "BOT_HEADLESS_PARALLEL_START_STAGGER_SEC if only some slots fail.%s",
                             len(to_retry),
                             ", ".join(st.label for st, _ in to_retry),
+                            extra,
                         )
                     for j, (st, rw) in enumerate(to_retry):
                         if retry_stagger > 0 and j > 0:
@@ -825,11 +855,20 @@ def start_headless_client_threads(
             time.sleep(poll_sec)
         pending_states = [st for st, _ in pairs if not st.login_success_event.is_set()]
         pending = [st.label for st in pending_states]
-        logger.error(
-            "Headless parallel login timed out after %.0fs — missing LoginSuccess for slot(s): %s",
-            timeout_sec,
-            ", ".join(pending) if pending else "(unknown)",
-        )
+        if os.environ.get("BOT_SLOT_SPAWN_CHILD_INDEX", "").strip():
+            logger.error(
+                "Headless parallel login timed out after %.0fs — missing LoginSuccess for slot(s): %s. "
+                "Spawn-console child: upstream connect timeouts often mean too many python.exe hit the same host "
+                "together — raise BOT_SPAWN_CHILD_HEADLESS_DELAY_PER_INDEX_SEC and BOT_SPAWN_SLOT_CONSOLE_STAGGER_SEC.",
+                timeout_sec,
+                ", ".join(pending) if pending else "(unknown)",
+            )
+        else:
+            logger.error(
+                "Headless parallel login timed out after %.0fs — missing LoginSuccess for slot(s): %s",
+                timeout_sec,
+                ", ".join(pending) if pending else "(unknown)",
+            )
         if pending_states:
             w121_n = _count_win121_slots(pending_states)
             if w121_n >= len(pending_states):

@@ -21,6 +21,8 @@ desktop Linux: a terminal emulator when ``DISPLAY`` is set). Children disable li
 and share cached ``TFM_SECRETS_*`` from ``.env`` so parallel runs do not corrupt ``mm.cfg`` / secrets.
 ``--slot-index`` / ``BOT_SLOT_INDEX`` runs only that row from ``BOT_ACCOUNTS_JSON`` in the current process.
 On Windows, optional ``BOT_SLOT_CONSOLE_COLUMNS`` / ``BOT_SLOT_CONSOLE_LINES`` shrink each child window.
+With ``--spawn-slot-consoles``, the launcher console is raised to the top (HWND_TOPMOST) while spawning;
+each child console starts minimized (override with ``BOT_SPAWN_DISABLE_*`` in ``.env``).
 
 Loader URL fields for ``LoginPacket`` are built from ``TFMProxyLoader.swf`` metadata (see ``flash_launch``).
 """
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import logging
 import os
 import random
@@ -472,13 +475,56 @@ def _bot_child_invocation_prefix() -> list[str]:
     return [sys.executable, "-m", "bot"]
 
 
-def _popen_slot_console(cmd: list[str], *, env: dict[str, str]) -> subprocess.Popen:
+def _windows_spawn_launcher_console_topmost(enabled: bool) -> None:
+    """Raise or restore Z-order for the console hosting the spawn launcher (Windows only)."""
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        hwnd = kernel32.GetConsoleWindow()
+        if not hwnd:
+            return
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_SHOWWINDOW = 0x0040
+        insert = HWND_TOPMOST if enabled else HWND_NOTOPMOST
+        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+        if not user32.SetWindowPos(hwnd, insert, 0, 0, 0, 0, flags):
+            logger.debug("SetWindowPos(topmost=%s) failed: %s", enabled, ctypes.get_last_error())
+        if enabled:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+    except (AttributeError, ctypes.ArgumentError, OSError):
+        logger.debug("Windows spawn launcher console topmost failed.", exc_info=True)
+
+
+def _popen_slot_console(
+    cmd: list[str],
+    *,
+    env: dict[str, str],
+    minimize_new_console: bool = False,
+) -> subprocess.Popen:
     creationflags = 0
     if sys.platform == "win32":
         creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 
     if sys.platform == "win32" and creationflags:
-        return subprocess.Popen(cmd, env=env, close_fds=False, creationflags=creationflags)
+        startupinfo: subprocess.STARTUPINFO | None = None
+        if minimize_new_console and not env_truthy("BOT_SPAWN_DISABLE_MINIMIZE_CHILD"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            # SW_SHOWMINNOACTIVE: minimized without stealing activation from the launcher.
+            startupinfo.wShowWindow = 7
+        return subprocess.Popen(
+            cmd,
+            env=env,
+            close_fds=False,
+            creationflags=creationflags,
+            startupinfo=startupinfo,
+        )
 
     display = (os.environ.get("DISPLAY") or "").strip()
     if display:
@@ -508,7 +554,7 @@ def _spawn_one_bot_per_account_console(*, argv_tail: list[str], n_accounts: int)
     base_argv = _argv_strip_spawn_and_slot(argv_tail)
     prefix = _bot_child_invocation_prefix()
 
-    stagger = float(os.environ.get("BOT_SPAWN_SLOT_CONSOLE_STAGGER_SEC", "0.2") or 0.2)
+    stagger = float(os.environ.get("BOT_SPAWN_SLOT_CONSOLE_STAGGER_SEC", "2.0") or 2.0)
     stagger = max(0.0, stagger)
 
     logger.info(
@@ -516,6 +562,35 @@ def _spawn_one_bot_per_account_console(*, argv_tail: list[str], n_accounts: int)
         "Run the bot once without --spawn-slot-consoles if you need a live secrets refresh.",
     )
 
+    if sys.platform == "win32" and not env_truthy("BOT_SPAWN_DISABLE_LAUNCHER_TOPMOST"):
+        _windows_spawn_launcher_console_topmost(True)
+
+    try:
+        _spawn_slot_console_children_loop(
+            n_accounts=n_accounts,
+            prefix=prefix,
+            base_argv=base_argv,
+            stagger=stagger,
+        )
+    finally:
+        if sys.platform == "win32" and not env_truthy("BOT_SPAWN_DISABLE_LAUNCHER_TOPMOST"):
+            _windows_spawn_launcher_console_topmost(False)
+
+    logger.info(
+        "Launched %s separate bot process(es). This launcher exits; each slot runs /room+/ban in its own process.",
+        n_accounts,
+    )
+    raise SystemExit(0)
+
+
+def _spawn_slot_console_children_loop(
+    *,
+    n_accounts: int,
+    prefix: list[str],
+    base_argv: list[str],
+    stagger: float,
+) -> None:
+    minimize = sys.platform == "win32"
     for i in range(n_accounts):
         child_env = os.environ.copy()
         child_env.pop("BOT_SPAWN_SLOT_CONSOLES", None)
@@ -526,6 +601,15 @@ def _spawn_one_bot_per_account_console(*, argv_tail: list[str], n_accounts: int)
         child_env["BOT_HEADLESS_SECRETS_AUTO_LEAKER_SWF"] = "false"
         if i > 0:
             child_env["BOT_UPSTREAM_TCP_PROBE_BEFORE_HEADLESS"] = "false"
+        # Many separate processes × default max 2 parallel connects each → upstream timeouts; serialize a bit.
+        child_env["BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS"] = str(
+            max(1, int(os.environ.get("BOT_SPAWN_CHILD_UPSTREAM_MAX_CONCURRENT", "1") or 1))
+        )
+        child_env["BOT_SKIP_UPSTREAM_SYNC_DOTENV_PERSIST"] = "true"
+        child_env["BOT_SLOT_SPAWN_CHILD_INDEX"] = str(i)
+        per_delay = float(os.environ.get("BOT_SPAWN_CHILD_HEADLESS_DELAY_PER_INDEX_SEC", "2.0") or 2.0)
+        per_delay = max(0.0, per_delay)
+        child_env["BOT_SPAWN_CHILD_HEADLESS_DELAY_SEC"] = str(per_delay * i)
 
         cmd = [*prefix, *base_argv, "--slot-index", str(i)]
         logger.info(
@@ -534,15 +618,9 @@ def _spawn_one_bot_per_account_console(*, argv_tail: list[str], n_accounts: int)
             n_accounts,
             " ".join(shlex.quote(c) for c in cmd),
         )
-        _popen_slot_console(cmd, env=child_env)
+        _popen_slot_console(cmd, env=child_env, minimize_new_console=minimize)
         if stagger and i < n_accounts - 1:
             time.sleep(stagger)
-
-    logger.info(
-        "Launched %s separate bot process(es). This launcher exits; each slot runs /room+/ban in its own process.",
-        n_accounts,
-    )
-    raise SystemExit(0)
 
 
 def _resize_windows_slot_child_console() -> None:
@@ -757,11 +835,18 @@ def main(argv: list[str] | None = None) -> None:
                 "or set BOT_UPSTREAM_SERVER_ADDRESS and BOT_UPSTREAM_SERVER_PORTS in .env."
             )
             raise SystemExit(1)
-        logger.info(
-            "Headless TCP login enabled: proxy upstream %s ports %s",
-            upstream_addr,
-            upstream_ports,
-        )
+        if os.environ.get("BOT_SLOT_SPAWN_CHILD_INDEX", "").strip():
+            logger.debug(
+                "Headless TCP login enabled: proxy upstream %s ports %s",
+                upstream_addr,
+                upstream_ports,
+            )
+        else:
+            logger.info(
+                "Headless TCP login enabled: proxy upstream %s ports %s",
+                upstream_addr,
+                upstream_ports,
+            )
         if len(states) > 1:
             logger.info(
                 "Multi-slot headless (%s accounts): BOT_HEADLESS_PARALLEL_LOGIN=%s",
@@ -780,12 +865,15 @@ def main(argv: list[str] | None = None) -> None:
                     us,
                 )
             else:
-                logger.info(
-                    "Upstream host matches TFM_SECRETS_SERVER_ADDRESS (%r). Zero-byte closes usually mean stale "
-                    "TFM_SECRETS_* (re-run leaker) or server policy; WinError 121 on later slots: increase "
-                    "BOT_HEADLESS_LOGIN_STAGGER_SEC or set BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES.",
-                    ds,
-                )
+                if os.environ.get("BOT_SLOT_SPAWN_CHILD_INDEX", "").strip():
+                    logger.debug("Upstream host matches TFM_SECRETS_SERVER_ADDRESS (%r).", ds)
+                else:
+                    logger.info(
+                        "Upstream host matches TFM_SECRETS_SERVER_ADDRESS (%r). Zero-byte closes usually mean stale "
+                        "TFM_SECRETS_* (re-run leaker) or server policy; WinError 121 on later slots: increase "
+                        "BOT_HEADLESS_LOGIN_STAGGER_SEC or set BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES.",
+                        ds,
+                    )
 
     auth_key_fallback: int | None = None
     packet_key_sources_fallback: list | tuple | None = None
@@ -855,6 +943,26 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if headless_auto:
+        _spawn_ix = os.environ.get("BOT_SLOT_SPAWN_CHILD_INDEX", "").strip()
+        if _spawn_ix:
+            _raw_d = os.environ.get("BOT_SPAWN_CHILD_HEADLESS_DELAY_SEC", "").strip()
+            try:
+                _spawn_pre_delay = float(_raw_d) if _raw_d else 0.0
+            except ValueError:
+                _spawn_pre_delay = 0.0
+            _spawn_pre_delay = max(0.0, _spawn_pre_delay)
+            logger.info(
+                "Spawn-console child: slot_index=%s pid=%s upstream=%r max_parallel_connects=%s "
+                "tcp_open_timeout_sec=%.0f headless_delay_sec=%.2f",
+                _spawn_ix,
+                os.getpid(),
+                upstream_addr,
+                int(getattr(cfg, "UPSTREAM_MAX_CONCURRENT_CONNECTS", 0) or 0),
+                float(getattr(cfg, "UPSTREAM_OPEN_CONNECTION_TIMEOUT_SEC", 12.0) or 12.0),
+                _spawn_pre_delay,
+            )
+            if _spawn_pre_delay > 0:
+                time.sleep(_spawn_pre_delay)
         if not start_headless_client_threads(
             states,
             raw_accounts,

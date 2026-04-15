@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
+import os
 import random
 import sys
 import threading
@@ -49,12 +50,15 @@ def _configure_upstream_connect_gate(cap: int) -> threading.Semaphore | None:
             return _upstream_connect_semaphore
         _upstream_connect_semaphore = threading.Semaphore(cap)
         _upstream_connect_gate_cap = cap
-        logger.info(
+        _msg = (
             "Upstream TCP connect gate enabled: max %s concurrent connect attempt(s) "
             "process-wide (BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS); reduces WinError 121 when "
-            "many slots open TCP to the same host.",
-            cap,
-        )
+            "many slots open TCP to the same host."
+        ) % (cap,)
+        if os.environ.get("BOT_SLOT_SPAWN_CHILD_INDEX", "").strip():
+            logger.debug("%s", _msg)
+        else:
+            logger.info("%s", _msg)
         return _upstream_connect_semaphore
 
 
