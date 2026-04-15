@@ -17,8 +17,10 @@ unless ``BOT_PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is true and that IP exists on th
 
 ``--spawn-slot-consoles`` (or ``BOT_SPAWN_SLOT_CONSOLES=true``) starts one OS process per account, each
 with ``--slot-index N``, so every account auto-logs in its own console (Windows: new ``cmd`` window;
-desktop Linux: a terminal emulator when ``DISPLAY`` is set). ``--slot-index`` / ``BOT_SLOT_INDEX`` runs
-only that row from ``BOT_ACCOUNTS_JSON`` in the current process.
+desktop Linux: a terminal emulator when ``DISPLAY`` is set). Children disable live Flash leaker refresh
+and share cached ``TFM_SECRETS_*`` from ``.env`` so parallel runs do not corrupt ``mm.cfg`` / secrets.
+``--slot-index`` / ``BOT_SLOT_INDEX`` runs only that row from ``BOT_ACCOUNTS_JSON`` in the current process.
+On Windows, optional ``BOT_SLOT_CONSOLE_COLUMNS`` / ``BOT_SLOT_CONSOLE_LINES`` shrink each child window.
 
 Loader URL fields for ``LoginPacket`` are built from ``TFMProxyLoader.swf`` metadata (see ``flash_launch``).
 """
@@ -505,14 +507,26 @@ def _popen_slot_console(cmd: list[str], *, env: dict[str, str]) -> subprocess.Po
 def _spawn_one_bot_per_account_console(*, argv_tail: list[str], n_accounts: int) -> None:
     base_argv = _argv_strip_spawn_and_slot(argv_tail)
     prefix = _bot_child_invocation_prefix()
-    env = os.environ.copy()
-    env.pop("BOT_SPAWN_SLOT_CONSOLES", None)
-    env.pop("BOT_SLOT_INDEX", None)
 
     stagger = float(os.environ.get("BOT_SPAWN_SLOT_CONSOLE_STAGGER_SEC", "0.2") or 0.2)
     stagger = max(0.0, stagger)
 
+    logger.info(
+        "Spawned slot processes use cached TFM_SECRETS_* from .env (no parallel Flash leaker). "
+        "Run the bot once without --spawn-slot-consoles if you need a live secrets refresh.",
+    )
+
     for i in range(n_accounts):
+        child_env = os.environ.copy()
+        child_env.pop("BOT_SPAWN_SLOT_CONSOLES", None)
+        child_env.pop("BOT_SLOT_INDEX", None)
+        # Many children at once all run tfm-secrets / TFMSecretsLeaker.swf → mm.cfg.bak races and
+        # conflicting .env writes; stale handshakes (zero-byte close) until one leaker wins.
+        child_env["BOT_HEADLESS_SECRETS_ALWAYS_REFRESH"] = "false"
+        child_env["BOT_HEADLESS_SECRETS_AUTO_LEAKER_SWF"] = "false"
+        if i > 0:
+            child_env["BOT_UPSTREAM_TCP_PROBE_BEFORE_HEADLESS"] = "false"
+
         cmd = [*prefix, *base_argv, "--slot-index", str(i)]
         logger.info(
             "Spawning slot %s/%s console: %s",
@@ -520,7 +534,7 @@ def _spawn_one_bot_per_account_console(*, argv_tail: list[str], n_accounts: int)
             n_accounts,
             " ".join(shlex.quote(c) for c in cmd),
         )
-        _popen_slot_console(cmd, env=env)
+        _popen_slot_console(cmd, env=child_env)
         if stagger and i < n_accounts - 1:
             time.sleep(stagger)
 
@@ -529,6 +543,32 @@ def _spawn_one_bot_per_account_console(*, argv_tail: list[str], n_accounts: int)
         n_accounts,
     )
     raise SystemExit(0)
+
+
+def _resize_windows_slot_child_console() -> None:
+    """Shrink the host ``cmd`` window for ``--slot-index`` runs (optional env sizing)."""
+    if sys.platform != "win32":
+        return
+    if env_truthy("BOT_SLOT_CONSOLE_DISABLE_RESIZE"):
+        return
+    try:
+        cols = int(os.environ.get("BOT_SLOT_CONSOLE_COLUMNS", "72") or 72)
+        lines = int(os.environ.get("BOT_SLOT_CONSOLE_LINES", "20") or 20)
+    except ValueError:
+        cols, lines = 72, 20
+    cols = max(40, min(cols, 200))
+    lines = max(8, min(lines, 60))
+    try:
+        subprocess.run(
+            f"mode con: cols={cols} lines={lines}",
+            shell=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
 
 
 def _cfg_shared_flash_policy_port(cfg) -> int | None:
@@ -603,6 +643,8 @@ def main(argv: list[str] | None = None) -> None:
             str(picked.get("label", slot_ix + 1)),
         )
         raw_accounts = [picked]
+        _resize_windows_slot_child_console()
+
     headless_auto = (
         (bool(getattr(cfg, "HEADLESS_AUTO_LOGIN", False)) or args.headless)
         and not args.no_headless
