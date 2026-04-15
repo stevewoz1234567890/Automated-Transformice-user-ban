@@ -206,6 +206,9 @@ def _run_slot_async(
                 upstream_max_concurrent_connects=int(
                     getattr(cfg, "UPSTREAM_MAX_CONCURRENT_CONNECTS", 2)
                 ),
+                upstream_open_connection_timeout_sec=float(
+                    getattr(cfg, "UPSTREAM_OPEN_CONNECTION_TIMEOUT_SEC", 12.0) or 12.0
+                ),
                 packet_login_auth_key_fallback=packet_login_auth_key_fallback,
                 packet_login_packet_key_sources_fallback=packet_login_packet_key_sources_fallback,
                 bootstrap_secrets=bootstrap_secrets,

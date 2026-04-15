@@ -207,6 +207,7 @@ class BanBotProxy(Proxy):
         login_diagnostics: bool = True,
         upstream_connect_shuffle_ports: bool = False,
         upstream_max_concurrent_connects: int | None = None,
+        upstream_open_connection_timeout_sec: float | None = None,
         **kwargs,
     ):
         # Flash file:// SWF + Socket: use IPv4 literal so the client never targets the public
@@ -245,6 +246,11 @@ class BanBotProxy(Proxy):
         self._upstream_connect_shuffle_ports = upstream_connect_shuffle_ports
         cap = 2 if upstream_max_concurrent_connects is None else int(upstream_max_concurrent_connects)
         self._upstream_connect_sem = _configure_upstream_connect_gate(cap)
+        self._upstream_open_connection_timeout_sec = float(
+            upstream_open_connection_timeout_sec
+            if upstream_open_connection_timeout_sec is not None
+            else 12.0
+        )
         # When game secrets include client_verification_template, defer injected LoginPacket
         # until the local client sends serverbound ClientVerificationPacket (answer). Otherwise
         # a short delay after SystemInformation can inject Login before the answer reaches the
@@ -932,14 +938,33 @@ class BanBotProxy(Proxy):
             )
         raise NotImplementedError(f"We do not properly handle changing the main server: {packet}")
 
+    async def _open_connection_maybe_timeout(self, address, port):
+        """``asyncio.open_connection`` with optional cap (fails before Windows ~21s default)."""
+        timeout = self._upstream_open_connection_timeout_sec
+        if timeout is None or timeout <= 0:
+            return await asyncio.open_connection(address, port)
+        return await asyncio.wait_for(
+            asyncio.open_connection(address, port),
+            timeout=timeout,
+        )
+
     async def _gated_open_connection(self, address, port):
-        """``asyncio.open_connection`` optionally limited process-wide (Windows 121 under burst)."""
+        """
+        Limit concurrent upstream TCP connects process-wide.
+
+        Uses non-blocking ``Semaphore.acquire`` + ``asyncio.sleep`` so we do **not** block
+        ``asyncio``'s default ThreadPoolExecutor (``asyncio.to_thread(sem.acquire)`` would — one
+        blocked waiter per slot could exhaust the pool and stall every slot).
+        """
         sem = self._upstream_connect_sem
         if sem is None:
-            return await asyncio.open_connection(address, port)
-        await asyncio.to_thread(sem.acquire)
+            return await self._open_connection_maybe_timeout(address, port)
+        while True:
+            if sem.acquire(blocking=False):
+                break
+            await asyncio.sleep(0.03)
         try:
-            return await asyncio.open_connection(address, port)
+            return await self._open_connection_maybe_timeout(address, port)
         finally:
             sem.release()
 
@@ -1012,8 +1037,10 @@ class BanBotProxy(Proxy):
                         if ev is not None:
                             ev.set()
                         logger.warning(
-                            "Slot %s: [login] winerror=121: TCP connect timed out (firewall/VPN/path). "
-                            "Not fixed by tfm-secrets. Run `python -m bot.upstream_probe %s %s`.",
+                            "Slot %s: [login] winerror=121: Windows TCP connect timed out "
+                            "(firewall/VPN/path). The OS message says 'semaphore'; that is **not** "
+                            "BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS. Not fixed by tfm-secrets. "
+                            "Run `python -m bot.upstream_probe %s %s`.",
                             self.slot_label,
                             address,
                             " ".join(str(p) for p in ports_seq),
