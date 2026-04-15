@@ -25,6 +25,38 @@ logger = logging.getLogger(__name__)
 
 _print_lock = threading.Lock()
 
+# Process-wide cap on concurrent asyncio.open_connection() to the game host.
+# Many parallel proxies (e.g. 12 slots) otherwise hit Windows WinError 121 on the same IP.
+_upstream_connect_gate_lock = threading.Lock()
+_upstream_connect_semaphore: threading.Semaphore | None = None
+_upstream_connect_gate_cap: int = 0
+
+
+def _configure_upstream_connect_gate(cap: int) -> threading.Semaphore | None:
+    """Return a shared semaphore, or None when ``cap <= 0`` (no gating)."""
+    global _upstream_connect_semaphore, _upstream_connect_gate_cap
+    if cap <= 0:
+        return None
+    with _upstream_connect_gate_lock:
+        if _upstream_connect_semaphore is not None:
+            if cap != _upstream_connect_gate_cap:
+                logger.warning(
+                    "BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS=%s differs from active gate (%s); "
+                    "keeping the first value for this process.",
+                    cap,
+                    _upstream_connect_gate_cap,
+                )
+            return _upstream_connect_semaphore
+        _upstream_connect_semaphore = threading.Semaphore(cap)
+        _upstream_connect_gate_cap = cap
+        logger.info(
+            "Upstream TCP connect gate enabled: max %s concurrent connect attempt(s) "
+            "process-wide (BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS); reduces WinError 121 when "
+            "many slots open TCP to the same host.",
+            cap,
+        )
+        return _upstream_connect_semaphore
+
 
 def _safe_print(msg: str) -> None:
     with _print_lock:
@@ -174,6 +206,7 @@ class BanBotProxy(Proxy):
         bootstrap_secrets: Secrets | None = None,
         login_diagnostics: bool = True,
         upstream_connect_shuffle_ports: bool = False,
+        upstream_max_concurrent_connects: int | None = None,
         **kwargs,
     ):
         # Flash file:// SWF + Socket: use IPv4 literal so the client never targets the public
@@ -210,6 +243,8 @@ class BanBotProxy(Proxy):
         self._login_diag_upstream_cb_seq = 0
         self._upstream_raw_chunk_logged = False
         self._upstream_connect_shuffle_ports = upstream_connect_shuffle_ports
+        cap = 2 if upstream_max_concurrent_connects is None else int(upstream_max_concurrent_connects)
+        self._upstream_connect_sem = _configure_upstream_connect_gate(cap)
         # When game secrets include client_verification_template, defer injected LoginPacket
         # until the local client sends serverbound ClientVerificationPacket (answer). Otherwise
         # a short delay after SystemInformation can inject Login before the answer reaches the
@@ -897,6 +932,17 @@ class BanBotProxy(Proxy):
             )
         raise NotImplementedError(f"We do not properly handle changing the main server: {packet}")
 
+    async def _gated_open_connection(self, address, port):
+        """``asyncio.open_connection`` optionally limited process-wide (Windows 121 under burst)."""
+        sem = self._upstream_connect_sem
+        if sem is None:
+            return await asyncio.open_connection(address, port)
+        await asyncio.to_thread(sem.acquire)
+        try:
+            return await asyncio.open_connection(address, port)
+        finally:
+            sem.release()
+
     async def open_streams(self, address, ports):
         """
         Like ``caseus.Proxy.open_streams`` but log each ``asyncio.open_connection`` attempt.
@@ -904,14 +950,21 @@ class BanBotProxy(Proxy):
         the same order as ``ports`` (put main, e.g. 11801, first in config to try it before fallbacks).
         The base implementation swallows exceptions, which hides refused / timeout / firewall errors.
         """
-        if not self._upstream_connect_diag:
-            return await super().open_streams(address, ports)
-
         ports_seq = list(ports)
         if self._upstream_connect_shuffle_ports:
             order = random.sample(ports_seq, len(ports_seq))
         else:
             order = list(ports_seq)
+
+        if not self._upstream_connect_diag:
+            last_exc: BaseException | None = None
+            for port in order:
+                try:
+                    return await self._gated_open_connection(address, port)
+                except Exception:
+                    continue
+            raise ValueError(f"Unable to connect to address '{address}' on ports {ports}")
+
         self._upstream_open_streams_entered = True
         logger.info(
             "Slot %s: [login] upstream TCP: host=%r shuffle_ports=%s port_try_order=%s (pool=%s)",
@@ -926,7 +979,7 @@ class BanBotProxy(Proxy):
         for port in order:
             try:
                 t0 = time.monotonic()
-                server_reader, server_writer = await asyncio.open_connection(address, port)
+                server_reader, server_writer = await self._gated_open_connection(address, port)
                 dt = time.monotonic() - t0
                 peer = None
                 try:

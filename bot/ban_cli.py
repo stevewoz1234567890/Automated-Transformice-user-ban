@@ -203,6 +203,9 @@ def _run_slot_async(
                 upstream_connect_shuffle_ports=bool(
                     getattr(cfg, "UPSTREAM_CONNECT_SHUFFLE_PORTS", False)
                 ),
+                upstream_max_concurrent_connects=int(
+                    getattr(cfg, "UPSTREAM_MAX_CONCURRENT_CONNECTS", 2)
+                ),
                 packet_login_auth_key_fallback=packet_login_auth_key_fallback,
                 packet_login_packet_key_sources_fallback=packet_login_packet_key_sources_fallback,
                 bootstrap_secrets=bootstrap_secrets,
