@@ -210,6 +210,11 @@ class BanBotProxy(Proxy):
         self._login_diag_upstream_cb_seq = 0
         self._upstream_raw_chunk_logged = False
         self._upstream_connect_shuffle_ports = upstream_connect_shuffle_ports
+        # When game secrets include client_verification_template, defer injected LoginPacket
+        # until the local client sends serverbound ClientVerificationPacket (answer). Otherwise
+        # a short delay after SystemInformation can inject Login before the answer reaches the
+        # server and the session is dropped (intermittent under parallel load).
+        self._packet_login_waiting_client_verification = False
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(
             self._log_client_verification_challenge,
@@ -223,6 +228,10 @@ class BanBotProxy(Proxy):
         self.register_packet_listener(
             self._schedule_packet_login_after_sysinfo,
             serverbound.SystemInformationPacket,
+        )
+        self.register_packet_listener(
+            self._schedule_packet_login_after_client_verification_answer,
+            serverbound.ClientVerificationPacket,
         )
         self.register_packet_listener(
             self._gate_duplicate_login_packet,
@@ -464,6 +473,52 @@ class BanBotProxy(Proxy):
         self._packet_login_task = None
         self._login_diag_upstream_cb_seq = 0
         self._upstream_raw_chunk_logged = False
+        self._packet_login_waiting_client_verification = False
+
+    def _game_requires_client_verification_response(self, source) -> bool:
+        """True when secrets include a template; client must answer before LoginPacket."""
+        sec = self._bootstrap_secrets
+        if sec is None and source is not None:
+            dest = getattr(source, "destination", None)
+            if dest is not None:
+                sec = getattr(dest, "secrets", None)
+        if sec is None:
+            return False
+        return getattr(sec, "client_verification_template", None) is not None
+
+    def _packet_login_fields_ok(self) -> bool:
+        if not (self._packet_login_username and self._packet_login_password.strip()):
+            logger.warning(
+                "Slot %s: [login] username/password missing — cannot inject LoginPacket",
+                self.slot_label,
+            )
+            return False
+        if not self._packet_login_loader_url:
+            logger.warning(
+                "Slot %s: [login] packet_loader_url empty — cannot inject LoginPacket",
+                self.slot_label,
+            )
+            return False
+        return True
+
+    def _start_packet_login_delay_task(self, *, log_line: str) -> None:
+        delay = max(0.0, float(self._packet_login_delay_sec))
+        logger.info(log_line, self.slot_label, delay)
+
+        async def _job() -> None:
+            try:
+                await asyncio.sleep(delay)
+                if self._packet_login_sent:
+                    return
+                await self._send_packet_login_upstream()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Slot %s: [login] packet login task failed", self.slot_label)
+
+        if self._packet_login_task is not None and not self._packet_login_task.done():
+            self._packet_login_task.cancel()
+        self._packet_login_task = asyncio.create_task(_job())
 
     async def _login_stall_watchdog(self) -> None:
         """Warn when the login pipeline stalls (helps diagnose silent upstream failures)."""
@@ -509,6 +564,13 @@ class BanBotProxy(Proxy):
                     "after 25s — headless client or loader may be stuck",
                     self.slot_label,
                 )
+            elif self._packet_login_waiting_client_verification:
+                logger.warning(
+                    "Slot %s: [login] SystemInformation OK but LoginPacket not injected yet — "
+                    "waiting for client ClientVerificationPacket (anti-bot answer). "
+                    "If this persists, the client is not completing verification.",
+                    self.slot_label,
+                )
             elif not self._packet_login_sent:
                 logger.warning(
                     "Slot %s: [login] SystemInformation seen but LoginPacket was not injected "
@@ -523,7 +585,8 @@ class BanBotProxy(Proxy):
             return
         logger.warning(
             "Slot %s: [login] server sent ClientVerificationPacket (anti-bot) — "
-            "if login fails, the headless path may not satisfy this challenge; try a full client",
+            "injected LoginPacket is deferred until the client sends the verification answer "
+            "when client_verification_template is set; if login still fails, try a full client",
             self.slot_label,
         )
 
@@ -558,37 +621,33 @@ class BanBotProxy(Proxy):
         if getattr(source, "is_satellite", False):
             return
         self._sysinfo_received = True
-        delay = max(0.0, self._packet_login_delay_sec)
-        if not (self._packet_login_username and self._packet_login_password.strip()):
-            logger.warning(
-                "Slot %s: [login] SystemInformation received but username/password missing — cannot inject LoginPacket",
+        if not self._packet_login_fields_ok():
+            return
+        if self._game_requires_client_verification_response(source):
+            self._packet_login_waiting_client_verification = True
+            logger.info(
+                "Slot %s: [login] SystemInformation received — deferring LoginPacket until "
+                "client sends ClientVerificationPacket (anti-bot)",
                 self.slot_label,
             )
             return
-        if not self._packet_login_loader_url:
-            logger.warning(
-                "Slot %s: [login] SystemInformation received but packet_loader_url empty — cannot inject LoginPacket",
-                self.slot_label,
-            )
-            return
-        logger.info(
-            "Slot %s: [login] SystemInformation received — injecting LoginPacket in %.2fs",
-            self.slot_label,
-            delay,
+        self._packet_login_waiting_client_verification = False
+        self._start_packet_login_delay_task(
+            log_line="Slot %s: [login] SystemInformation received — injecting LoginPacket in %.2fs",
         )
 
-        async def _job() -> None:
-            try:
-                await asyncio.sleep(delay)
-                if self._packet_login_sent:
-                    return
-                await self._send_packet_login_upstream()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Slot %s: [login] packet login task failed", self.slot_label)
-
-        self._packet_login_task = asyncio.create_task(_job())
+    async def _schedule_packet_login_after_client_verification_answer(self, source, packet):
+        if getattr(source, "is_satellite", False):
+            return
+        if not self._packet_login_waiting_client_verification:
+            return
+        if not self._packet_login_fields_ok():
+            self._packet_login_waiting_client_verification = False
+            return
+        self._packet_login_waiting_client_verification = False
+        self._start_packet_login_delay_task(
+            log_line="Slot %s: [login] client ClientVerificationPacket (answer) — injecting LoginPacket in %.2fs",
+        )
 
     async def _send_packet_login_upstream(self) -> None:
         if self._packet_login_sent or not self.main_clients:
