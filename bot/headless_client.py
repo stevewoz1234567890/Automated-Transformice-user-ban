@@ -40,7 +40,7 @@ from caseus import Secrets
 from .env_setup import load_dotenv_file, repo_root, update_or_append_dotenv
 from .tfm_secrets_acquire import try_load_secrets_via_leaker
 from caseus.clients.client import AccountError, Client
-from caseus.packets import clientbound, serverbound
+from caseus.packets import clientbound
 from caseus.util.crypto import shakikoo
 
 logger = logging.getLogger(__name__)
@@ -543,7 +543,6 @@ class HeadlessProxyClient(Client):
         super().__init__(**kwargs)
         self._login_success_event = login_success_event
         self._exit_after_login_success = exit_after_login_success
-        self._sysinfo_after_verification_pending = False
 
     async def _close_bootstrap_connections(self) -> None:
         """End ``listen()`` so ``start()`` returns; needed for multi-slot headless stagger."""
@@ -564,44 +563,6 @@ class HeadlessProxyClient(Client):
     async def login(self) -> None:
         """Do not send ``LoginPacket`` — ``BanBotProxy`` injects it after ``SystemInformationPacket``."""
         return
-
-    async def _emit_system_information_and_steam(self) -> None:
-        await self.main.write_packet(
-            serverbound.SystemInformationPacket,
-            language=self.system_language,
-            os=self.OS,
-            flash_version=self.FLASH_VERSION,
-        )
-        if self.steam_id is not None:
-            await self.main.write_packet(
-                serverbound.SteamInfoPacket,
-                user_id=self.steam_id,
-            )
-
-    @pak.packet_listener(clientbound.HandshakeResponsePacket)
-    async def _on_handshake_response(self, server, packet):
-        self.auth_token = packet.auth_token
-        await self.set_desired_language(fallback=packet.language)
-        if self.secrets.client_verification_template is not None:
-            self._sysinfo_after_verification_pending = True
-            return
-        await self._emit_system_information_and_steam()
-
-    @pak.packet_listener(clientbound.ClientVerificationPacket)
-    async def _on_client_verification(self, server, packet):
-        if self.secrets.client_verification_template is not None:
-            await self.main.write_packet(
-                serverbound.ClientVerificationPacket,
-                ciphered_data=self.secrets.client_verification_data(
-                    packet.verification_token,
-                    ctx=self.main.ctx,
-                ),
-            )
-        if self._sysinfo_after_verification_pending:
-            self._sysinfo_after_verification_pending = False
-            await self._emit_system_information_and_steam()
-        if self.username is not None:
-            await self.login()
 
     @pak.packet_listener(clientbound.LoginSuccessPacket)
     async def _on_login_success(self, server, packet):
