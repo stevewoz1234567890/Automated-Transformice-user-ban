@@ -15,6 +15,11 @@ On startup the bot creates ``.env`` from ``.env.example`` when missing and appen
 Use ``python -m bot --no-headless`` to force external connectors only. Row ``bind_ip`` is for Proxifier
 unless ``BOT_PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is true and that IP exists on this machine.
 
+``--spawn-slot-consoles`` (or ``BOT_SPAWN_SLOT_CONSOLES=true``) starts one OS process per account, each
+with ``--slot-index N``, so every account auto-logs in its own console (Windows: new ``cmd`` window;
+desktop Linux: a terminal emulator when ``DISPLAY`` is set). ``--slot-index`` / ``BOT_SLOT_INDEX`` runs
+only that row from ``BOT_ACCOUNTS_JSON`` in the current process.
+
 Loader URL fields for ``LoginPacket`` are built from ``TFMProxyLoader.swf`` metadata (see ``flash_launch``).
 """
 
@@ -23,7 +28,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import random
+import shlex
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -36,7 +45,7 @@ from caseus import Secrets
 
 from .ban_proxy import BanBotProxy
 from . import flash_launch
-from .env_setup import load_bot_config, repo_root
+from .env_setup import env_truthy, load_bot_config, repo_root
 from .headless_client import (
     load_secrets_base,
     resolve_headless_upstream,
@@ -392,7 +401,134 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Do not start built-in caseus TCP clients (overrides BOT_HEADLESS_AUTO_LOGIN).",
     )
+    p.add_argument(
+        "--slot-index",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Use only the Nth account (0-based) from BOT_ACCOUNTS_JSON in this process.",
+    )
+    p.add_argument(
+        "--spawn-slot-consoles",
+        action="store_true",
+        help="Start one bot process per account (each with --slot-index); this launcher exits. "
+        "Also enabled when BOT_SPAWN_SLOT_CONSOLES is true.",
+    )
     return p.parse_args(argv)
+
+
+def _spawn_slot_consoles_requested(args: argparse.Namespace) -> bool:
+    """True when this process should spawn one child per account and exit.
+
+    ``--spawn-slot-consoles`` always wins. Otherwise env ``BOT_SPAWN_SLOT_CONSOLES`` does not apply
+    when ``--slot-index`` or ``BOT_SLOT_INDEX`` is set (avoids a fork loop after dotenv reload).
+    """
+    if bool(getattr(args, "spawn_slot_consoles", False)):
+        return True
+    if getattr(args, "slot_index", None) is not None:
+        return False
+    if os.environ.get("BOT_SLOT_INDEX", "").strip():
+        return False
+    return env_truthy("BOT_SPAWN_SLOT_CONSOLES")
+
+
+def _argv_strip_spawn_and_slot(argv: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--spawn-slot-consoles":
+            i += 1
+            continue
+        if a == "--slot-index":
+            i += 2
+            continue
+        if a.startswith("--slot-index="):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def _resolve_effective_slot_index(args: argparse.Namespace) -> int | None:
+    if getattr(args, "slot_index", None) is not None:
+        return int(args.slot_index)
+    raw = os.environ.get("BOT_SLOT_INDEX", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.error("BOT_SLOT_INDEX must be an integer, got %r.", raw)
+        raise SystemExit(2)
+
+
+def _bot_child_invocation_prefix() -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, "-m", "bot"]
+
+
+def _popen_slot_console(cmd: list[str], *, env: dict[str, str]) -> subprocess.Popen:
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+
+    if sys.platform == "win32" and creationflags:
+        return subprocess.Popen(cmd, env=env, close_fds=False, creationflags=creationflags)
+
+    display = (os.environ.get("DISPLAY") or "").strip()
+    if display:
+        inner = shlex.join(cmd)
+        for binary, args_prefix in (
+            ("x-terminal-emulator", ["-e", "bash", "-lc"]),
+            ("gnome-terminal", None),
+            ("konsole", ["-e", "bash", "-lc"]),
+            ("xfce4-terminal", ["-e", "bash", "-lc"]),
+            ("xterm", ["-e", "bash", "-lc"]),
+        ):
+            path = shutil.which(binary)
+            if not path:
+                continue
+            if binary == "gnome-terminal":
+                return subprocess.Popen([path, "--", *cmd], env=env, start_new_session=True)
+            return subprocess.Popen([path, *args_prefix, inner + "; exec bash"], env=env, start_new_session=True)
+
+    logger.warning(
+        "Spawning slot without a new terminal window (no DISPLAY or no known terminal). "
+        "Logs still go to log.txt.",
+    )
+    return subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def _spawn_one_bot_per_account_console(*, argv_tail: list[str], n_accounts: int) -> None:
+    base_argv = _argv_strip_spawn_and_slot(argv_tail)
+    prefix = _bot_child_invocation_prefix()
+    env = os.environ.copy()
+    env.pop("BOT_SPAWN_SLOT_CONSOLES", None)
+    env.pop("BOT_SLOT_INDEX", None)
+
+    stagger = float(os.environ.get("BOT_SPAWN_SLOT_CONSOLE_STAGGER_SEC", "0.2") or 0.2)
+    stagger = max(0.0, stagger)
+
+    for i in range(n_accounts):
+        cmd = [*prefix, *base_argv, "--slot-index", str(i)]
+        logger.info(
+            "Spawning slot %s/%s console: %s",
+            i + 1,
+            n_accounts,
+            " ".join(shlex.quote(c) for c in cmd),
+        )
+        _popen_slot_console(cmd, env=env)
+        if stagger and i < n_accounts - 1:
+            time.sleep(stagger)
+
+    logger.info(
+        "Launched %s separate bot process(es). This launcher exits; each slot runs /room+/ban in its own process.",
+        n_accounts,
+    )
+    raise SystemExit(0)
 
 
 def _cfg_shared_flash_policy_port(cfg) -> int | None:
@@ -418,6 +554,31 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     cfg = load_bot_config()
 
+    argv_tail = sys.argv[1:] if argv is None else argv
+
+    if _spawn_slot_consoles_requested(args):
+        if args.slot_index is not None:
+            logger.warning("Ignoring --slot-index because --spawn-slot-consoles / BOT_SPAWN_SLOT_CONSOLES is active.")
+        elif os.environ.get("BOT_SLOT_INDEX", "").strip():
+            logger.warning(
+                "Ignoring BOT_SLOT_INDEX in the environment because BOT_SPAWN_SLOT_CONSOLES is active.",
+            )
+        all_rows = list(cfg.ACCOUNTS)
+        if not all_rows:
+            logger.error("BOT_ACCOUNTS_JSON has no accounts to spawn.")
+            raise SystemExit(1)
+        for i, row in enumerate(all_rows):
+            label = str(row.get("label", i + 1))
+            u = str(row.get("username", "") or "").strip()
+            pw = str(row.get("password", "") or "")
+            if not u or not pw.strip():
+                logger.error(
+                    "BOT_ACCOUNTS_JSON slot %s: username and password must be non-empty before spawning consoles.",
+                    label,
+                )
+                raise SystemExit(1)
+        _spawn_one_bot_per_account_console(argv_tail=argv_tail, n_accounts=len(all_rows))
+
     this_exe = Path(sys.executable).resolve()
     allow_kill = not args.no_kill_stale
 
@@ -425,7 +586,23 @@ def main(argv: list[str] | None = None) -> None:
     if isinstance(proxy_bind, str):
         proxy_bind = proxy_bind.strip() or None
 
-    raw_accounts = cfg.ACCOUNTS
+    raw_accounts = list(cfg.ACCOUNTS)
+    slot_ix = _resolve_effective_slot_index(args)
+    if slot_ix is not None:
+        if slot_ix < 0 or slot_ix >= len(raw_accounts):
+            logger.error(
+                "Slot index %s is out of range for BOT_ACCOUNTS_JSON (valid: 0..%s).",
+                slot_ix,
+                len(raw_accounts) - 1,
+            )
+            raise SystemExit(2)
+        picked = raw_accounts[slot_ix]
+        logger.info(
+            "Single-slot process: account index %s (label %s).",
+            slot_ix,
+            str(picked.get("label", slot_ix + 1)),
+        )
+        raw_accounts = [picked]
     headless_auto = (
         (bool(getattr(cfg, "HEADLESS_AUTO_LOGIN", False)) or args.headless)
         and not args.no_headless
