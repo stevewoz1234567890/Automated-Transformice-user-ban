@@ -948,6 +948,72 @@ class BanBotProxy(Proxy):
             timeout=timeout,
         )
 
+    async def _gated_open_connection_timed(
+        self,
+        address,
+        port,
+    ):
+        """
+        Returns ``(reader, writer, gate_wait_sec, tcp_phase_sec, gate_spins)``.
+
+        Logs a single ``[login][diag]`` line on failure when ``PROXY_UPSTREAM_CONNECT_DIAG`` is on
+        so logs show **gate queue** vs **TCP/connect** vs **wait_for timeout** separately.
+        """
+        sem = self._upstream_connect_sem
+        t_gate0 = time.monotonic()
+        spins = 0
+        if sem is not None:
+            while True:
+                if sem.acquire(blocking=False):
+                    break
+                spins += 1
+                if spins % 34 == 0 and self._upstream_connect_diag:
+                    logger.debug(
+                        "Slot %s: [login][diag] upstream connect gate: still waiting spins=%s "
+                        "(~%.1fs; BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS=%s)",
+                        self.slot_label,
+                        spins,
+                        spins * 0.03,
+                        _upstream_connect_gate_cap,
+                    )
+                await asyncio.sleep(0.03)
+        gate_wait_sec = time.monotonic() - t_gate0
+        hold_sem = sem is not None
+        t_tcp0 = time.monotonic()
+        try:
+            reader, writer = await self._open_connection_maybe_timeout(address, port)
+            tcp_phase_sec = time.monotonic() - t_tcp0
+            return reader, writer, gate_wait_sec, tcp_phase_sec, spins
+        except BaseException as e:
+            tcp_phase_sec = time.monotonic() - t_tcp0
+            if self._upstream_connect_diag:
+                win_e = getattr(e, "winerror", None)
+                os_e = getattr(e, "errno", None)
+                if isinstance(e, asyncio.TimeoutError):
+                    kind = "wait_for (BOT_UPSTREAM_OPEN_CONNECTION_TIMEOUT_SEC)"
+                elif isinstance(e, OSError) and win_e == 121:
+                    kind = "os_tcp (WinError 121 — not the app connect gate)"
+                else:
+                    kind = type(e).__name__
+                logger.warning(
+                    "Slot %s: [login][diag] upstream connect FAILED %s:%s — kind=%s gate_wait=%.3fs "
+                    "tcp_phase=%.3fs spins=%s winerror=%s errno=%s err=%s",
+                    self.slot_label,
+                    address,
+                    port,
+                    kind,
+                    gate_wait_sec,
+                    tcp_phase_sec,
+                    spins,
+                    win_e,
+                    os_e,
+                    e,
+                )
+            raise
+        finally:
+            if hold_sem and sem is not None:
+                sem.release()
+
     async def _gated_open_connection(self, address, port):
         """
         Limit concurrent upstream TCP connects process-wide.
@@ -956,17 +1022,8 @@ class BanBotProxy(Proxy):
         ``asyncio``'s default ThreadPoolExecutor (``asyncio.to_thread(sem.acquire)`` would — one
         blocked waiter per slot could exhaust the pool and stall every slot).
         """
-        sem = self._upstream_connect_sem
-        if sem is None:
-            return await self._open_connection_maybe_timeout(address, port)
-        while True:
-            if sem.acquire(blocking=False):
-                break
-            await asyncio.sleep(0.03)
-        try:
-            return await self._open_connection_maybe_timeout(address, port)
-        finally:
-            sem.release()
+        r, w, _, _, _ = await self._gated_open_connection_timed(address, port)
+        return r, w
 
     async def open_streams(self, address, ports):
         """
@@ -986,7 +1043,17 @@ class BanBotProxy(Proxy):
             for port in order:
                 try:
                     return await self._gated_open_connection(address, port)
-                except Exception:
+                except Exception as e:
+                    last_exc = e
+                    logger.warning(
+                        "Slot %s: [login] upstream TCP attempt failed %s:%s — %s: %s "
+                        "(enable BOT_PROXY_UPSTREAM_CONNECT_DIAG=true for gate/tcp timing)",
+                        self.slot_label,
+                        address,
+                        port,
+                        type(e).__name__,
+                        e,
+                    )
                     continue
             raise ValueError(f"Unable to connect to address '{address}' on ports {ports}")
 
@@ -1003,9 +1070,13 @@ class BanBotProxy(Proxy):
         logged_win121_hint = False
         for port in order:
             try:
-                t0 = time.monotonic()
-                server_reader, server_writer = await self._gated_open_connection(address, port)
-                dt = time.monotonic() - t0
+                (
+                    server_reader,
+                    server_writer,
+                    gate_wait_sec,
+                    tcp_phase_sec,
+                    gate_spins,
+                ) = await self._gated_open_connection_timed(address, port)
                 peer = None
                 try:
                     if server_writer.transport is not None:
@@ -1014,46 +1085,38 @@ class BanBotProxy(Proxy):
                     pass
                 self._upstream_tcp_established = True
                 self._upstream_endpoint = (str(address), int(port))
+                total_sec = gate_wait_sec + tcp_phase_sec
                 logger.info(
-                    "Slot %s: [login] upstream TCP connected %s:%s in %.3fs remote_peer=%r",
+                    "Slot %s: [login] upstream TCP connected %s:%s total=%.3fs "
+                    "(gate_wait=%.3fs tcp_open=%.3fs spins=%s) remote_peer=%r",
                     self.slot_label,
                     address,
                     port,
-                    dt,
+                    total_sec,
+                    gate_wait_sec,
+                    tcp_phase_sec,
+                    gate_spins,
                     peer,
                 )
                 return server_reader, server_writer
             except Exception as e:
                 last_exc = e
-                extra = ""
-                if isinstance(e, OSError):
-                    for name in ("errno", "winerror"):
-                        v = getattr(e, name, None)
-                        if v is not None:
-                            extra += f" {name}={v}"
-                    if getattr(e, "winerror", None) == 121 and not logged_win121_hint:
+                if isinstance(e, OSError) and getattr(e, "winerror", None) == 121:
+                    if not logged_win121_hint:
                         logged_win121_hint = True
                         ev = self._upstream_win121_event
                         if ev is not None:
                             ev.set()
                         logger.warning(
-                            "Slot %s: [login] winerror=121: Windows TCP connect timed out "
-                            "(firewall/VPN/path). The OS message says 'semaphore'; that is **not** "
-                            "BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS. Not fixed by tfm-secrets. "
-                            "Run `python -m bot.upstream_probe %s %s`.",
+                            "Slot %s: [login] winerror=121 probe hint: Windows TCP connect timed out "
+                            "(firewall/VPN/path). OS text may say 'semaphore'; not "
+                            "BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS. Run "
+                            "`python -m bot.upstream_probe %s %s`.",
                             self.slot_label,
                             address,
                             " ".join(str(p) for p in ports_seq),
                         )
-                logger.warning(
-                    "Slot %s: [login] upstream TCP attempt failed %s:%s — %s: %s%s",
-                    self.slot_label,
-                    address,
-                    port,
-                    type(e).__name__,
-                    e,
-                    extra,
-                )
+                # Failure detail: already logged in _gated_open_connection_timed when diag is on.
         logger.error(
             "Slot %s: [login] upstream TCP all ports failed — last_error=%s: %s",
             self.slot_label,
