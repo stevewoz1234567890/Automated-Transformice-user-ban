@@ -198,6 +198,8 @@ _ENV_DEFAULTS: dict[str, str] = {
     "BOT_UI_AUTO_LAUNCH_FLASH": "false",
     "BOT_UI_FLASH_PLAYER_PATH": "",
     "BOT_UI_FLASH_LAUNCH_STAGGER_SEC": "1.0",
+    "BOT_UI_SEQUENTIAL_LOGIN": "false",
+    "BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC": "120",
 }
 
 
@@ -512,6 +514,8 @@ def load_bot_config() -> SimpleNamespace:
         UI_AUTO_LAUNCH_FLASH=_truthy("BOT_UI_AUTO_LAUNCH_FLASH", False),
         UI_FLASH_PLAYER_PATH=str(os.environ.get("BOT_UI_FLASH_PLAYER_PATH", "") or ""),
         UI_FLASH_LAUNCH_STAGGER_SEC=_float("BOT_UI_FLASH_LAUNCH_STAGGER_SEC", 1.0),
+        UI_SEQUENTIAL_LOGIN=_truthy("BOT_UI_SEQUENTIAL_LOGIN", False),
+        UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC=_float("BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC", 120.0),
     )
 
 

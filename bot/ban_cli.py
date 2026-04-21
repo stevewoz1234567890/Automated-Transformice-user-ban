@@ -368,6 +368,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Do not launch Flash player windows even if BOT_UI_AUTO_LAUNCH_FLASH=true in .env.",
     )
+    p.add_argument(
+        "--ui-sequential",
+        action="store_true",
+        help=(
+            "Open Flash windows one at a time: launch slot 1, wait for it to log in, "
+            "then launch slot 2, and so on. Slower but avoids opening all windows at once. "
+            "Also enabled by BOT_UI_SEQUENTIAL_LOGIN=true. "
+            "Timeout per slot: BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC (default 120 s)."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -380,7 +390,7 @@ def _ui_mode_requested(args: argparse.Namespace) -> bool:
     return env_truthy("BOT_UI_AUTO_LAUNCH_FLASH")
 
 
-def _launch_ui_flash_players(states: "list[SlotState]", cfg: object) -> None:
+def _launch_ui_flash_players(states: "list[SlotState]", cfg: object, args: argparse.Namespace) -> None:
     """
     Resolve the Flash standalone projector and launch one window per slot.
 
@@ -423,17 +433,54 @@ def _launch_ui_flash_players(states: "list[SlotState]", cfg: object) -> None:
     stagger = float(getattr(cfg, "UI_FLASH_LAUNCH_STAGGER_SEC", 1.0) or 1.0)
     stagger = max(0.0, stagger)
 
-    slot_infos = [(s.label, s.packet_loader_url) for s in states]
-    launched = flash_launch.launch_flash_players_for_slots(
-        slot_infos,
-        flash_exe,
-        stagger_sec=stagger,
+    sequential = bool(getattr(cfg, "UI_SEQUENTIAL_LOGIN", False)) or bool(
+        getattr(args, "ui_sequential", False)
     )
-    n_total = sum(1 for _, url in slot_infos if url)
+    per_slot_timeout = float(getattr(cfg, "UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC", 120.0) or 120.0)
+
+    n_total = sum(1 for s in states if s.packet_loader_url)
+    launched = 0
+
+    for i, s in enumerate(states):
+        if not s.packet_loader_url:
+            logger.warning(
+                "UI-mode: slot %s has no loader URL (TFMProxyLoader.swf missing). Skipping.",
+                s.label,
+            )
+            continue
+
+        proc = flash_launch.launch_flash_player_for_slot(s.packet_loader_url, flash_exe, label=s.label)
+        if proc is None:
+            continue
+        launched += 1
+
+        if sequential and i < len(states) - 1:
+            logger.info(
+                "UI sequential: waiting for slot %s to log in before opening next window "
+                "(timeout %.0fs) ...",
+                s.label,
+                per_slot_timeout,
+            )
+            logged_in = s.login_success_event.wait(timeout=per_slot_timeout)
+            if logged_in:
+                logger.info(
+                    "UI sequential: slot %s logged in — opening next window.",
+                    s.label,
+                )
+            else:
+                logger.warning(
+                    "UI sequential: slot %s did not log in within %.0fs — "
+                    "opening next window anyway. Increase BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC if needed.",
+                    s.label,
+                    per_slot_timeout,
+                )
+        elif stagger > 0 and i < len(states) - 1:
+            time.sleep(stagger)
+
     logger.info(
         "UI mode: launched %s/%s Flash window(s). "
         "Each window should connect to its proxy and log in automatically.",
-        len(launched),
+        launched,
         n_total,
     )
 
@@ -649,7 +696,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if ui_mode:
-        _launch_ui_flash_players(states, cfg)
+        _launch_ui_flash_players(states, cfg, args)
 
     if headless_auto:
         if not start_headless_client_threads(
