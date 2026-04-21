@@ -351,7 +351,71 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Do not start built-in caseus TCP clients (overrides BOT_HEADLESS_AUTO_LOGIN).",
     )
+    p.add_argument(
+        "--ui",
+        action="store_true",
+        help=(
+            "UI mode: launch one Flash standalone player window per slot so the full game UI is "
+            "visible. Each window opens TFMProxyLoader.swf and connects to its local proxy port; "
+            "the proxy injects the login packet automatically. Requires TFMProxyLoader.swf in the "
+            "repo root (or TFM_PROXY_SWF) and a Flash standalone projector "
+            "(flashplayer_32_sa.exe / flashplayer_32_sa_debug.exe beside the exe, or set "
+            "BOT_UI_FLASH_PLAYER_PATH / FLASHPLAYER). Also enabled by BOT_UI_AUTO_LAUNCH_FLASH=true."
+        ),
+    )
+    p.add_argument(
+        "--no-ui",
+        action="store_true",
+        help="Do not launch Flash player windows even if BOT_UI_AUTO_LAUNCH_FLASH=true in .env.",
+    )
     return p.parse_args(argv)
+
+
+def _ui_mode_requested(args: argparse.Namespace) -> bool:
+    """True when Flash UI windows should be launched for each slot."""
+    if getattr(args, "no_ui", False):
+        return False
+    if getattr(args, "ui", False):
+        return True
+    return env_truthy("BOT_UI_AUTO_LAUNCH_FLASH")
+
+
+def _launch_ui_flash_players(states: "list[SlotState]", cfg: object) -> None:
+    """
+    Resolve the Flash standalone projector and launch one window per slot.
+
+    Missing loader URLs are warned individually (slot skipped).  If no projector
+    is found the function logs an actionable error and returns without launching.
+    """
+    root = repo_root()
+    flash_exe = flash_launch.resolve_flash_player(root)
+    if flash_exe is None:
+        logger.error(
+            "UI mode: no Flash standalone projector found. Place flashplayer_32_sa.exe or "
+            "flashplayer_32_sa_debug.exe next to the bot (or beside ban_bot.exe), or set "
+            "BOT_UI_FLASH_PLAYER_PATH / FLASHPLAYER to the full path of the executable. "
+            "Skipping Flash window launch — connect manually instead."
+        )
+        return
+
+    logger.info("UI mode: Flash projector → %s", flash_exe)
+
+    stagger = float(getattr(cfg, "UI_FLASH_LAUNCH_STAGGER_SEC", 1.0) or 1.0)
+    stagger = max(0.0, stagger)
+
+    slot_infos = [(s.label, s.packet_loader_url) for s in states]
+    launched = flash_launch.launch_flash_players_for_slots(
+        slot_infos,
+        flash_exe,
+        stagger_sec=stagger,
+    )
+    n_total = sum(1 for _, url in slot_infos if url)
+    logger.info(
+        "UI mode: launched %s/%s Flash window(s). "
+        "Each window should connect to its proxy and log in automatically.",
+        len(launched),
+        n_total,
+    )
 
 
 def _cfg_shared_flash_policy_port(cfg) -> int | None:
@@ -389,6 +453,13 @@ def main(argv: list[str] | None = None) -> None:
         (bool(getattr(cfg, "HEADLESS_AUTO_LOGIN", False)) or args.headless)
         and not args.no_headless
     )
+    if _ui_mode_requested(args) and headless_auto:
+        logger.warning(
+            "Both --ui (Flash windows) and --headless (TCP clients) are active. "
+            "The proxy will inject login packets from the headless client; the Flash window "
+            "will connect and display the game UI as well. This is supported but unusual — "
+            "use --no-headless if you only want Flash to handle the connection."
+        )
     for i, row in enumerate(raw_accounts):
         label = str(row.get("label", i + 1))
         u = str(row.get("username", "") or "").strip()
@@ -543,6 +614,8 @@ def main(argv: list[str] | None = None) -> None:
                     )
                     raise SystemExit(1)
 
+    ui_mode = _ui_mode_requested(args)
+
     start_all_slots(
         states,
         this_exe=this_exe,
@@ -554,6 +627,9 @@ def main(argv: list[str] | None = None) -> None:
         packet_login_packet_key_sources_fallback=packet_key_sources_fallback,
         bootstrap_secrets=base_secrets if headless_auto else None,
     )
+
+    if ui_mode:
+        _launch_ui_flash_players(states, cfg)
 
     if headless_auto:
         if not start_headless_client_threads(

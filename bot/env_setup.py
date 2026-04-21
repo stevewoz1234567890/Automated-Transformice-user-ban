@@ -194,6 +194,10 @@ _ENV_DEFAULTS: dict[str, str] = {
     "BOT_CASEUS_GIT_PIP_SPEC": "caseus @ git+https://github.com/friedkeenan/caseus.git",
     "BOT_PIP_INSTALL_TFM_SECRETS_CLI": "false",
     "BOT_TFM_SECRETS_PIP_INSTALL_SPEC": "",
+    # UI mode: launch Flash standalone player windows
+    "BOT_UI_AUTO_LAUNCH_FLASH": "false",
+    "BOT_UI_FLASH_PLAYER_PATH": "",
+    "BOT_UI_FLASH_LAUNCH_STAGGER_SEC": "1.0",
 }
 
 
@@ -504,6 +508,10 @@ def load_bot_config() -> SimpleNamespace:
         ),
         PIP_INSTALL_TFM_SECRETS_CLI=_truthy("BOT_PIP_INSTALL_TFM_SECRETS_CLI", False),
         TFM_SECRETS_PIP_INSTALL_SPEC=str(os.environ.get("BOT_TFM_SECRETS_PIP_INSTALL_SPEC", "") or ""),
+        # UI mode: launch Flash standalone player windows
+        UI_AUTO_LAUNCH_FLASH=_truthy("BOT_UI_AUTO_LAUNCH_FLASH", False),
+        UI_FLASH_PLAYER_PATH=str(os.environ.get("BOT_UI_FLASH_PLAYER_PATH", "") or ""),
+        UI_FLASH_LAUNCH_STAGGER_SEC=_float("BOT_UI_FLASH_LAUNCH_STAGGER_SEC", 1.0),
     )
 
 
