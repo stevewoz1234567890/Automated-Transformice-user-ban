@@ -444,10 +444,51 @@ def _launch_ui_flash_players(states: "list[SlotState]", cfg: object, args: argpa
     for i, s in enumerate(states):
         if not s.packet_loader_url:
             logger.warning(
-                "UI-mode: slot %s has no loader URL (TFMProxyLoader.swf missing). Skipping.",
+                "UI-mode: slot %s has no loader URL (TFMProxyLoader.swf missing or "
+                "TFM_PROXY_SWF not set). Skipping Flash launch for this slot.",
                 s.label,
             )
             continue
+
+        # Verify the SWF file exists and is readable before handing it to Flash Player.
+        swf_local = flash_launch.swf_local_path_from_url(s.packet_loader_url)
+        if swf_local is not None:
+            if not swf_local.is_file():
+                logger.warning(
+                    "UI-mode: slot %s SWF not found on disk (%s). "
+                    "Attempting to regenerate from TFMProxyLoader.swf ...",
+                    s.label,
+                    swf_local,
+                )
+                # Rebuild the loader URL (forces patch regeneration).
+                from .ban_proxy import BanBotProxy  # noqa: F401 — ensure module loaded
+                row_dict = {
+                    "proxy_port": s.port,
+                    "_flash_satellite_port": s.satellite_port,
+                    "_flash_policy_port": s.policy_port,
+                    "_flash_connect_host": s.proxy_bind_host if s.proxy_bind_host else "127.0.0.1",
+                }
+                new_url = flash_launch.loader_document_url_for_row(row_dict, root) or ""
+                if new_url:
+                    s.packet_loader_url = new_url
+                    logger.info("UI-mode: slot %s SWF regenerated → %s", s.label, new_url)
+                else:
+                    logger.error(
+                        "UI-mode: slot %s could not regenerate SWF. "
+                        "Check that TFMProxyLoader.swf exists in the repo root.",
+                        s.label,
+                    )
+                    continue
+            try:
+                sz = swf_local.stat().st_size
+                logger.debug("UI-mode: slot %s SWF OK (%s bytes) → %s", s.label, sz, swf_local)
+            except OSError as _e:
+                logger.warning(
+                    "UI-mode: slot %s cannot stat SWF (%s): %s — Flash may fail to open it.",
+                    s.label,
+                    swf_local,
+                    _e,
+                )
 
         proc = flash_launch.launch_flash_player_for_slot(s.packet_loader_url, flash_exe, label=s.label)
         if proc is None:

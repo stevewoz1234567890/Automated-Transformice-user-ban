@@ -220,6 +220,28 @@ _FLASH_SA_CANDIDATES = [
 ]
 
 
+def swf_local_path_from_url(loader_url: str) -> Path | None:
+    """
+    Extract the local filesystem path from a ``file:///…`` URL (strips query string).
+
+    Returns ``None`` for non-file URLs or empty strings.
+    """
+    if not loader_url or not loader_url.startswith("file://"):
+        return None
+    path_part = loader_url.split("?")[0]
+    # file:///C:/... (Windows) or file:///home/... (Unix)
+    if path_part.startswith("file:///"):
+        local = path_part[len("file:///"):]
+    else:
+        local = path_part[len("file://"):]
+    if sys.platform != "win32" and not local.startswith("/"):
+        local = "/" + local
+    try:
+        return Path(local)
+    except Exception:
+        return None
+
+
 def resolve_flash_player(root: Path | None = None) -> Path | None:
     """
     Locate a Flash standalone projector for UI mode.
@@ -272,6 +294,22 @@ def launch_flash_player_for_slot(
     ``None`` when the launch fails.
     """
     slot_tag = f" (slot {label})" if label else ""
+    # Verify the SWF file exists before handing it to Flash Player so the error is clear.
+    swf_path = swf_local_path_from_url(loader_url)
+    if swf_path is not None:
+        if swf_path.is_file():
+            logger.info(
+                "UI-mode: SWF%s exists (%s bytes) — opening with Flash Player.",
+                slot_tag,
+                swf_path.stat().st_size,
+            )
+        else:
+            logger.error(
+                "UI-mode: SWF%s NOT FOUND at %s — Flash Player will show 'Cannot open file'. "
+                "Delete tmp/loader_patch/ and restart the bot to force regeneration.",
+                slot_tag,
+                swf_path,
+            )
     logger.info("UI-mode: launching Flash Player%s  →  %s", slot_tag, loader_url)
     try:
         proc = subprocess.Popen(
