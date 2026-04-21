@@ -105,6 +105,98 @@ def loader_document_url_for_row(row: AccountRow, root: Path | None = None) -> st
 
 
 # ---------------------------------------------------------------------------
+# Flash security trust
+# ---------------------------------------------------------------------------
+
+def _flash_trust_dir() -> Path | None:
+    """
+    Return the Flash Player global security trust folder for the current OS / user.
+
+    Flash reads ``*.cfg`` files from this folder; each file lists one trusted path per line.
+    Paths listed there are treated as "local-trusted" so the SWF can open sockets.
+    Returns ``None`` when the parent Macromedia folder cannot be determined.
+    """
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        if not appdata:
+            return None
+        return Path(appdata) / "Macromedia" / "Flash Player" / "#Security" / "FlashPlayerTrust"
+    # macOS
+    home = Path.home()
+    mac_path = home / "Library" / "Preferences" / "Macromedia" / "Flash Player" / "#Security" / "FlashPlayerTrust"
+    if sys.platform == "darwin" or mac_path.parent.parent.exists():
+        return mac_path
+    # Linux
+    return home / ".macromedia" / "Flash_Player" / "#Security" / "FlashPlayerTrust"
+
+
+def ensure_flash_trust(swf_dirs: "list[Path]") -> None:
+    """
+    Write (or update) a ``tfm_ban_bot.cfg`` trust file so Flash Player allows the
+    given SWF directories to make socket connections without a security dialog.
+
+    Safe to call even if Flash is not installed — errors are logged as warnings.
+    """
+    trust_dir = _flash_trust_dir()
+    if trust_dir is None:
+        logger.debug("ensure_flash_trust: cannot determine Flash trust folder; skipping.")
+        return
+
+    cfg_path = trust_dir / "tfm_ban_bot.cfg"
+
+    # Collect unique resolved directory strings
+    dirs_to_trust: list[str] = []
+    seen: set[str] = set()
+    for d in swf_dirs:
+        try:
+            resolved = str(d.resolve())
+        except OSError:
+            resolved = str(d)
+        if resolved not in seen:
+            dirs_to_trust.append(resolved)
+            seen.add(resolved)
+
+    if not dirs_to_trust:
+        return
+
+    # Read existing trusted paths so we only write when something is new
+    existing: set[str] = set()
+    if cfg_path.is_file():
+        try:
+            existing = {
+                line.strip()
+                for line in cfg_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            }
+        except OSError:
+            pass
+
+    new_dirs = [d for d in dirs_to_trust if d not in existing]
+    if not new_dirs:
+        logger.debug("ensure_flash_trust: all SWF dirs already trusted in %s", cfg_path)
+        return
+
+    try:
+        trust_dir.mkdir(parents=True, exist_ok=True)
+        content = "\n".join(sorted(existing | set(dirs_to_trust))) + "\n"
+        cfg_path.write_text(content, encoding="utf-8")
+        logger.info(
+            "Flash trust: wrote %s trusted path(s) to %s — "
+            "SWFs in those folders can now open sockets without a security dialog.",
+            len(dirs_to_trust),
+            cfg_path,
+        )
+    except OSError as exc:
+        logger.warning(
+            "Flash trust: could not write %s: %s — "
+            "if Flash shows a blank screen, add the SWF folder manually via "
+            "Flash Player Settings → Global Security Settings.",
+            cfg_path,
+            exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # UI mode: resolve and launch Flash standalone player
 # ---------------------------------------------------------------------------
 

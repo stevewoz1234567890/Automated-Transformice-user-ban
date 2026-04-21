@@ -400,6 +400,26 @@ def _launch_ui_flash_players(states: "list[SlotState]", cfg: object) -> None:
 
     logger.info("UI mode: Flash projector → %s", flash_exe)
 
+    # Trust all SWF directories so Flash does not show a blank screen / security dialog.
+    swf_dirs = list({
+        Path(s.packet_loader_url.split("?")[0].replace("file:///", "/").replace("file://", "/")).parent
+        for s in states
+        if s.packet_loader_url
+    })
+    # On Windows the URI looks like file:///C:/... so strip the leading slash back to a drive letter.
+    if sys.platform == "win32":
+        swf_dirs = []
+        for s in states:
+            if not s.packet_loader_url:
+                continue
+            uri = s.packet_loader_url.split("?")[0]
+            # file:///C:/path/to/file.swf → C:/path/to/file.swf → parent dir
+            local = uri[len("file:///"):] if uri.startswith("file:///") else uri[len("file://"):]
+            swf_dirs.append(Path(local).parent)
+        swf_dirs = list({str(d): d for d in swf_dirs}.values())
+
+    flash_launch.ensure_flash_trust(swf_dirs)
+
     stagger = float(getattr(cfg, "UI_FLASH_LAUNCH_STAGGER_SEC", 1.0) or 1.0)
     stagger = max(0.0, stagger)
 
