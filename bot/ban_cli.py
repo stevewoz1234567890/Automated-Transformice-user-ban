@@ -35,7 +35,7 @@ from caseus import Secrets
 
 from .ban_proxy import BanBotProxy
 from . import flash_launch
-from .env_setup import load_bot_config, repo_root
+from .env_setup import env_truthy, load_bot_config, repo_root
 from .headless_client import (
     load_secrets_base,
     resolve_headless_upstream,
@@ -535,6 +535,61 @@ def _cfg_shared_flash_policy_port(cfg) -> int | None:
     return p if p > 0 else None
 
 
+_FLASH_POLICY_XML = (
+    b'<cross-domain-policy>'
+    b'<allow-access-from domain="*" to-ports="*" secure="false" />'
+    b'</cross-domain-policy>\x00'
+)
+
+
+def _start_shared_flash_policy_server(port: int | None, cfg: object) -> None:
+    """Start a shared Flash socket-policy server in a background thread.
+
+    Flash Player requests a cross-domain policy when ``Security.loadPolicyFile``
+    is called on ``xmlsocket://127.0.0.1:<port>``.  Without a server responding
+    with the allow-all policy XML, Flash blocks all socket connections — even
+    for SWFs in a trusted directory.  This server listens on *port* and
+    immediately writes the policy XML to every connecting client then closes.
+    """
+    if port is None:
+        return
+
+    bind_host = getattr(cfg, "PROXY_BIND_HOST", None) or "0.0.0.0"
+
+    async def _policy_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            writer.write(_FLASH_POLICY_XML)
+            await writer.drain()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _serve() -> None:
+        srv = await asyncio.start_server(_policy_handler, bind_host, port)
+        logger.info("Shared Flash policy server listening on %s:%s", bind_host, port)
+        async with srv:
+            await srv.serve_forever()
+
+    def _thread_main() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_serve())
+        except Exception:  # noqa: BLE001
+            logger.exception("Shared Flash policy server crashed on port %s", port)
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=_thread_main, name=f"flash-policy-{port}", daemon=True)
+    t.start()
+    logger.info("Shared Flash policy server thread started (port %s).", port)
+
+
 def main(argv: list[str] | None = None) -> None:
     colorama_init()
     if sys.platform == "win32":
@@ -666,6 +721,8 @@ def main(argv: list[str] | None = None) -> None:
     upstream_ports: tuple[int, ...] | None = None
     base_secrets = None
 
+    ui_mode = _ui_mode_requested(args)
+
     if headless_auto:
         base_secrets = load_secrets_base(cfg)
         sync_upstream_cfg_from_secrets(cfg, base_secrets)
@@ -699,15 +756,48 @@ def main(argv: list[str] | None = None) -> None:
                     "BOT_HEADLESS_LOGIN_STAGGER_SEC or set BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES.",
                     ds,
                 )
+    elif ui_mode:
+        # UI-only mode (no headless TCP client): the proxy still needs the upstream address and
+        # TFM crypto secrets so it can connect to the game server when Flash connects.
+        # Without these, caseus crashes immediately when Flash sends its HandshakePacket
+        # (client.destination is None → AttributeError in _fix_handshake_packet).
+        logger.info(
+            "UI mode (no headless): loading TFM secrets to configure proxy upstream "
+            "so Flash windows can connect and log in through the proxy."
+        )
+        try:
+            base_secrets = load_secrets_base(cfg)
+            sync_upstream_cfg_from_secrets(cfg, base_secrets)
+            upstream_addr, upstream_ports = resolve_headless_upstream(cfg, base_secrets)
+            if upstream_addr and upstream_ports:
+                logger.info(
+                    "UI mode: proxy upstream configured → %s ports %s",
+                    upstream_addr,
+                    upstream_ports,
+                )
+            else:
+                logger.warning(
+                    "UI mode: could not resolve upstream from secrets — "
+                    "set BOT_UPSTREAM_SERVER_ADDRESS / BOT_UPSTREAM_SERVER_PORTS or enable --headless."
+                )
+                base_secrets = None
+        except SystemExit:
+            logger.warning(
+                "UI mode: failed to load TFM secrets for proxy upstream. "
+                "Flash windows will not be able to connect to the game server. "
+                "Place flashplayer_32_sa_debug.exe in the repo root (for the leaker), "
+                "or set BOT_UPSTREAM_SERVER_ADDRESS and BOT_UPSTREAM_SERVER_PORTS in .env."
+            )
+            base_secrets = None
 
     auth_key_fallback: int | None = None
     packet_key_sources_fallback: list | tuple | None = None
-    if headless_auto and base_secrets is not None:
+    if base_secrets is not None:
         auth_key_fallback = getattr(base_secrets, "auth_key", None)
         packet_key_sources_fallback = getattr(base_secrets, "packet_key_sources", None)
 
-    if headless_auto and upstream_addr and upstream_ports:
-        if bool(getattr(cfg, "UPSTREAM_TCP_PROBE_BEFORE_HEADLESS", True)):
+    if upstream_addr and upstream_ports:
+        if headless_auto and bool(getattr(cfg, "UPSTREAM_TCP_PROBE_BEFORE_HEADLESS", True)):
             probe_results = run_upstream_tcp_probe(upstream_addr, upstream_ports, cfg)
             if bool(getattr(cfg, "UPSTREAM_ABORT_ON_PROBE_ALL_FAILED", True)):
                 n_ok = sum(1 for _p, st, _ in probe_results if st == "ok")
@@ -722,8 +812,6 @@ def main(argv: list[str] | None = None) -> None:
                     )
                     raise SystemExit(1)
 
-    ui_mode = _ui_mode_requested(args)
-
     start_all_slots(
         states,
         this_exe=this_exe,
@@ -733,10 +821,11 @@ def main(argv: list[str] | None = None) -> None:
         main_server_ports=upstream_ports,
         packet_login_auth_key_fallback=auth_key_fallback,
         packet_login_packet_key_sources_fallback=packet_key_sources_fallback,
-        bootstrap_secrets=base_secrets if headless_auto else None,
+        bootstrap_secrets=base_secrets,
     )
 
     if ui_mode:
+        _start_shared_flash_policy_server(shared_flash_policy_port, cfg)
         _launch_ui_flash_players(states, cfg, args)
 
     if headless_auto:

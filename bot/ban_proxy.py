@@ -374,7 +374,14 @@ class BanBotProxy(Proxy):
         if isinstance(packet, clientbound.LoginSuccessPacket):
             return
         self._login_diag_upstream_cb_seq += 1
-        pid = getattr(packet, "id", None)
+        pid_raw = getattr(packet, "id", None)
+        if callable(pid_raw):
+            try:
+                pid = pid_raw()
+            except Exception:
+                pid = pid_raw
+        else:
+            pid = pid_raw
         body = ""
         if isinstance(packet, pak.GenericPacket):
             body = f" generic_code={getattr(packet, 'code', None)!r}"
