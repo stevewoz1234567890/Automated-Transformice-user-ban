@@ -82,7 +82,7 @@ def _account_error_hint(code: int | None) -> str:
 
 
 def _tcp_teardown_after_login_ok(ev: threading.Event | None, exc: BaseException) -> bool:
-    """True when the session died with a normal \"connection lost\" after ``LoginSuccess`` (e.g. headless closes TCP)."""
+    """True when the session died with a normal "connection lost" after ``LoginSuccess``."""
     if ev is None or not ev.is_set():
         return False
     if isinstance(exc, asyncio.CancelledError):
@@ -160,7 +160,6 @@ class BanBotProxy(Proxy):
         *,
         slot_label: str = "",
         login_success_event: threading.Event | None = None,
-        upstream_win121_event: threading.Event | None = None,
         verbose_login_flow: bool = False,
         log_all_main_packets: bool = False,
         packet_login_username: str = "",
@@ -183,7 +182,6 @@ class BanBotProxy(Proxy):
         super().__init__(**kwargs)
         self.slot_label = slot_label
         self._login_success_event = login_success_event
-        self._upstream_win121_event = upstream_win121_event
         self._loop: asyncio.AbstractEventLoop | None = None
         self._own_username: str | None = None
         self._verbose_login_flow = verbose_login_flow
@@ -210,6 +208,7 @@ class BanBotProxy(Proxy):
         self._login_diag_upstream_cb_seq = 0
         self._upstream_raw_chunk_logged = False
         self._upstream_connect_shuffle_ports = upstream_connect_shuffle_ports
+        self._open_streams_tag: str = "login"
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(
             self._log_client_verification_challenge,
@@ -303,7 +302,7 @@ class BanBotProxy(Proxy):
             except BaseException as e:
                 if _tcp_teardown_after_login_ok(self._login_success_event, e):
                     logger.info(
-                        "Slot %s: [login] %s closed after LoginSuccess (%s: %s) — expected when headless drops TCP",
+                        "Slot %s: [login] %s closed after LoginSuccess (%s: %s) — connection closed normally",
                         self.slot_label,
                         label,
                         type(e).__name__,
@@ -332,7 +331,7 @@ class BanBotProxy(Proxy):
         if label == "local(client→proxy)":
             if waiting and not success:
                 logger.debug(
-                    "Slot %s: [login][diag] local client disconnected (upstream failure or headless exit)",
+                    "Slot %s: [login][diag] local client disconnected (upstream failure or client exit)",
                     self.slot_label,
                 )
             return
@@ -513,7 +512,7 @@ class BanBotProxy(Proxy):
             if not self._sysinfo_received:
                 logger.warning(
                     "Slot %s: [login] HandshakeResponse OK but no SystemInformationPacket from client "
-                    "after 25s — headless client or loader may be stuck",
+                    "after 25s — Flash Player or loader may be stuck",
                     self.slot_label,
                 )
             elif not self._packet_login_sent:
@@ -529,8 +528,7 @@ class BanBotProxy(Proxy):
         if getattr(source, "is_satellite", False):
             return
         logger.warning(
-            "Slot %s: [login] server sent ClientVerificationPacket (anti-bot) — "
-            "if login fails, the headless path may not satisfy this challenge; try a full client",
+            "Slot %s: [login] server sent ClientVerificationPacket (anti-bot challenge).",
             self.slot_label,
         )
 
@@ -860,10 +858,13 @@ class BanBotProxy(Proxy):
             order = random.sample(ports_seq, len(ports_seq))
         else:
             order = list(ports_seq)
-        self._upstream_open_streams_entered = True
+        tag = self._open_streams_tag
+        if tag == "login":
+            self._upstream_open_streams_entered = True
         logger.info(
-            "Slot %s: [login] upstream TCP: host=%r shuffle_ports=%s port_try_order=%s (pool=%s)",
+            "Slot %s: [%s] upstream TCP: host=%r shuffle_ports=%s port_try_order=%s (pool=%s)",
             self.slot_label,
+            tag,
             address,
             self._upstream_connect_shuffle_ports,
             order,
@@ -882,11 +883,13 @@ class BanBotProxy(Proxy):
                         peer = server_writer.transport.get_extra_info("peername")
                 except Exception:
                     pass
-                self._upstream_tcp_established = True
-                self._upstream_endpoint = (str(address), int(port))
+                if tag == "login":
+                    self._upstream_tcp_established = True
+                    self._upstream_endpoint = (str(address), int(port))
                 logger.info(
-                    "Slot %s: [login] upstream TCP connected %s:%s in %.3fs remote_peer=%r",
+                    "Slot %s: [%s] upstream TCP connected %s:%s in %.3fs remote_peer=%r",
                     self.slot_label,
+                    tag,
                     address,
                     port,
                     dt,
@@ -903,19 +906,17 @@ class BanBotProxy(Proxy):
                             extra += f" {name}={v}"
                     if getattr(e, "winerror", None) == 121 and not logged_win121_hint:
                         logged_win121_hint = True
-                        ev = self._upstream_win121_event
-                        if ev is not None:
-                            ev.set()
                         logger.warning(
                             "Slot %s: [login] winerror=121: TCP connect timed out (firewall/VPN/path). "
-                            "Not fixed by tfm-secrets. Run `python -m bot.upstream_probe %s %s`.",
+                            "Run `python -m bot.upstream_probe %s %s`.",
                             self.slot_label,
                             address,
                             " ".join(str(p) for p in ports_seq),
                         )
                 logger.warning(
-                    "Slot %s: [login] upstream TCP attempt failed %s:%s — %s: %s%s",
+                    "Slot %s: [%s] upstream TCP attempt failed %s:%s — %s: %s%s",
                     self.slot_label,
+                    tag,
                     address,
                     port,
                     type(e).__name__,
@@ -923,8 +924,9 @@ class BanBotProxy(Proxy):
                     extra,
                 )
         logger.error(
-            "Slot %s: [login] upstream TCP all ports failed — last_error=%s: %s",
+            "Slot %s: [%s] upstream TCP all ports failed — last_error=%s: %s",
             self.slot_label,
+            tag,
             type(last_exc).__name__ if last_exc else "None",
             last_exc,
         )
@@ -1044,7 +1046,11 @@ class BanBotProxy(Proxy):
             peer,
             self.host_satellite_port,
         )
-        await super().new_satellite_connection(client_reader, client_writer)
+        self._open_streams_tag = "satellite"
+        try:
+            await super().new_satellite_connection(client_reader, client_writer)
+        finally:
+            self._open_streams_tag = "login"
 
     async def on_start(self):
         self._loop = asyncio.get_running_loop()

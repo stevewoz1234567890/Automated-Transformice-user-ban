@@ -1,20 +1,21 @@
 """
-CMD entry: multi-slot local proxies, /room on all clients, then staggered /ban.
+CMD entry: multi-slot local proxies + Flash Player UI windows, then /room on all clients and staggered /ban.
 
-Enable automatic TCP login with ``BOT_HEADLESS_AUTO_LOGIN=true`` in repo-root ``.env`` or by running
-``python -m bot --headless``. That starts one **caseus** client per slot to each local proxy port
-(``HandshakePacket`` + ``SystemInformationPacket``); the proxy injects ``LoginPacket`` (see ``ban_proxy``).
-Requires ``TFM_SECRETS_*`` in ``.env`` (see ``.env.example``), or ``BOT_HEADLESS_SECRETS_INLINE_JSON``,
-or ``BOT_HEADLESS_SECRETS_DUMPER`` (subprocess prints JSON to stdout; no secret files). Optional
-``BOT_PIP_INSTALL_TFM_SECRETS_CLI`` + ``BOT_TFM_SECRETS_PIP_INSTALL_SPEC``; upstream from the dump or
-``BOT_UPSTREAM_SERVER_*`` (``BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY``, ``BOT_UPSTREAM_PORTS_MATCH_DUMP_ORDER``).
+On startup the bot:
+1. Starts one local proxy per account slot (each listens on a unique TCP port).
+2. Loads TFM crypto secrets via TFMSecretsLeaker.swf / tfm-secrets CLI / .env so the proxy
+   can connect to the upstream game server when Flash connects.
+3. Starts a shared Flash socket-policy server (port 10801 by default).
+4. Launches one Flash standalone projector window per slot, each loading a patched
+   ``TFMProxyLoader.swf`` that connects to its local proxy port.
+5. Waits for all slots to log in (LoginSuccessPacket), then prompts for room + target user.
 
-On startup the bot creates ``.env`` from ``.env.example`` when missing and appends default ``BOT_*`` keys.
+Flash Player path: place ``flashplayer_32_sa_debug.exe`` (or ``flashplayer_32_sa.exe``) beside
+the bot, or set ``BOT_UI_FLASH_PLAYER_PATH`` / ``FLASHPLAYER`` environment variable.
 
-Use ``python -m bot --no-headless`` to force external connectors only. Row ``bind_ip`` is for Proxifier
-unless ``BOT_PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is true and that IP exists on this machine.
-
-Loader URL fields for ``LoginPacket`` are built from ``TFMProxyLoader.swf`` metadata (see ``flash_launch``).
+You can also open Flash Player manually: File > Open > select the patched
+``TFMProxyLoader_{slot}.swf`` from the ``tmp/`` directory, choose Transformice, and log in.
+Pass ``--no-ui`` to skip auto-launching Flash windows entirely (manual connect only).
 """
 
 from __future__ import annotations
@@ -36,29 +37,21 @@ from caseus import Secrets
 from .ban_proxy import BanBotProxy
 from . import flash_launch
 from .env_setup import env_truthy, load_bot_config, repo_root
-from .headless_client import (
-    load_secrets_base,
-    resolve_headless_upstream,
-    start_headless_client_threads,
-    sync_upstream_cfg_from_secrets,
-)
-from .upstream_probe import run_upstream_tcp_probe
+from .secrets_loader import load_secrets, sync_upstream_cfg_from_secrets, resolve_upstream
 from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
 
 logger = logging.getLogger(__name__)
 
 # caseus.Proxy defaults use main 11801, satellite 12801, policy 10801 (+1000 / -1000).
 # Those defaults are shared by every slot unless overridden — only one process can bind.
-# Use larger offsets so derived ports stay unique for typical proxy_port ranges; all values
-# (main + satellite + policy) must be disjoint across slots (see _assign_listen_ports).
+# Use larger offsets so derived ports stay unique for typical proxy_port ranges.
 SATELLITE_PORT_OFFSET = 10_000
-SOCKET_POLICY_PORT_OFFSET = 10_000
 _PORT_SCAN_SPAN = 50_000
 _MIN_AUX_PORT = 1024
 
 
 def _pick_free_port(preferred: int, used: set[int], *, role: str, label: str) -> int:
-    """Use ``preferred`` if unused and free; otherwise scan forward (Windows may occupy derived ports)."""
+    """Use ``preferred`` if unused and free; otherwise scan forward."""
     start = max(_MIN_AUX_PORT, preferred)
     for p in range(start, start + _PORT_SCAN_SPAN):
         if p in used:
@@ -67,10 +60,7 @@ def _pick_free_port(preferred: int, used: set[int], *, role: str, label: str) ->
             if p != preferred:
                 logger.info(
                     "Slot %s: %s port %s was busy or reserved; using %s",
-                    label,
-                    role,
-                    preferred,
-                    p,
+                    label, role, preferred, p,
                 )
             return p
     msg = (
@@ -89,7 +79,6 @@ class SlotState:
     policy_port: int | None = None
     proxy_bind_host: str | None = None
     login_success_event: threading.Event = field(default_factory=threading.Event)
-    headless_seen_upstream_win121: threading.Event = field(default_factory=threading.Event)
     proxy: BanBotProxy | None = None
     loop: asyncio.AbstractEventLoop | None = None
     thread: threading.Thread | None = None
@@ -105,7 +94,7 @@ def _assign_listen_ports(
     *,
     shared_flash_policy_port: int | None,
 ) -> None:
-    """Set satellite port; policy port number(s) are for ``LoginPacket.loader_url`` only (no Flash socket servers)."""
+    """Assign unique satellite ports; policy port is embedded in loader URL only."""
     used: set[int] = {s.port for s in states}
     if shared_flash_policy_port is not None:
         used.add(shared_flash_policy_port)
@@ -114,23 +103,13 @@ def _assign_listen_ports(
         preferred_sat = s.port + SATELLITE_PORT_OFFSET
         s.satellite_port = _pick_free_port(preferred_sat, used, role="satellite", label=s.label)
         used.add(s.satellite_port)
+        # Policy port is always the shared one; no per-slot policy servers.
+        s.policy_port = None
 
-        if shared_flash_policy_port is not None:
-            s.policy_port = None
-        else:
-            preferred_pol = s.port - SOCKET_POLICY_PORT_OFFSET
-            pol = _pick_free_port(preferred_pol, used, role="policy", label=s.label)
-            s.policy_port = pol
-            used.add(pol)
-
-    triples = [(s.port, s.satellite_port, s.policy_port) for s in states]
-    flat = [p for t in triples for p in t if p is not None]
+    flat = [s.port for s in states] + [s.satellite_port for s in states]
     if len(flat) != len(set(flat)):
         dup = [p for p, n in Counter(flat).items() if n > 1]
-        msg = (
-            "Listen port collision after assignment (should not happen). "
-            f"Duplicates: {dup!r}"
-        )
+        msg = f"Listen port collision after assignment. Duplicates: {dup!r}"
         logger.error(msg)
         raise SystemExit(msg)
 
@@ -173,33 +152,18 @@ def _run_slot_async(
                 host_socket_policy_port=None,
                 slot_label=state.label,
                 login_success_event=state.login_success_event,
-                upstream_win121_event=state.headless_seen_upstream_win121,
-                verbose_login_flow=bool(
-                    getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", False)
-                ),
-                log_all_main_packets=bool(
-                    getattr(cfg, "PROXY_LOG_ALL_MAIN_PACKETS", False)
-                ),
-                login_diagnostics=bool(
-                    getattr(cfg, "PROXY_LOGIN_DIAGNOSTICS", True)
-                ),
+                verbose_login_flow=bool(getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", False)),
+                log_all_main_packets=bool(getattr(cfg, "PROXY_LOG_ALL_MAIN_PACKETS", False)),
+                login_diagnostics=bool(getattr(cfg, "PROXY_LOGIN_DIAGNOSTICS", True)),
                 packet_login_username=state.flash_username,
                 packet_login_password=state.flash_password,
                 packet_login_loader_url=state.packet_loader_url,
-                packet_login_delay_sec=float(
-                    getattr(cfg, "PACKET_LOGIN_DELAY_SEC", 0.35) or 0.35
-                ),
-                packet_login_start_room=str(
-                    getattr(cfg, "PACKET_LOGIN_START_ROOM", "") or ""
-                ),
+                packet_login_delay_sec=float(getattr(cfg, "PACKET_LOGIN_DELAY_SEC", 0.35) or 0.35),
+                packet_login_start_room=str(getattr(cfg, "PACKET_LOGIN_START_ROOM", "") or ""),
                 main_server_address=main_server_address,
                 main_server_ports=main_server_ports,
-                upstream_connect_diag=bool(
-                    getattr(cfg, "PROXY_UPSTREAM_CONNECT_DIAG", True)
-                ),
-                upstream_connect_shuffle_ports=bool(
-                    getattr(cfg, "UPSTREAM_CONNECT_SHUFFLE_PORTS", False)
-                ),
+                upstream_connect_diag=bool(getattr(cfg, "PROXY_UPSTREAM_CONNECT_DIAG", True)),
+                upstream_connect_shuffle_ports=bool(getattr(cfg, "UPSTREAM_CONNECT_SHUFFLE_PORTS", False)),
                 packet_login_auth_key_fallback=packet_login_auth_key_fallback,
                 packet_login_packet_key_sources_fallback=packet_login_packet_key_sources_fallback,
                 bootstrap_secrets=bootstrap_secrets,
@@ -231,15 +195,9 @@ def start_all_slots(
     bootstrap_secrets: Secrets | None = None,
 ) -> None:
     for s in states:
-        for role, p in (
-            ("main", s.port),
-            ("satellite", s.satellite_port),
-        ):
+        for role, p in (("main", s.port), ("satellite", s.satellite_port)):
             if not ensure_port_free_or_kill_same_bot(p, this_exe=this_exe, allow_kill=allow_kill):
-                msg = (
-                    f"{role} port {p} (slot {s.label}) is in use. "
-                    "Free it or change proxy_port in config."
-                )
+                msg = f"{role} port {p} (slot {s.label}) is in use. Free it or change proxy_port in config."
                 logger.error(msg)
                 raise SystemExit(msg)
 
@@ -270,26 +228,17 @@ def _wait_for_all_slots_logged_in(states: list[SlotState], cfg: object) -> None:
     n = len(states)
     logger.info(
         "Waiting until all %s slot(s) report login success (timeout %.0fs)...",
-        n,
-        timeout_sec,
+        n, timeout_sec,
     )
     deadline = time.monotonic() + timeout_sec
     poll_sec = 2.0
     while time.monotonic() < deadline:
-        pending = [
-            s
-            for s in states
-            if s.proxy is not None and not s.login_success_event.is_set()
-        ]
+        pending = [s for s in states if s.proxy is not None and not s.login_success_event.is_set()]
         if not pending:
             logger.info("All %s slot(s) logged in.", n)
             return
         time.sleep(poll_sec)
-    labels = [
-        s.label
-        for s in states
-        if s.proxy is not None and not s.login_success_event.is_set()
-    ]
+    labels = [s.label for s in states if s.proxy is not None and not s.login_success_event.is_set()]
     logger.warning(
         "Timeout waiting for login — missing slot(s): %s. Continuing anyway.",
         ", ".join(labels) if labels else "(none)",
@@ -322,12 +271,7 @@ def run_ban_round(states: list[SlotState], room: str, target_user: str, cfg) -> 
     active = [s for s in states if s.proxy is not None]
     for i, s in enumerate(active):
         ok = _run_coro_on_slot(s, s.proxy.send_ban_command(target_user))
-        logger.info(
-            "[slot %s] /ban %r -> %s",
-            s.label,
-            target_user,
-            "sent" if ok else "FAILED",
-        )
+        logger.info("[slot %s] /ban %r -> %s", s.label, target_user, "sent" if ok else "FAILED")
         if i < len(active) - 1:
             time.sleep(random.uniform(dmin, dmax))
 
@@ -335,107 +279,71 @@ def run_ban_round(states: list[SlotState], room: str, target_user: str, cfg) -> 
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Transformice multi-slot /room + /ban bot (local proxy).")
+    p = argparse.ArgumentParser(description="Transformice multi-slot /room + /ban bot (Flash UI + local proxy).")
     p.add_argument(
         "--no-kill-stale",
         action="store_true",
         help="Do not kill processes already listening on configured proxy ports.",
     )
     p.add_argument(
-        "--headless",
-        action="store_true",
-        help="Start built-in caseus TCP clients per slot (needs TFM_SECRETS_* / inline JSON / dumper + upstream).",
-    )
-    p.add_argument(
-        "--no-headless",
-        action="store_true",
-        help="Do not start built-in caseus TCP clients (overrides BOT_HEADLESS_AUTO_LOGIN).",
-    )
-    p.add_argument(
-        "--ui",
-        action="store_true",
-        help=(
-            "UI mode: launch one Flash standalone player window per slot so the full game UI is "
-            "visible. Each window opens TFMProxyLoader.swf and connects to its local proxy port; "
-            "the proxy injects the login packet automatically. Requires TFMProxyLoader.swf in the "
-            "repo root (or TFM_PROXY_SWF) and a Flash standalone projector "
-            "(flashplayer_32_sa.exe / flashplayer_32_sa_debug.exe beside the exe, or set "
-            "BOT_UI_FLASH_PLAYER_PATH / FLASHPLAYER). Also enabled by BOT_UI_AUTO_LAUNCH_FLASH=true."
-        ),
-    )
-    p.add_argument(
         "--no-ui",
         action="store_true",
-        help="Do not launch Flash player windows even if BOT_UI_AUTO_LAUNCH_FLASH=true in .env.",
+        help=(
+            "Do not auto-launch Flash Player windows. Start proxies only; "
+            "open flashplayer_32_sa_debug.exe manually, File > Open, select the patched SWF from tmp/."
+        ),
     )
     p.add_argument(
         "--ui-sequential",
         action="store_true",
         help=(
             "Open Flash windows one at a time: launch slot 1, wait for it to log in, "
-            "then launch slot 2, and so on. Slower but avoids opening all windows at once. "
-            "Also enabled by BOT_UI_SEQUENTIAL_LOGIN=true. "
+            "then launch slot 2, and so on. Also enabled by BOT_UI_SEQUENTIAL_LOGIN=true. "
             "Timeout per slot: BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC (default 120 s)."
         ),
     )
     return p.parse_args(argv)
 
 
-def _ui_mode_requested(args: argparse.Namespace) -> bool:
-    """True when Flash UI windows should be launched for each slot."""
-    if getattr(args, "no_ui", False):
-        return False
-    if getattr(args, "ui", False):
-        return True
-    return env_truthy("BOT_UI_AUTO_LAUNCH_FLASH")
-
-
-def _launch_ui_flash_players(states: "list[SlotState]", cfg: object, args: argparse.Namespace) -> None:
+def _launch_ui_flash_players(states: list[SlotState], cfg: object, args: argparse.Namespace) -> None:
     """
     Resolve the Flash standalone projector and launch one window per slot.
 
-    Missing loader URLs are warned individually (slot skipped).  If no projector
-    is found the function logs an actionable error and returns without launching.
+    If no projector is found the function logs an error and returns — the user
+    can open Flash Player manually instead.
     """
     root = repo_root()
     flash_exe = flash_launch.resolve_flash_player(root)
     if flash_exe is None:
         logger.error(
             "UI mode: no Flash standalone projector found. Place flashplayer_32_sa.exe or "
-            "flashplayer_32_sa_debug.exe next to the bot (or beside ban_bot.exe), or set "
-            "BOT_UI_FLASH_PLAYER_PATH / FLASHPLAYER to the full path of the executable. "
-            "Skipping Flash window launch — connect manually instead."
+            "flashplayer_32_sa_debug.exe beside the bot, or set BOT_UI_FLASH_PLAYER_PATH / FLASHPLAYER. "
+            "Open Flash manually: File > Open > select the patched SWF from tmp/."
         )
         return
 
     logger.info("UI mode: Flash projector → %s", flash_exe)
 
-    # Trust all SWF directories so Flash does not show a blank screen / security dialog.
-    swf_dirs = list({
-        Path(s.packet_loader_url.split("?")[0].replace("file:///", "/").replace("file://", "/")).parent
-        for s in states
-        if s.packet_loader_url
-    })
-    # On Windows the URI looks like file:///C:/... so strip the leading slash back to a drive letter.
+    # Trust all SWF directories so Flash does not show a security dialog.
     if sys.platform == "win32":
         swf_dirs = []
         for s in states:
             if not s.packet_loader_url:
                 continue
             uri = s.packet_loader_url.split("?")[0]
-            # file:///C:/path/to/file.swf → C:/path/to/file.swf → parent dir
             local = uri[len("file:///"):] if uri.startswith("file:///") else uri[len("file://"):]
             swf_dirs.append(Path(local).parent)
         swf_dirs = list({str(d): d for d in swf_dirs}.values())
+    else:
+        swf_dirs = list({
+            Path(s.packet_loader_url.split("?")[0].replace("file:///", "/").replace("file://", "/")).parent
+            for s in states if s.packet_loader_url
+        })
 
     flash_launch.ensure_flash_trust(swf_dirs)
 
-    stagger = float(getattr(cfg, "UI_FLASH_LAUNCH_STAGGER_SEC", 1.0) or 1.0)
-    stagger = max(0.0, stagger)
-
-    sequential = bool(getattr(cfg, "UI_SEQUENTIAL_LOGIN", False)) or bool(
-        getattr(args, "ui_sequential", False)
-    )
+    stagger = max(0.0, float(getattr(cfg, "UI_FLASH_LAUNCH_STAGGER_SEC", 1.0) or 1.0))
+    sequential = bool(getattr(cfg, "UI_SEQUENTIAL_LOGIN", False)) or bool(getattr(args, "ui_sequential", False))
     per_slot_timeout = float(getattr(cfg, "UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC", 120.0) or 120.0)
 
     n_total = sum(1 for s in states if s.packet_loader_url)
@@ -444,24 +352,19 @@ def _launch_ui_flash_players(states: "list[SlotState]", cfg: object, args: argpa
     for i, s in enumerate(states):
         if not s.packet_loader_url:
             logger.warning(
-                "UI-mode: slot %s has no loader URL (TFMProxyLoader.swf missing or "
-                "TFM_PROXY_SWF not set). Skipping Flash launch for this slot.",
+                "UI-mode: slot %s has no loader URL (TFMProxyLoader.swf missing or TFM_PROXY_SWF not set). "
+                "Skipping Flash launch for this slot.",
                 s.label,
             )
             continue
 
-        # Verify the SWF file exists and is readable before handing it to Flash Player.
         swf_local = flash_launch.swf_local_path_from_url(s.packet_loader_url)
         if swf_local is not None:
             if not swf_local.is_file():
                 logger.warning(
-                    "UI-mode: slot %s SWF not found on disk (%s). "
-                    "Attempting to regenerate from TFMProxyLoader.swf ...",
-                    s.label,
-                    swf_local,
+                    "UI-mode: slot %s SWF not found on disk (%s). Attempting to regenerate ...",
+                    s.label, swf_local,
                 )
-                # Rebuild the loader URL (forces patch regeneration).
-                from .ban_proxy import BanBotProxy  # noqa: F401 — ensure module loaded
                 row_dict = {
                     "proxy_port": s.port,
                     "_flash_satellite_port": s.satellite_port,
@@ -479,16 +382,6 @@ def _launch_ui_flash_players(states: "list[SlotState]", cfg: object, args: argpa
                         s.label,
                     )
                     continue
-            try:
-                sz = swf_local.stat().st_size
-                logger.debug("UI-mode: slot %s SWF OK (%s bytes) → %s", s.label, sz, swf_local)
-            except OSError as _e:
-                logger.warning(
-                    "UI-mode: slot %s cannot stat SWF (%s): %s — Flash may fail to open it.",
-                    s.label,
-                    swf_local,
-                    _e,
-                )
 
         proc = flash_launch.launch_flash_player_for_slot(s.packet_loader_url, flash_exe, label=s.label)
         if proc is None:
@@ -497,32 +390,23 @@ def _launch_ui_flash_players(states: "list[SlotState]", cfg: object, args: argpa
 
         if sequential and i < len(states) - 1:
             logger.info(
-                "UI sequential: waiting for slot %s to log in before opening next window "
-                "(timeout %.0fs) ...",
-                s.label,
-                per_slot_timeout,
+                "UI sequential: waiting for slot %s to log in before opening next window (timeout %.0fs) ...",
+                s.label, per_slot_timeout,
             )
             logged_in = s.login_success_event.wait(timeout=per_slot_timeout)
             if logged_in:
-                logger.info(
-                    "UI sequential: slot %s logged in — opening next window.",
-                    s.label,
-                )
+                logger.info("UI sequential: slot %s logged in — opening next window.", s.label)
             else:
                 logger.warning(
-                    "UI sequential: slot %s did not log in within %.0fs — "
-                    "opening next window anyway. Increase BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC if needed.",
-                    s.label,
-                    per_slot_timeout,
+                    "UI sequential: slot %s did not log in within %.0fs — opening next window anyway.",
+                    s.label, per_slot_timeout,
                 )
         elif stagger > 0 and i < len(states) - 1:
             time.sleep(stagger)
 
     logger.info(
-        "UI mode: launched %s/%s Flash window(s). "
-        "Each window should connect to its proxy and log in automatically.",
-        launched,
-        n_total,
+        "UI mode: launched %s/%s Flash window(s). Each window connects to its proxy and logs in automatically.",
+        launched, n_total,
     )
 
 
@@ -545,11 +429,9 @@ _FLASH_POLICY_XML = (
 def _start_shared_flash_policy_server(port: int | None, cfg: object) -> None:
     """Start a shared Flash socket-policy server in a background thread.
 
-    Flash Player requests a cross-domain policy when ``Security.loadPolicyFile``
-    is called on ``xmlsocket://127.0.0.1:<port>``.  Without a server responding
-    with the allow-all policy XML, Flash blocks all socket connections — even
-    for SWFs in a trusted directory.  This server listens on *port* and
-    immediately writes the policy XML to every connecting client then closes.
+    Flash Player requests a cross-domain policy on ``xmlsocket://127.0.0.1:<port>``.
+    Without a server responding with the allow-all XML, Flash blocks all socket
+    connections even for SWFs in a trusted directory.
     """
     if port is None:
         return
@@ -560,13 +442,13 @@ def _start_shared_flash_policy_server(port: int | None, cfg: object) -> None:
         try:
             writer.write(_FLASH_POLICY_XML)
             await writer.drain()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
     async def _serve() -> None:
@@ -580,7 +462,7 @@ def _start_shared_flash_policy_server(port: int | None, cfg: object) -> None:
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(_serve())
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("Shared Flash policy server crashed on port %s", port)
         finally:
             loop.close()
@@ -612,32 +494,17 @@ def main(argv: list[str] | None = None) -> None:
         proxy_bind = proxy_bind.strip() or None
 
     raw_accounts = cfg.ACCOUNTS
-    headless_auto = (
-        (bool(getattr(cfg, "HEADLESS_AUTO_LOGIN", False)) or args.headless)
-        and not args.no_headless
-    )
-    if _ui_mode_requested(args) and headless_auto:
-        logger.warning(
-            "Both --ui (Flash windows) and --headless (TCP clients) are active. "
-            "The proxy will inject login packets from the headless client; the Flash window "
-            "will connect and display the game UI as well. This is supported but unusual — "
-            "use --no-headless if you only want Flash to handle the connection."
-        )
     for i, row in enumerate(raw_accounts):
         label = str(row.get("label", i + 1))
         u = str(row.get("username", "") or "").strip()
         pw = str(row.get("password", "") or "")
         if not u or not pw.strip():
             logger.error(
-                "BOT_ACCOUNTS_JSON slot %s: username and password must be non-empty "
-                "(required for proxy LoginPacket%s).",
+                "BOT_ACCOUNTS_JSON slot %s: username and password must be non-empty (required for proxy LoginPacket).",
                 label,
-                " and headless TCP login" if headless_auto else "",
             )
             raise SystemExit(1)
 
-    # False: listen on PROXY_BIND_HOST or all interfaces; row bind_ip is Proxifier reference only.
-    # True only if each bind_ip is assigned to a NIC on *this* machine (otherwise bind() fails).
     use_account_bind_ip = getattr(cfg, "PROXY_LISTEN_USE_ACCOUNT_BIND_IP", False)
     states: list[SlotState] = []
     seen_ports: set[int] = set()
@@ -652,24 +519,18 @@ def main(argv: list[str] | None = None) -> None:
         ip = str(row.get("bind_ip", "")).strip()
         if ip:
             if ip in seen_ips:
-                msg = (
-                    f"Duplicate bind_ip {ip!r} - each account needs a unique IP (Proxifier mapping)."
-                )
+                msg = f"Duplicate bind_ip {ip!r} — each account needs a unique IP (Proxifier mapping)."
                 logger.error(msg)
                 raise SystemExit(msg)
             seen_ips.add(ip)
         label = str(row.get("label", i + 1))
-        if use_account_bind_ip:
-            slot_listen: str | None = ip if ip else proxy_bind
-        else:
-            slot_listen = proxy_bind
+        slot_listen: str | None = (ip if ip else proxy_bind) if use_account_bind_ip else proxy_bind
         states.append(SlotState(label=label, port=port, proxy_bind_host=slot_listen))
 
     if not use_account_bind_ip and any(str(row.get("bind_ip", "")).strip() for row in raw_accounts):
         logger.info(
             "PROXY_LISTEN_USE_ACCOUNT_BIND_IP is False: per-row bind_ip is ignored for listening "
-            "(use it in Proxifier only). Proxies use distinct ports; clients typically use "
-            "127.0.0.1 unless BOT_PROXY_BIND_HOST is set."
+            "(use it in Proxifier only). Proxies use distinct ports; clients connect to 127.0.0.1."
         )
 
     shared_flash_policy_port = _cfg_shared_flash_policy_port(cfg)
@@ -679,8 +540,7 @@ def main(argv: list[str] | None = None) -> None:
             if s.port == shared_flash_policy_port:
                 msg = (
                     f"Slot {s.label}: proxy_port {s.port} equals SHARED_FLASH_SOCKET_POLICY_PORT "
-                    f"({shared_flash_policy_port}); use a different main port or disable the shared "
-                    "policy (set SHARED_FLASH_SOCKET_POLICY_PORT = None)."
+                    f"({shared_flash_policy_port}); use a different main port or set SHARED_FLASH_SOCKET_POLICY_PORT=None."
                 )
                 logger.error(msg)
                 raise SystemExit(msg)
@@ -688,18 +548,10 @@ def main(argv: list[str] | None = None) -> None:
     _assign_listen_ports(states, shared_flash_policy_port=shared_flash_policy_port)
 
     for s in states:
-        pol = (
-            shared_flash_policy_port
-            if shared_flash_policy_port is not None
-            else s.policy_port
-        )
         logger.info(
             "Slot %s: listen_host=%r main=%s satellite=%s loader_url_policy_port=%s",
-            s.label,
-            s.proxy_bind_host,
-            s.port,
-            s.satellite_port,
-            pol,
+            s.label, s.proxy_bind_host, s.port, s.satellite_port,
+            shared_flash_policy_port if shared_flash_policy_port is not None else "(per-slot disabled)",
         )
 
     for s, row in zip(states, raw_accounts):
@@ -709,108 +561,33 @@ def main(argv: list[str] | None = None) -> None:
     for row, st in zip(raw_accounts, states):
         row_dict = dict(row)
         row_dict["_flash_satellite_port"] = st.satellite_port
-        row_dict["_flash_policy_port"] = (
-            shared_flash_policy_port
-            if shared_flash_policy_port is not None
-            else st.policy_port
-        )
+        row_dict["_flash_policy_port"] = shared_flash_policy_port if shared_flash_policy_port is not None else st.policy_port
         row_dict["_flash_connect_host"] = st.proxy_bind_host if st.proxy_bind_host else "127.0.0.1"
         st.packet_loader_url = flash_launch.loader_document_url_for_row(row_dict, repo_root()) or ""
 
+    # Load TFM secrets and upstream configuration so the proxy can connect to the game server
+    # when Flash Player sends its HandshakePacket.
+    logger.info("Loading TFM secrets for proxy upstream configuration ...")
     upstream_addr: str | None = None
     upstream_ports: tuple[int, ...] | None = None
-    base_secrets = None
-
-    ui_mode = _ui_mode_requested(args)
-
-    if headless_auto:
-        base_secrets = load_secrets_base(cfg)
+    base_secrets: Secrets | None = None
+    try:
+        base_secrets = load_secrets(cfg)
         sync_upstream_cfg_from_secrets(cfg, base_secrets)
-        upstream_addr, upstream_ports = resolve_headless_upstream(cfg, base_secrets)
-        if not upstream_addr or not upstream_ports:
-            logger.error(
-                "HEADLESS_AUTO_LOGIN needs server_address and server_ports from the live secrets dump "
-                "or set BOT_UPSTREAM_SERVER_ADDRESS and BOT_UPSTREAM_SERVER_PORTS in .env."
-            )
-            raise SystemExit(1)
-        logger.info(
-            "Headless TCP login enabled: proxy upstream %s ports %s",
-            upstream_addr,
-            upstream_ports,
+        upstream_addr, upstream_ports = resolve_upstream(cfg, base_secrets)
+        logger.info("Proxy upstream configured → %s ports %s", upstream_addr, upstream_ports)
+    except SystemExit:
+        logger.warning(
+            "Failed to load TFM secrets. Flash windows may not be able to connect to the game server. "
+            "Place flashplayer_32_sa_debug.exe in the repo root, or fill TFM_SECRETS_* in .env."
         )
-        dump_host = getattr(base_secrets, "server_address", None)
-        if dump_host:
-            ds = str(dump_host).strip()
-            us = str(upstream_addr).strip()
-            if ds != us:
-                logger.warning(
-                    "TFM_SECRETS_SERVER_ADDRESS is %r but headless upstream is %r — if ALLOW_ADDRESS_MISMATCH is on, "
-                    "zero-byte handshake closes often mean this pairing is wrong; prefer matching hosts or dump-only upstream.",
-                    ds,
-                    us,
-                )
-            else:
-                logger.info(
-                    "Upstream host matches TFM_SECRETS_SERVER_ADDRESS (%r). Zero-byte closes usually mean stale "
-                    "TFM_SECRETS_* (re-run leaker) or server policy; WinError 121 on later slots: increase "
-                    "BOT_HEADLESS_LOGIN_STAGGER_SEC or set BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES.",
-                    ds,
-                )
-    elif ui_mode:
-        # UI-only mode (no headless TCP client): the proxy still needs the upstream address and
-        # TFM crypto secrets so it can connect to the game server when Flash connects.
-        # Without these, caseus crashes immediately when Flash sends its HandshakePacket
-        # (client.destination is None → AttributeError in _fix_handshake_packet).
-        logger.info(
-            "UI mode (no headless): loading TFM secrets to configure proxy upstream "
-            "so Flash windows can connect and log in through the proxy."
-        )
-        try:
-            base_secrets = load_secrets_base(cfg)
-            sync_upstream_cfg_from_secrets(cfg, base_secrets)
-            upstream_addr, upstream_ports = resolve_headless_upstream(cfg, base_secrets)
-            if upstream_addr and upstream_ports:
-                logger.info(
-                    "UI mode: proxy upstream configured → %s ports %s",
-                    upstream_addr,
-                    upstream_ports,
-                )
-            else:
-                logger.warning(
-                    "UI mode: could not resolve upstream from secrets — "
-                    "set BOT_UPSTREAM_SERVER_ADDRESS / BOT_UPSTREAM_SERVER_PORTS or enable --headless."
-                )
-                base_secrets = None
-        except SystemExit:
-            logger.warning(
-                "UI mode: failed to load TFM secrets for proxy upstream. "
-                "Flash windows will not be able to connect to the game server. "
-                "Place flashplayer_32_sa_debug.exe in the repo root (for the leaker), "
-                "or set BOT_UPSTREAM_SERVER_ADDRESS and BOT_UPSTREAM_SERVER_PORTS in .env."
-            )
-            base_secrets = None
+        base_secrets = None
 
     auth_key_fallback: int | None = None
     packet_key_sources_fallback: list | tuple | None = None
     if base_secrets is not None:
         auth_key_fallback = getattr(base_secrets, "auth_key", None)
         packet_key_sources_fallback = getattr(base_secrets, "packet_key_sources", None)
-
-    if upstream_addr and upstream_ports:
-        if headless_auto and bool(getattr(cfg, "UPSTREAM_TCP_PROBE_BEFORE_HEADLESS", True)):
-            probe_results = run_upstream_tcp_probe(upstream_addr, upstream_ports, cfg)
-            if bool(getattr(cfg, "UPSTREAM_ABORT_ON_PROBE_ALL_FAILED", True)):
-                n_ok = sum(1 for _p, st, _ in probe_results if st == "ok")
-                if len(probe_results) > 0 and n_ok == 0:
-                    logger.error(
-                        "Aborting: upstream TCP probe reached 0/%s ports on %r — this process cannot reach "
-                        "the game TCP ports (firewall, VPN, ISP, or routing). Headless login would only repeat "
-                        "timeouts/WinError 121. Fix network path to the host or set "
-                        "BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED=false to try anyway.",
-                        len(probe_results),
-                        upstream_addr,
-                    )
-                    raise SystemExit(1)
 
     start_all_slots(
         states,
@@ -824,33 +601,17 @@ def main(argv: list[str] | None = None) -> None:
         bootstrap_secrets=base_secrets,
     )
 
-    if ui_mode:
-        _start_shared_flash_policy_server(shared_flash_policy_port, cfg)
-        _launch_ui_flash_players(states, cfg, args)
+    # Start shared Flash socket-policy server (Flash needs this before it allows socket connections).
+    _start_shared_flash_policy_server(shared_flash_policy_port, cfg)
 
-    if headless_auto:
-        if not start_headless_client_threads(
-            states,
-            raw_accounts,
-            cfg,
-            base_secrets=base_secrets,
-        ):
-            logger.error(
-                "Aborting: headless login stopped early (BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES). "
-                "Remaining slots never attempted login — fix upstream reachability or credentials, raise the "
-                "threshold, or set it to 0 to attempt every slot.",
-            )
-            raise SystemExit(1)
-        missing_login = [s for s in states if not s.login_success_event.is_set()]
-        if missing_login:
-            logger.error(
-                "Headless attempted every slot but %s never reached LoginSuccess (labels: %s). "
-                "Check AccountError / wrong password lines above; fix BOT_ACCOUNTS_JSON or run "
-                "`python -m bot.validate_accounts --all`.",
-                len(missing_login),
-                ", ".join(s.label for s in missing_login),
-            )
-            raise SystemExit(1)
+    # Launch Flash Player windows unless the user passed --no-ui.
+    if not args.no_ui:
+        _launch_ui_flash_players(states, cfg, args)
+    else:
+        logger.info(
+            "--no-ui: skipping Flash auto-launch. "
+            "Open flashplayer_32_sa_debug.exe manually, File > Open, and select the patched SWF from tmp/."
+        )
 
     _wait_for_all_slots_logged_in(states, cfg)
 
@@ -868,7 +629,7 @@ def main(argv: list[str] | None = None) -> None:
 
         run_ban_round(states, room, target, cfg)
 
-        again = input('Ban someone else? (y/n): ').strip().lstrip("\ufeff").lower()
+        again = input("Ban someone else? (y/n): ").strip().lstrip("\ufeff").lower()
         logger.info("Ban someone else? answered: %r", again)
         if again not in ("y", "yes"):
             break

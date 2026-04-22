@@ -49,6 +49,7 @@ def _loader_document_url(
         f"proxyHost={h}",
         f"port={int(main_port)}",
         f"satellite={int(satellite_port)}",
+        "game=transformice",
     ]
     if policy_port is not None:
         pp = int(policy_port)

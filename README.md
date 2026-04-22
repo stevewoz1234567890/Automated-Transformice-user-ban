@@ -1,135 +1,142 @@
 # Automated Transformice user ban
 
-This repository (**Automated-Transformice-user-ban**) is aimed at a **command-line** workflow for coordinating **room** moves and **staggered `/ban`** across many Transformice clients, as described in [`Initial-Idea.txt`](Initial-Idea.txt).
+This repository (**Automated-Transformice-user-ban**) provides a **command-line** workflow for coordinating **room** moves and **staggered `/ban`** across many Transformice clients, as described in [`Initial-Idea.txt`](Initial-Idea.txt).
 
-The implementation is the Python package **`bot/`**: one **local TCP proxy per game client** (via **caseus**). The proxy injects **`LoginPacket`** after **`SystemInformationPacket`** using credentials from **`BOT_ACCOUNTS_JSON`** in a repo-root **`.env`**. By default the bot does not start Flash Player, but **UI mode** (`--ui`) can open Flash windows automatically (see below).
+The implementation is the Python package **`bot/`**: one **local TCP proxy per game client** (via **caseus**). The proxy injects **`LoginPacket`** after **`SystemInformationPacket`** using credentials from **`BOT_ACCOUNTS_JSON`** in a repo-root **`.env`**.
 
-**First run:** if **`.env`** is missing, it is created from **`.env.example`**, then any missing **`BOT_*`** keys are appended with defaults (see `bot/env_setup.py`).
+## Quick start (UI mode)
 
-**Automatic login (recommended):** run **`python -m bot --headless`** or set **`BOT_HEADLESS_AUTO_LOGIN=true`** in **`.env`**. The bot starts a built-in **caseus** TCP client per slot (see `bot/headless_client.py`, `HandshakePacket` → `SystemInformationPacket` → proxy-injected `LoginPacket`). **`TFM_SECRETS_*`** can be filled automatically when incomplete: try **`tfm-secrets`** (optional **`BOT_TFM_SECRETS_PIP_INSTALL_SPEC`** for a one-time `pip install` if the exe is missing), then **TFMSecretsLeaker.swf** via the **Flash debug projector** (`flashplayer_32_sa_debug.exe` in the repo root, or **`FLASHPLAYER_DEBUG`** — the leaker SWF is downloaded to **`tmp/`**). Results are **written into `.env`** by default (`BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV`). You can still set **`BOT_HEADLESS_SECRETS_INLINE_JSON`** or **`BOT_HEADLESS_SECRETS_DUMPER`**. **`BOT_UPSTREAM_SERVER_ADDRESS`** and **`BOT_UPSTREAM_SERVER_PORTS`** can override host/ports from secrets (comma-separated ports, e.g. `11801,12801,13801,14801`).
+```powershell
+# From the repo root:
+.\venv\Scripts\python.exe -m bot
+```
 
-Before starting proxies, headless mode runs a **parallel TCP-only probe** ( **`BOT_UPSTREAM_TCP_PROBE_BEFORE_HEADLESS`**; timeout **`BOT_UPSTREAM_PROBE_TIMEOUT_SEC`**). If **no** port connects, **`BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED`** (default **true**) **exits immediately** so you do not burn through headless slots on a dead path. To test manually: `python -m bot.upstream_probe <host> 11801 12801 13801 14801`. Windows **WinError 121** is a **connect timeout** (firewall/VPN/path), not a tfm-secrets problem.
+The bot will:
+1. Load TFM crypto secrets via **TFMSecretsLeaker.swf** (using `flashplayer_32_sa_debug.exe`) or from `TFM_SECRETS_*` in `.env`.
+2. Start one local TCP proxy per account slot.
+3. Start a shared Flash socket-policy server on port **10801**.
+4. Launch one **Flash standalone projector** window per slot, each loading a patched **`TFMProxyLoader.swf`** pointed at its proxy port.
+5. In each Flash window, **click "Transformice"** to start the game connection through the proxy.
+6. The proxy injects login credentials automatically — no typing needed in Flash.
+7. After all slots log in, the CLI prompts for target room and player.
 
-**Upstream port order:** by default **`BOT_UPSTREAM_CONNECT_SHUFFLE_PORTS`** is false — the proxy tries configured ports in list order (put **11801** first if that is your main listener). Set **`BOT_UPSTREAM_CONNECT_SHUFFLE_PORTS=true`** to restore random order like stock caseus. **`BOT_HEADLESS_LOGIN_STAGGER_SEC`** (default **6** s between slots) reduces burst connect attempts that can trigger 121 on later accounts. **`BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES`** (default **3**) stops the headless loop after N failed slots in a row. **`BOT_HEADLESS_SECRETS_ALWAYS_REFRESH`** (default **true**) re-runs tfm-secrets / the Flash leaker before using cached **`TFM_SECRETS_*`**. **`BOT_UPSTREAM_AUTO_SYNC_FROM_SECRETS`** (default **true**) writes **`BOT_UPSTREAM_*`** from the dump, sets **`BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY=true`**, and clears **`BOT_UPSTREAM_ALLOW_ADDRESS_MISMATCH`**. After **WinError 121**, the inter-slot pause grows by **`BOT_HEADLESS_STAGGER_WIN121_EXTRA_SEC`** up to **`BOT_HEADLESS_STAGGER_MAX_SEC`**.
+To skip auto-launching Flash windows (open Flash manually instead): `python -m bot --no-ui`
 
-**UI mode (Flash windows):** run **`python -m bot --ui`** or set **`BOT_UI_AUTO_LAUNCH_FLASH=true`** in **`.env`**. The bot starts the proxies and then launches one **Flash standalone projector** window per slot. Each window opens **`TFMProxyLoader.swf`** pointed at its slot's proxy port; the proxy injects `LoginPacket` automatically so you see the full game UI without entering credentials manually. Flash executable resolution order: **`BOT_UI_FLASH_PLAYER_PATH`** → **`FLASHPLAYER`** / **`FLASH_STANDALONE`** env vars → **`flashplayer_32_sa.exe`** → **`flashplayer_32_sa_debug.exe`** in the repo root. Use **`--no-ui`** to suppress window launches even if the env var is set. **`BOT_UI_FLASH_LAUNCH_STAGGER_SEC`** (default **1.0 s**) spaces out window launches to avoid all slots hammering the proxy simultaneously.
-
-**Manual connector:** omit `--headless` and `--ui`, keep **`BOT_HEADLESS_AUTO_LOGIN`** and **`BOT_UI_AUTO_LAUNCH_FLASH`** false; attach your own client to each slot's main port.
+**Manual Flash connect:** open `flashplayer_32_sa_debug.exe` → **File > Open** → select `TFMProxyLoader.swf` from the repo root → click **Transformice** → the game connects through the proxy.
 
 ## What you need
 
 - **Python 3.10+**
-- **`TFMProxyLoader.swf`** in the repo root (or set **`TFM_PROXY_SWF`**) so the proxy can build a matching **`LoginPacket.loader_url`** (see `bot/flash_launch.py`). Also required for **UI mode** so Flash knows which proxy port to connect to.
-- **Either** automatic headless mode (secrets JSON + optional flags above), **UI mode** (Flash standalone projector + `TFMProxyLoader.swf`), **or** one external connector per account that opens TCP to the **matching `proxy_port`** and completes the handshake through **`SystemInformationPacket`**.
-- **Unique outbound IP per client** where required (e.g. **Proxifier** + proxies/VPN). The `bind_ip` field in **`BOT_ACCOUNTS_JSON`** is only a **reminder** of which IP you assigned; the bot does not configure Proxifier for you.
+- **`TFMProxyLoader.swf`** in the repo root (or set **`TFM_PROXY_SWF`**).
+- **`flashplayer_32_sa_debug.exe`** (or `flashplayer_32_sa.exe`) in the repo root — or set **`BOT_UI_FLASH_PLAYER_PATH`** / **`FLASHPLAYER`**. Used both for launching game windows and for running **TFMSecretsLeaker.swf** to obtain TFM crypto secrets.
+- **`TFM_SECRETS_*`** keys in **`.env`** (auto-populated on first run via the leaker SWF). Alternatively set `BOT_UPSTREAM_SERVER_ADDRESS` + `BOT_UPSTREAM_SERVER_PORTS` manually.
+- **Unique outbound IP per client** where required (e.g. **Proxifier** + proxies/VPN). The `bind_ip` field in **`BOT_ACCOUNTS_JSON`** is a reminder only.
 
 ## Install
 
 From the repository root (Windows example):
 
 ```powershell
-cd D:\work\Automated-Transformice-user-ban
 python -m venv venv
 .\venv\Scripts\pip install -r requirements.txt
 ```
 
-Create or edit **`.env`** in the repo root (see **`.env.example`**): set **`BOT_ACCOUNTS_JSON`** to a JSON array — one object per client with unique **`proxy_port`** (main port your client connects to), optional **`label`**, and a **distinct `bind_ip`** for your own tracking (must be unique when present). For each slot the bot binds **satellite** (prefers `proxy_port + 10000`). A **policy port number** for **`loader_url`** is either shared (default **10801** via **`BOT_SHARED_FLASH_SOCKET_POLICY_PORT`**) or per-slot (prefers `proxy_port − 10000`). In **UI mode** the bot opens a shared Flash socket-policy server on that port (responds to Flash's `Security.loadPolicyFile` call with an allow-all `cross-domain-policy` XML); in **manual/headless** modes no policy listener is started. If a preferred port is already in use, the next free port is chosen automatically and logged.
+Create or edit **`.env`** in the repo root (see **`.env.example`**): set **`BOT_ACCOUNTS_JSON`** to a JSON array — one object per client with unique **`proxy_port`**, optional **`label`**, credentials (`username` / `password`), and optional **`bind_ip`** for Proxifier tracking.
 
 ### Build `ban_bot.exe` (optional)
-
-After **`pip install -r requirements.txt`** (see Install above), from the repo root:
 
 ```powershell
 .\venv\Scripts\python.exe build_exe.py
 ```
 
-**Important:** `caseus` is installed from GitHub via `requirements.txt`, and **`ban_bot.exe` must be built with the same Python** where `import caseus` and `import pak` work. If you use another interpreter to run `build_exe.py`, the frozen exe can start with `ModuleNotFoundError` for those packages. The spec aborts the build with a short message if they are missing.
-
-That writes **`ban_bot.exe`** in the **repository root**. Run it from that folder so **`.env`** and **`.env.example`** sit beside the exe (same layout as the repo). Session logs go to **`log.txt`** in the same folder.
+Writes **`ban_bot.exe`** in the repository root. Run it from that folder so `.env` and `TFMProxyLoader.swf` sit beside the exe.
 
 ## How to use the bot
 
-The proxy always sends **`LoginPacket`** after **`SystemInformationPacket`** using each row's **`username`** / **`password`** from **`BOT_ACCOUNTS_JSON`**.
-
-**Prerequisite:** something must open a **MAIN TCP** connection to each slot's proxy (typically **`127.0.0.1:<proxy_port>`**). Use **`--headless`** for built-in TCP clients, **`--ui`** to open Flash windows, or connect manually.
-
-1. **Start the bot** from the repo root (choose one connector style):
+1. **Start the bot:**
 
    ```powershell
-   # Headless (no visible game UI, needs TFM_SECRETS_*):
-   .\venv\Scripts\python.exe -m bot --headless
-
-   # UI mode (Flash windows per slot, needs TFMProxyLoader.swf + Flash projector):
-   .\venv\Scripts\python.exe -m bot --ui
-
-   # Manual (you connect each Flash/client yourself):
    .\venv\Scripts\python.exe -m bot
    ```
 
-   Or use **`ban_bot.exe --ui`** / **`ban_bot.exe --headless`** (exe folder must include **`.env`** / **`.env.example`** and for UI mode the Flash projector and `TFMProxyLoader.swf`).
+2. The bot starts proxies and launches Flash windows. **Click "Transformice"** in each Flash window to connect it through the proxy.
 
-2. The process logs which **proxy ports** are active. In UI mode, one Flash window per slot opens automatically after the proxies bind. In headless mode, caseus TCP clients connect instead. In manual mode, connect each game client through **tfm-proxy-loader** (or equivalent) to the **main port** for that slot.
+3. The proxy injects credentials automatically. Logs show **`[login] LoginPacket sent upstream`** and **`OK  [slot …] logged in as …`** per slot.
 
-3. **Login:** the proxy injects credentials from **`BOT_ACCOUNTS_JSON`**. Logs should include **`[login] LoginPacket sent upstream`** and **`OK  [slot …] logged in as …`** when **`LoginSuccessPacket`** arrives.
+4. The bot **waits until every slot has logged in** (timeout: **`BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC`**).
 
-4. The bot **waits until every slot has logged in** (or until **`BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC`** in **`.env`**). It does not ask you to press Enter for that.
-
-5. Enter the **target room** (the text you would type after `/room`, e.g. `*Racing1`).
+5. Enter the **target room** (e.g. `*Racing1`).
 
 6. Enter the **target player** as `nickname#tag` (e.g. `adrian#8912`).
 
-7. The bot sends **`/room`** on each connected slot (with a small stagger), then **`/ban`** on each with a **random 1–2 s** gap between accounts (defaults **`BOT_BAN_DELAY_MIN_SEC`** / **`BOT_BAN_DELAY_MAX_SEC`** in **`.env`**).
+7. The bot sends **`/room`** on each slot, then staggered **`/ban`** commands.
 
-8. After the round, it asks **`Ban someone else? (y/n)`**. Answer **`y`** to enter another room and target; **`n`** exits.
+8. After the round, answer **`Ban someone else? (y/n)`**.
 
 ### What you should see
 
-- **`OK  [slot …] logged in as …`** when a client finishes logging in through the proxy (per-slot confirmation).
-- Lines confirming **`/room`** and **`/ban`** sends per slot.
-- In UI mode: **`UI-mode: Flash Player (slot …) started (pid …)`** for each window launched.
-- Optional echoes when the server pushes chat or messages that look ban-related (see proxy handlers in `bot/ban_proxy.py`).
+- **`Loading TFM secrets …`** → leaker SWF runs, then **`Proxy upstream configured → <ip> ports …`**
+- **`Slot X: listen_host=… main=… satellite=…`** for each proxy
+- **`Shared Flash policy server listening on 0.0.0.0:10801`**
+- **`UI-mode: Flash Player (slot X) started (pid …)`** for each Flash window
+- After clicking Transformice in each window: **`[login] MAIN client connected`** → **`[login] upstream TCP connected`** → **`[login] LoginPacket sent upstream`** → **`OK  [slot X] logged in as …`**
+- **`All X slot(s) logged in.`** then the room/ban prompt
 
 ### Command-line flags
 
-- **`--ui`** — launch one Flash standalone player window per slot (UI mode; see above).
-- **`--no-ui`** — do not launch Flash windows even if **`BOT_UI_AUTO_LAUNCH_FLASH=true`** in **`.env`**.
-- **`--headless`** — start built-in caseus TCP clients (requires secrets in **`.env`**; see above).
-- **`--no-headless`** — do not start built-in clients even if **`BOT_HEADLESS_AUTO_LOGIN`** is true in **`.env`**.
-- **`--ui-sequential`** — open Flash windows one at a time: launch slot 1, wait for it to log in, then slot 2, and so on. Also enabled by **`BOT_UI_SEQUENTIAL_LOGIN=true`**. Timeout per slot: **`BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC`** (default 120 s).
-- **`--no-kill-stale`** — do not try to kill processes already listening on your configured proxy ports (e.g. `python -m bot --no-kill-stale` or `ban_bot.exe --no-kill-stale`).
+- **`--no-ui`** — do not auto-launch Flash windows; open Flash manually instead.
+- **`--ui-sequential`** — open Flash windows one at a time, waiting for each slot to log in before opening the next. Also enabled by **`BOT_UI_SEQUENTIAL_LOGIN=true`**. Timeout: **`BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC`** (default 120 s).
+- **`--no-kill-stale`** — do not try to kill processes already listening on configured proxy ports.
 
-### Loader SWF path
+### TFM secrets
 
-Point **`TFM_PROXY_SWF`** at `TFMProxyLoader.swf` if it is not in the repository root next to the exe. The proxy reads that file to build **`loader_url`** for packet login; in UI mode the Flash window also loads this SWF to connect to the proxy.
+On startup the bot tries to obtain live TFM crypto secrets in this order:
+1. **TFMSecretsLeaker.swf** via the Flash debug projector (`flashplayer_32_sa_debug.exe` in the repo root).
+2. **`TFM_SECRETS_*`** keys already in `.env` (written by a previous successful run).
+3. **`tfm-secrets`** CLI on PATH (if installed).
+
+Secrets are written back to `.env` on success so subsequent runs start instantly. Set **`BOT_SECRETS_ALWAYS_REFRESH=false`** to skip the live leaker and always use cached `.env` values.
+
+**Upstream port order:** by default the bot tries port **11801** first. Set **`BOT_UPSTREAM_CONNECT_SHUFFLE_PORTS=true`** to randomise. **`BOT_UPSTREAM_AUTO_SYNC_FROM_SECRETS`** (default true) overwrites `BOT_UPSTREAM_SERVER_ADDRESS/PORTS` from the live dump.
+
+### Upstream connectivity
+
+To diagnose TCP reachability to the game servers:
+
+```powershell
+.\venv\Scripts\python.exe -m bot.upstream_probe <host> 11801 12801 13801 14801
+```
+
+**WinError 121** is a connect timeout (firewall/VPN/routing) — not a secrets problem.
 
 ## Spec mapping (`Initial-Idea.txt`)
 
 | Requirement | Implementation |
 |-------------|----------------|
-| `config.py` with ~11 accounts + unique IP | **`.env`**: `BOT_ACCOUNTS_JSON` array; unique `proxy_port`; unique `bind_ip` when set (Proxifier / VPN discipline) |
+| ~11 accounts + unique IP | **`.env`**: `BOT_ACCOUNTS_JSON` array; unique `proxy_port`; unique `bind_ip` (Proxifier) |
 | Prompt for room + user | CLI `input()` in `bot/ban_cli.py` |
 | Wait until all accounts logged in | `login_success_event` per slot; `BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC` |
-| `/room` then `/ban` with 1–2 s jitter | `CommandPacket` in proxy; `BOT_ROOM_STAGGER_SEC`, `BOT_BAN_DELAY_*` in `.env` |
-| Per-action confirmation | Prints for each `/room` and `/ban` |
+| `/room` then `/ban` with 1–2 s jitter | `CommandPacket` via proxy; `BOT_ROOM_STAGGER_SEC`, `BOT_BAN_DELAY_*` |
+| Per-action confirmation | Logged for each `/room` and `/ban` |
 | "OK" on login | `LoginSuccessPacket` handler in `BanBotProxy` |
 | Loop "ban someone else?" | Main loop in `ban_cli.main` |
-| Chat hint when someone is banned | Room / general message listeners in `ban_proxy.py` |
-| Open Flash player (UI mode) | `--ui` / `BOT_UI_AUTO_LAUNCH_FLASH`; `bot/flash_launch.py` `launch_flash_players_for_slots` |
+| Open Flash player (UI mode) | Auto-launch via `bot/flash_launch.py`; `--no-ui` to skip |
 
 ## Legal / ToS
 
-Use only in line with **Transformice's terms** and applicable law. This repository is for automation you are explicitly allowed to perform.
+Use only in line with **Transformice's terms** and applicable law.
 
 ## Layout
 
 | Path | Role |
 |------|------|
 | `bot/` | Ban CLI + local proxy (`python -m bot`) |
-| `bot/flash_launch.py` | Build loader URLs + UI-mode Flash player launch |
-| `.env` | Per-client `BOT_ACCOUNTS_JSON`, `TFM_SECRETS_*`, and bot knobs (local; gitignored) |
+| `bot/ban_cli.py` | Main entry: start proxies, launch Flash, wait for logins, send ban commands |
+| `bot/ban_proxy.py` | Per-slot proxy: HandshakePacket forwarding, LoginPacket injection, ban commands |
+| `bot/secrets_loader.py` | TFM crypto secrets loading (leaker SWF / tfm-secrets CLI / .env) |
+| `bot/flash_launch.py` | Flash standalone player launch + SWF patching + trust file |
+| `bot/tfm_swf_port_patch.py` | Binary patch `TFMProxyLoader.swf` with proxy host:port |
+| `.env` | Per-client `BOT_ACCOUNTS_JSON`, `TFM_SECRETS_*`, and bot knobs |
 | `.env.example` | Template copied to `.env` on first run |
-| `ban_bot.spec`, `build_exe.py`, `requirements.txt` | Build **`ban_bot.exe`** in the repo root |
-| `ban_bot.exe` | Frozen Windows app (build output; gitignored) |
-| `Initial-Idea.txt` | Original feature / difficulty notes |
-| `Transformice*.swf`, `Transformice.exe`, `TFMProxyLoader.swf` | Client / loader assets (as committed) |
-| `flashplayer_32_sa.exe` / `flashplayer_32_sa_debug.exe` | Flash standalone projector for UI mode (place here or set `BOT_UI_FLASH_PLAYER_PATH`) |
+| `TFMProxyLoader.swf` | Multi-game loader SWF; patched per slot to connect to the local proxy |
+| `flashplayer_32_sa_debug.exe` | Flash standalone projector for UI mode and TFMSecretsLeaker.swf |
