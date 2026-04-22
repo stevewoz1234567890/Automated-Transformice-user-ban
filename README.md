@@ -33,7 +33,7 @@ python -m venv venv
 .\venv\Scripts\pip install -r requirements.txt
 ```
 
-Create or edit **`.env`** in the repo root (see **`.env.example`**): set **`BOT_ACCOUNTS_JSON`** to a JSON array — one object per client with unique **`proxy_port`** (main port your client connects to), optional **`label`**, and a **distinct `bind_ip`** for your own tracking (must be unique when present). For each slot the bot binds **satellite** (prefers `proxy_port + 10000`). A **policy port number** for **`loader_url`** is either shared (default **10801** via **`BOT_SHARED_FLASH_SOCKET_POLICY_PORT`**) or per-slot (prefers `proxy_port − 10000`); the bot does **not** open Flash socket-policy listeners. If a preferred port is already in use, the next free port is chosen automatically and logged.
+Create or edit **`.env`** in the repo root (see **`.env.example`**): set **`BOT_ACCOUNTS_JSON`** to a JSON array — one object per client with unique **`proxy_port`** (main port your client connects to), optional **`label`**, and a **distinct `bind_ip`** for your own tracking (must be unique when present). For each slot the bot binds **satellite** (prefers `proxy_port + 10000`). A **policy port number** for **`loader_url`** is either shared (default **10801** via **`BOT_SHARED_FLASH_SOCKET_POLICY_PORT`**) or per-slot (prefers `proxy_port − 10000`). In **UI mode** the bot opens a shared Flash socket-policy server on that port (responds to Flash's `Security.loadPolicyFile` call with an allow-all `cross-domain-policy` XML); in **manual/headless** modes no policy listener is started. If a preferred port is already in use, the next free port is chosen automatically and logged.
 
 ### Build `ban_bot.exe` (optional)
 
@@ -49,7 +49,7 @@ That writes **`ban_bot.exe`** in the **repository root**. Run it from that folde
 
 ## How to use the bot
 
-**Option A** — packet login from the proxy — is spelled out in root [`method.md`](method.md). The proxy always sends **`LoginPacket`** after **`SystemInformationPacket`** using each row's **`username`** / **`password`** from **`BOT_ACCOUNTS_JSON`**.
+The proxy always sends **`LoginPacket`** after **`SystemInformationPacket`** using each row's **`username`** / **`password`** from **`BOT_ACCOUNTS_JSON`**.
 
 **Prerequisite:** something must open a **MAIN TCP** connection to each slot's proxy (typically **`127.0.0.1:<proxy_port>`**). Use **`--headless`** for built-in TCP clients, **`--ui`** to open Flash windows, or connect manually.
 
@@ -70,7 +70,7 @@ That writes **`ban_bot.exe`** in the **repository root**. Run it from that folde
 
 2. The process logs which **proxy ports** are active. In UI mode, one Flash window per slot opens automatically after the proxies bind. In headless mode, caseus TCP clients connect instead. In manual mode, connect each game client through **tfm-proxy-loader** (or equivalent) to the **main port** for that slot.
 
-3. **Login:** the proxy injects credentials from **`BOT_ACCOUNTS_JSON`**. Logs should include **`LoginPacket sent upstream by proxy (packet login)`** and **`OK [slot …] logged in as …`** when **`LoginSuccessPacket`** arrives.
+3. **Login:** the proxy injects credentials from **`BOT_ACCOUNTS_JSON`**. Logs should include **`[login] LoginPacket sent upstream`** and **`OK  [slot …] logged in as …`** when **`LoginSuccessPacket`** arrives.
 
 4. The bot **waits until every slot has logged in** (or until **`BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC`** in **`.env`**). It does not ask you to press Enter for that.
 
@@ -84,7 +84,7 @@ That writes **`ban_bot.exe`** in the **repository root**. Run it from that folde
 
 ### What you should see
 
-- **`OK [slot …] logged in as …`** when a client finishes logging in through the proxy (per-slot confirmation).
+- **`OK  [slot …] logged in as …`** when a client finishes logging in through the proxy (per-slot confirmation).
 - Lines confirming **`/room`** and **`/ban`** sends per slot.
 - In UI mode: **`UI-mode: Flash Player (slot …) started (pid …)`** for each window launched.
 - Optional echoes when the server pushes chat or messages that look ban-related (see proxy handlers in `bot/ban_proxy.py`).
@@ -95,6 +95,7 @@ That writes **`ban_bot.exe`** in the **repository root**. Run it from that folde
 - **`--no-ui`** — do not launch Flash windows even if **`BOT_UI_AUTO_LAUNCH_FLASH=true`** in **`.env`**.
 - **`--headless`** — start built-in caseus TCP clients (requires secrets in **`.env`**; see above).
 - **`--no-headless`** — do not start built-in clients even if **`BOT_HEADLESS_AUTO_LOGIN`** is true in **`.env`**.
+- **`--ui-sequential`** — open Flash windows one at a time: launch slot 1, wait for it to log in, then slot 2, and so on. Also enabled by **`BOT_UI_SEQUENTIAL_LOGIN=true`**. Timeout per slot: **`BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC`** (default 120 s).
 - **`--no-kill-stale`** — do not try to kill processes already listening on your configured proxy ports (e.g. `python -m bot --no-kill-stale` or `ban_bot.exe --no-kill-stale`).
 
 ### Loader SWF path
@@ -130,6 +131,5 @@ Use only in line with **Transformice's terms** and applicable law. This reposito
 | `ban_bot.spec`, `build_exe.py`, `requirements.txt` | Build **`ban_bot.exe`** in the repo root |
 | `ban_bot.exe` | Frozen Windows app (build output; gitignored) |
 | `Initial-Idea.txt` | Original feature / difficulty notes |
-| `method.md` | Option A: proxy packet login, external MAIN TCP |
 | `Transformice*.swf`, `Transformice.exe`, `TFMProxyLoader.swf` | Client / loader assets (as committed) |
 | `flashplayer_32_sa.exe` / `flashplayer_32_sa_debug.exe` | Flash standalone projector for UI mode (place here or set `BOT_UI_FLASH_PLAYER_PATH`) |
