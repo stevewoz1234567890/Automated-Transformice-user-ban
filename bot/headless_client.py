@@ -645,6 +645,7 @@ def _run_one_slot_headless(
     row: dict[str, object],
     cfg: object,
     base_secrets: Secrets,
+    exit_after_login_success: bool | None = None,
 ) -> None:
     label = state.label
     main_port = state.port
@@ -668,6 +669,11 @@ def _run_one_slot_headless(
         connect_host,
         main_port,
     )
+    # exit_after_login_success=False keeps the proxy connection alive after login so that
+    # send_room_command / send_ban_command can still use the active main connection.
+    # The caller may override this; default falls back to cfg.
+    if exit_after_login_success is None:
+        exit_after_login_success = bool(getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True))
     try:
         asyncio.run(
             _run_one_client(
@@ -677,9 +683,7 @@ def _run_one_slot_headless(
                 start_room=start_room,
                 login_success_event=state.login_success_event,
                 connect_to_satellite=bool(getattr(cfg, "HEADLESS_CONNECT_TO_SATELLITE", True)),
-                exit_after_login_success=bool(
-                    getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True)
-                ),
+                exit_after_login_success=exit_after_login_success,
             )
         )
         if not state.login_success_event.is_set():
@@ -705,23 +709,25 @@ def start_headless_client_threads(
     base_secrets: Secrets | None = None,
 ) -> bool:
     """
-    Run headless TCP login **one slot at a time** (main thread): each ``HeadlessProxyClient`` runs
-    to completion before the next starts. This avoids hammering the game server with parallel
-    handshakes from one host.
+    Start each slot's headless login in a background daemon thread with staggered starts.
 
-    ``HEADLESS_LOGIN_STAGGER_SEC`` (default 6) is the pause **between** finishing one slot and
-    starting the next (not used for overlapping parallel starts). Increase if you see WinError 121
-    on later slots (rate limiting / connect timeouts).
+    Each ``HeadlessProxyClient`` runs with ``exit_after_login_success=False`` so the TCP
+    connection to the proxy stays open after login.  This keeps ``BanBotProxy.main_clients``
+    populated so that ``send_room_command`` / ``send_ban_command`` have an active connection
+    to write to.
 
-    ``HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES`` (default 3): if > 0, stop after that many slots
-    in a row without ``LoginSuccess`` (avoids hammering upstream when the first slots fail). Set to 0
-    to disable.
+    The login phase is still serialised: the main thread waits for the current slot's
+    ``login_success_event`` (or a per-slot timeout) before sleeping the stagger delay and
+    starting the next slot.  This preserves the WinError-121 adaptive gap and consecutive-
+    failure safeguard.
 
-    After a slot hits upstream **WinError 121**, the pause before the next slot increases by
-    ``HEADLESS_STAGGER_WIN121_EXTRA_SEC`` up to ``HEADLESS_STAGGER_MAX_SEC``.
+    ``HEADLESS_LOGIN_STAGGER_SEC`` (default 6) — pause **after** each slot's login before the
+    next slot starts.
 
-    Returns ``False`` if the loop stopped early because of ``HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES``;
-    ``True`` if every slot received a headless attempt (even when some attempts fail).
+    ``HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES`` (default 3) — stop early if > 0 slots
+    in a row fail to log in.
+
+    Returns ``False`` if stopped early; ``True`` if every slot received a headless attempt.
     """
     base = base_secrets if base_secrets is not None else load_secrets_base(cfg)
     base_gap = float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 6.0) or 0.0)
@@ -730,6 +736,8 @@ def start_headless_client_threads(
     win121_extra = float(getattr(cfg, "HEADLESS_STAGGER_WIN121_EXTRA_SEC", 4.0) or 0.0)
     gap_cap = float(getattr(cfg, "HEADLESS_STAGGER_MAX_SEC", 15.0) or 15.0)
     max_consec = int(getattr(cfg, "HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES", 0) or 0)
+    # How long to wait for each slot's login before moving on (generous: base_gap * 3 + 30s).
+    login_wait_sec = max(30.0, base_gap * 3 + 30.0)
 
     pairs = list(zip(states, raw_accounts))
     consec_fail = 0
@@ -745,12 +753,30 @@ def start_headless_client_threads(
                 max_consec,
             )
             return False
-        if i > 0 and adaptive_gap > 0:
-            time.sleep(adaptive_gap)
+
         w121_ev = getattr(state, "headless_seen_upstream_win121", None)
         if w121_ev is not None:
             w121_ev.clear()
-        _run_one_slot_headless(state=state, row=row, cfg=cfg, base_secrets=base)
+
+        # Run in a background daemon thread so the connection stays open after login.
+        # exit_after_login_success=False keeps main_clients populated for command sending.
+        t = threading.Thread(
+            target=_run_one_slot_headless,
+            kwargs=dict(
+                state=state,
+                row=row,
+                cfg=cfg,
+                base_secrets=base,
+                exit_after_login_success=False,
+            ),
+            name=f"headless-slot-{state.label}",
+            daemon=True,
+        )
+        t.start()
+
+        # Wait for login result before starting the next slot (preserves sequential stagger).
+        state.login_success_event.wait(timeout=login_wait_sec)
+
         if w121_ev is not None and w121_ev.is_set() and win121_extra > 0:
             before = adaptive_gap
             adaptive_gap = min(gap_cap, adaptive_gap + win121_extra)
@@ -763,8 +789,13 @@ def start_headless_client_threads(
                     adaptive_gap,
                     gap_cap,
                 )
+
         if state.login_success_event.is_set():
             consec_fail = 0
         else:
             consec_fail += 1
+
+        if i < len(pairs) - 1 and adaptive_gap > 0:
+            time.sleep(adaptive_gap)
+
     return True

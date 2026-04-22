@@ -855,12 +855,12 @@ def main(argv: list[str] | None = None) -> None:
     _wait_for_all_slots_logged_in(states, cfg)
 
     while True:
-        room = input("Target room (text after /room, e.g. *Racing1): ").strip()
+        room = input("Target room (text after /room, e.g. *Racing1): ").strip().lstrip("\ufeff")
         logger.info("Target room entered: %r", room)
         if not room:
             logger.info("Empty room; try again.")
             continue
-        target = input("Target user (nickname#tag, e.g. adrian#8912): ").strip()
+        target = input("Target user (nickname#tag, e.g. adrian#8912): ").strip().lstrip("\ufeff")
         logger.info("Target user entered: %r", target)
         if not target:
             logger.info("Empty user; try again.")
@@ -868,7 +868,7 @@ def main(argv: list[str] | None = None) -> None:
 
         run_ban_round(states, room, target, cfg)
 
-        again = input('Ban someone else? (y/n): ').strip().lower()
+        again = input('Ban someone else? (y/n): ').strip().lstrip("\ufeff").lower()
         logger.info("Ban someone else? answered: %r", again)
         if again not in ("y", "yes"):
             break
