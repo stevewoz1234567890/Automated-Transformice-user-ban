@@ -252,6 +252,12 @@ class BanBotProxy(Proxy):
         self.known_rooms: dict[str, int] = {}
         self._room_list_ready = threading.Event()
         self.register_packet_listener(self._on_room_list_cb, clientbound.RoomListPacket)
+        # Player list collected after joining a room; key = username, value = session_id.
+        self.known_players: dict[str, int] = {}
+        self._player_list_ready = threading.Event()
+        self._player_list_version: int = 0
+        self.register_packet_listener(self._on_set_player_list, clientbound.SetPlayerListPacket)
+        self.register_packet_listener(self._on_update_player_list, clientbound.UpdatePlayerListPacket)
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(self._vl_handshake_sb, serverbound.HandshakePacket)
         if self._packet_auto_login:
@@ -699,6 +705,50 @@ class BanBotProxy(Proxy):
                 num = 0
             self.known_rooms[name] = num
         self._room_list_ready.set()
+
+    async def _on_set_player_list(self, source, packet):
+        """Full player list sent by the server when we join a room (arrives via satellite)."""
+        self.known_players.clear()
+        for p in (getattr(packet, "players", None) or []):
+            username = (getattr(p, "username", "") or "").strip()
+            if username:
+                self.known_players[username] = getattr(p, "session_id", 0) or 0
+        self._player_list_version += 1
+        self._player_list_ready.set()
+
+    async def _on_update_player_list(self, source, packet):
+        """Single player joining the room after us (arrives via satellite)."""
+        p = getattr(packet, "player", None)
+        if p is None:
+            return
+        username = (getattr(p, "username", "") or "").strip()
+        if username:
+            self.known_players[username] = getattr(p, "session_id", 0) or 0
+
+    async def join_room(self, room_name: str, community: str = "") -> bool:
+        """
+        Send ``JoinRoomPacket`` directly to the upstream main server as if the
+        Flash client requested the room change.  This is what the game client
+        sends when the player selects a room from the list (as opposed to the
+        ``/room`` slash-command).  The server responds with ``JoinedRoomPacket``
+        + ``SetPlayerListPacket`` (and other setup) which our listeners capture.
+        """
+        main_conn = self._main_write_conn()
+        if main_conn is None:
+            logger.warning("Slot %s: join_room — no main connection", self.slot_label)
+            return False
+        name = room_name.strip()
+        await main_conn.write_packet_instance(
+            serverbound.JoinRoomPacket(
+                community=community,
+                name=name,
+                password="",
+                auto=False,
+                customization=None,
+            )
+        )
+        logger.info("Slot %s: sent JoinRoomPacket %r", self.slot_label, name)
+        return True
 
     async def request_room_list(self, game_mode_int: int = 1) -> bool:
         """

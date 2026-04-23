@@ -444,11 +444,81 @@ def _pick_room(states: list[SlotState]) -> str:
         return input("Target room (text after /room, e.g. *Racing1): ").strip()
 
 
-def run_ban_round(states: list[SlotState], room: str, target_user: str, cfg) -> None:
-    stagger = float(getattr(cfg, "ROOM_STAGGER_SEC", 0.15))
-    dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
-    dmax = float(getattr(cfg, "BAN_DELAY_MAX_SEC", 2.0))
+def _collect_player_list_via_join(
+    states: list[SlotState],
+    room: str,
+    *,
+    timeout_sec: float = 12.0,
+) -> list[str]:
+    """
+    Send ``JoinRoomPacket`` to the first live slot's upstream main server and
+    wait for a new ``SetPlayerListPacket``.  This properly triggers the server
+    to send the player list for the target room.
 
+    Returns a sorted list of unique usernames.
+    """
+    live = [s for s in states if s.proxy and s.proxy.main_clients]
+    if not live:
+        return []
+
+    slot = live[0]
+    proxy = slot.proxy
+    version_before = proxy._player_list_version
+
+    try:
+        _run_coro_on_slot(slot, proxy.join_room(room))
+    except Exception as exc:
+        logger.warning("_collect_player_list_via_join: join_room failed: %s", exc)
+        return []
+
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if proxy._player_list_version != version_before:
+            time.sleep(0.8)  # let UpdatePlayerListPackets accumulate
+            break
+        time.sleep(0.2)
+
+    if proxy._player_list_version == version_before:
+        return []
+
+    return sorted(proxy.known_players.keys(), key=str.lower)
+
+
+def _show_and_pick_player(states: list[SlotState], room: str) -> str:
+    """
+    Use ``JoinRoomPacket`` to join *room* with the first slot, show the player
+    list, and let the user pick a target by number or type a nickname directly.
+    """
+    _flush_log_handlers()
+    logger.info("Collecting player list for %r...", room)
+    _flush_log_handlers()
+
+    players = _collect_player_list_via_join(states, room)
+
+    if players:
+        print(f"\nPlayers in {room!r} ({len(players)} total):", flush=True)
+        for i, name in enumerate(players, 1):
+            print(f"  {i:3d}. {name}", flush=True)
+        print(flush=True)
+        _flush_log_handlers()
+        choice = input("Enter player number or nickname (e.g. Zizao#0000): ").strip()
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(players):
+                chosen = players[idx]
+                logger.info("Player selected by number %s: %r", choice, chosen)
+                return chosen
+        logger.info("Player entered directly: %r", choice)
+        return choice
+    else:
+        logger.info("No player list received — enter nickname manually.")
+        _flush_log_handlers()
+        return input("Target user (nickname#tag, e.g. Zizao#0000): ").strip()
+
+
+def send_room_to_all(states: list[SlotState], room: str, cfg) -> None:
+    """Send /room to every slot (staggered). Call before collecting player list."""
+    stagger = float(getattr(cfg, "ROOM_STAGGER_SEC", 0.15))
     for s in states:
         if s.proxy is None:
             continue
@@ -456,8 +526,11 @@ def run_ban_round(states: list[SlotState], room: str, target_user: str, cfg) -> 
         logger.info("[slot %s] /room -> %s", s.label, "sent" if ok else "FAILED")
         time.sleep(stagger)
 
-    time.sleep(0.5)
 
+def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
+    """Send /ban to every slot (staggered). Call after player is chosen."""
+    dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
+    dmax = float(getattr(cfg, "BAN_DELAY_MAX_SEC", 2.0))
     active = [s for s in states if s.proxy is not None]
     for i, s in enumerate(active):
         ok = _run_coro_on_slot(s, s.proxy.send_ban_command(target_user))
@@ -469,8 +542,13 @@ def run_ban_round(states: list[SlotState], room: str, target_user: str, cfg) -> 
         )
         if i < len(active) - 1:
             time.sleep(random.uniform(dmin, dmax))
-
     logger.info("All accounts finished sending /ban commands for this round.")
+
+
+def run_ban_round(states: list[SlotState], room: str, target_user: str, cfg) -> None:
+    send_room_to_all(states, room, cfg)
+    time.sleep(0.5)
+    send_ban_to_all(states, target_user, cfg)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -877,14 +955,14 @@ def main(argv: list[str] | None = None) -> None:
         if not room:
             logger.info("Empty room; try again.")
             continue
-        _flush_log_handlers()
-        target = input("Target user (nickname#tag, e.g. adrian#8912): ").strip()
-        logger.info("Target user entered: %r", target)
+
+        target = _show_and_pick_player(states, room)
+        logger.info("Target user: %r", target)
         if not target:
             logger.info("Empty user; try again.")
             continue
 
-        run_ban_round(states, room, target, cfg)
+        send_ban_to_all(states, target, cfg)
 
         _flush_log_handlers()
         again = input('Ban someone else? (y/n): ').strip().lower()
