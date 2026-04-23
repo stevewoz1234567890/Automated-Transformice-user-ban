@@ -45,6 +45,12 @@ def recompress_zws_body(zws_original: bytes, new_body: bytes) -> bytes:
     # ZWS/CWS: FileLength (bytes 4–8) is total UNCOMPRESSED size (8-byte header + decompressed
     # payload), not the on-disk compressed size. Wrong value breaks Flash parsing / runtime.
     struct.pack_into("<I", out, 4, 8 + len(new_body))
+    # ZWS-specific CompressedLength field at bytes 8–12 tells Flash how many bytes of LZMA data
+    # follow the 5-byte LZMA-properties header. If we leave the original value in place and the
+    # re-compressed stream is SHORTER, Flash reads past EOF and silently refuses to start the
+    # SWF (blank window, no error). Even a few bytes short is fatal. Keep this in sync with the
+    # actual compressed payload size.
+    struct.pack_into("<I", out, 8, len(new_comp))
     return bytes(out)
 
 
@@ -110,8 +116,10 @@ def build_patched_loader_swf(
     h9 = nine_char_connect_host(connect_host)
     cache_dir.mkdir(parents=True, exist_ok=True)
     safe_host = h9.replace(":", "_").replace("/", "_")
-    # Bump name so caches built with the old (wrong FileLength) patcher are ignored.
-    out = cache_dir / f"TFMProxyLoader_patched_{safe_host}_{port}_zwsflen.swf"
+    # Bump suffix so caches built with older patchers are ignored. Previous suffix "_zwsflen"
+    # left the ZWS CompressedLength field stale, which broke SWFs whose re-compressed body was
+    # shorter than the original compressed stream (Flash would silently show a blank window).
+    out = cache_dir / f"TFMProxyLoader_patched_{safe_host}_{port}_zwsflen2.swf"
     if out.is_file() and out.stat().st_size > 0:
         logger.debug("Using cached patched loader port %s -> %s", port, out)
         return out

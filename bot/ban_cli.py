@@ -955,6 +955,93 @@ def main(argv: list[str] | None = None) -> None:
                     "Slot %s: PROXY_VERBOSE_LOGIN_FLOW=True — extra login-phase packet lines in log.",
                     st.label,
                 )
+
+            # Fast early retry clicks: the initial post_open_delay click (default ~1.15s) frequently
+            # lands before the loader SWF has drawn the Transformice button, especially on later slots
+            # when earlier Flash instances are still consuming CPU. The main poll loop below only
+            # retries every FLASH_LOGIN_WAIT_POLL_SEC (default 45s, floor 10s), which is way too slow
+            # to recover. Do a few aggressive re-clicks in the first ~20s while MAIN TCP is still
+            # missing so slots without bind_ip (which can't rely on Proxifier warming the port) still
+            # reach the proxy.
+            if (
+                st.flash_pid is not None
+                and not args.launch_flash_no_click
+                and not st.flash_main_tcp_seen
+                and not st.login_success_event.is_set()
+            ):
+                early_interval = float(
+                    getattr(cfg, "FLASH_LOADER_EARLY_RETRY_INTERVAL_SEC", 3.0)
+                )
+                early_retries = int(getattr(cfg, "FLASH_LOADER_EARLY_RETRY_COUNT", 5))
+                early_interval = max(0.5, min(early_interval, 15.0))
+                early_retries = max(0, min(early_retries, 20))
+                frac_x_early = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_X", 0.50))
+                frac_y_early = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_Y", 0.55))
+                for attempt in range(1, early_retries + 1):
+                    deadline_early = time.monotonic() + early_interval
+                    while time.monotonic() < deadline_early:
+                        if (
+                            st.flash_main_tcp_seen
+                            or st.login_success_event.is_set()
+                        ):
+                            break
+                        time.sleep(0.2)
+                    if st.flash_main_tcp_seen or st.login_success_event.is_set():
+                        logger.info(
+                            "Slot %s: MAIN TCP observed during early retry window (before attempt %d/%d)",
+                            st.label, attempt, early_retries,
+                        )
+                        break
+                    logger.info(
+                        "Slot %s: no MAIN TCP after ~%.1fs — re-clicking Transformice "
+                        "loader at several positions [early retry %d/%d]",
+                        st.label,
+                        early_interval * attempt,
+                        attempt, early_retries,
+                    )
+                    # Dump every visible top-level window belonging to this Flash PID
+                    # — if a Flash error popup / "Restricted content" dialog appeared,
+                    # we'll see it here and know clicks need to target it, not the
+                    # main loader window.
+                    try:
+                        windows = flash_launch.list_flash_windows(st.flash_pid)
+                        logger.info(
+                            "Slot %s: flash_pid=%s has %d top-level window(s): %s",
+                            st.label, st.flash_pid, len(windows),
+                            ", ".join(
+                                f"HWND={w['hwnd']} title={w['title']!r} "
+                                f"size={w['width']}x{w['height']}"
+                                for w in windows
+                            ) or "(none)",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Slot %s: list_flash_windows raised", st.label
+                        )
+                    # Try several candidate positions on each retry: the Transformice
+                    # entry in the loader has shifted between builds (sometimes ~0.55y,
+                    # sometimes ~0.45y, sometimes lower on screens that render a cached
+                    # "Continue" button). Hammering a small cluster is far cheaper than
+                    # waiting for the 45s slow-poll retry to land on the right pixel.
+                    click_positions = [
+                        (frac_x_early, frac_y_early),
+                        (frac_x_early, 0.45),
+                        (frac_x_early, 0.65),
+                        (frac_x_early, 0.50),
+                        (frac_x_early, 0.60),
+                    ]
+                    for fx_c, fy_c in click_positions:
+                        if (
+                            st.flash_main_tcp_seen
+                            or st.login_success_event.is_set()
+                        ):
+                            break
+                        flash_launch.click_transformice_in_loader(
+                            st.flash_pid, st.label,
+                            frac_x=fx_c, frac_y=fy_c,
+                        )
+                        time.sleep(0.15)
+
             while True:
                 left = deadline - time.monotonic()
                 if left <= 0:
@@ -1016,6 +1103,30 @@ def main(argv: list[str] | None = None) -> None:
                     st.label,
                     login_timeout,
                 )
+                if (
+                    bool(getattr(cfg, "FLASH_CLOSE_ON_LOGIN_FAIL", True))
+                    and st.flash_pid
+                    and flash_launch.flash_pid_is_alive(st.flash_pid)
+                ):
+                    logger.info(
+                        "Slot %s: closing stale Flash window PID=%s "
+                        "(BOT_FLASH_CLOSE_ON_LOGIN_FAIL=true).",
+                        st.label, st.flash_pid,
+                    )
+                    try:
+                        flash_launch.close_flash_window(
+                            st.flash_pid, st.label,
+                            grace_sec=float(
+                                getattr(cfg, "FLASH_CLOSE_GRACE_SEC", 2.0)
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Slot %s: close_flash_window raised", st.label,
+                        )
+                    st.flash_pid = None
+                if st.error is None:
+                    st.error = f"no login within {login_timeout}s"
             time.sleep(max(0.0, stagger_after))
     _wait_for_game_clients(states, auto_flash_launched=auto_flash)
 

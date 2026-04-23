@@ -299,27 +299,79 @@ def _win_best_click_hwnd(hwnd: int) -> int:
     return hwnd
 
 
-def _win_force_foreground(hwnd: int) -> None:
-    """Best-effort focus so the following synthetic mouse events hit this window."""
+def _win_force_foreground(hwnd: int) -> bool:
+    """
+    Best-effort focus so the following synthetic mouse events hit this window.
+
+    Returns True if ``hwnd`` ends up as the foreground window. After a few Flash
+    launches the Windows foreground-lock silently blocks ``SetForegroundWindow``
+    from the bot's process and a system-level click (``mouse_event``) then lands on
+    whatever app does own the foreground (e.g. the IDE running the bot). To get
+    around that, we:
+
+      1. Lower the ``ForegroundLockTimeout`` for this call via ``SystemParametersInfo``.
+      2. Inject a benign synthetic key event via ``keybd_event`` — Windows treats
+         that as user input, which resets the foreground-lock timer for the current
+         thread so the following ``SetForegroundWindow`` call is honoured.
+      3. Fall back to ``AttachThreadInput(fg_tid, cur_tid)`` + ``SetForegroundWindow`` +
+         ``BringWindowToTop`` as the previous implementation did.
+      4. Verify with ``GetForegroundWindow()`` and retry up to 3 times.
+    """
     import ctypes
     from ctypes import wintypes
 
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
 
-    fg = user32.GetForegroundWindow()
-    cur_tid = kernel32.GetCurrentThreadId()
-    fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
-
-    if fg_tid and fg_tid != cur_tid:
-        user32.AttachThreadInput(fg_tid, cur_tid, True)
+    SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+    SPIF_SENDCHANGE = 0x02
     try:
-        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        user32.SetForegroundWindow(hwnd)
-        user32.BringWindowToTop(hwnd)
-    finally:
+        user32.SystemParametersInfoW(
+            SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, SPIF_SENDCHANGE
+        )
+    except OSError:
+        pass
+
+    def _is_foreground(h: int) -> bool:
+        return int(user32.GetForegroundWindow() or 0) == int(h)
+
+    for _ in range(3):
+        if _is_foreground(hwnd):
+            return True
+
+        # Synthetic key stroke: pretends the user just pressed a key, which resets
+        # the foreground-lock counter so SetForegroundWindow from a background
+        # process is accepted on the very next call. VK_MENU (ALT) is the common
+        # choice; we down+up it so no keyboard state leaks.
+        VK_MENU = 0x12
+        KEYEVENTF_KEYUP = 0x0002
+        try:
+            user32.keybd_event(VK_MENU, 0, 0, 0)
+            user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+        except OSError:
+            pass
+
+        fg = user32.GetForegroundWindow()
+        cur_tid = kernel32.GetCurrentThreadId()
+        fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        attached = False
         if fg_tid and fg_tid != cur_tid:
-            user32.AttachThreadInput(fg_tid, cur_tid, False)
+            if user32.AttachThreadInput(fg_tid, cur_tid, True):
+                attached = True
+        try:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+            user32.SetActiveWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(fg_tid, cur_tid, False)
+
+        if _is_foreground(hwnd):
+            return True
+        time.sleep(0.05)
+
+    return _is_foreground(hwnd)
 
 
 def _win_resolve_click_hwnd(
@@ -394,7 +446,7 @@ def _win_click_client_fraction(
             last_fail = "no HWND"
             time.sleep(0.1 + attempt * 0.02)
             continue
-        _win_force_foreground(hwnd_cur)
+        is_fg = _win_force_foreground(hwnd_cur)
         time.sleep(0.08 + attempt * 0.03)
         rc_top = RECT()
         if not user32.GetClientRect(hwnd_cur, ctypes.byref(rc_top)):
@@ -426,20 +478,75 @@ def _win_click_client_fraction(
             time.sleep(0.1)
             continue
 
-        user32.SetCursorPos(pt.x, pt.y)
-        time.sleep(0.06)
-        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.03)
-        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        if double_click:
-            time.sleep(0.05)
+        # Check which window actually sits under the target pixel *right now*. If
+        # it's not our Flash hwnd (or a descendant), a synthetic cursor click will
+        # go to whatever app owns that pixel (e.g. the IDE). In that case we must
+        # use PostMessage so the WM_LBUTTONDOWN is delivered to Flash directly.
+        user32.WindowFromPoint.argtypes = [POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+        user32.GetAncestor.restype = wintypes.HWND
+        hwnd_at_point_raw = user32.WindowFromPoint(POINT(pt.x, pt.y))
+        hwnd_at_point = int(hwnd_at_point_raw) if hwnd_at_point_raw else 0
+        if hwnd_at_point:
+            root_raw = user32.GetAncestor(hwnd_at_point_raw, 2)  # GA_ROOT
+            root_at_point = int(root_raw) if root_raw else hwnd_at_point
+        else:
+            root_at_point = 0
+        point_belongs_to_flash = (
+            hwnd_at_point == target
+            or hwnd_at_point == hwnd_cur
+            or root_at_point == hwnd_cur
+            or root_at_point == target
+        )
+
+        WM_MOUSEMOVE = 0x0200
+        WM_LBUTTONDOWN = 0x0201
+        WM_LBUTTONUP = 0x0202
+        MK_LBUTTON = 0x0001
+        lparam = (cy & 0xFFFF) << 16 | (cx & 0xFFFF)
+
+        # Always post the click directly to the Flash HWND (client-relative coords)
+        # so we guarantee the WM_LBUTTON* reaches Flash regardless of whether some
+        # other app stole the foreground between force_foreground() and now.
+        try:
+            user32.PostMessageW(target, WM_MOUSEMOVE, 0, lparam)
+            user32.PostMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+            time.sleep(0.03)
+            user32.PostMessageW(target, WM_LBUTTONUP, 0, lparam)
+            if double_click:
+                time.sleep(0.05)
+                user32.PostMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+                time.sleep(0.03)
+                user32.PostMessageW(target, WM_LBUTTONUP, 0, lparam)
+        except OSError as e:
+            last_fail = f"PostMessage failed: {e}"
+            time.sleep(0.1)
+            continue
+
+        # Also fire a real cursor click, but only when the pixel under the target
+        # truly belongs to the Flash window — otherwise we'd be clicking on the IDE
+        # behind it. Flash accepts either event, so one of the two paths will land.
+        if is_fg and point_belongs_to_flash:
+            user32.SetCursorPos(pt.x, pt.y)
+            time.sleep(0.06)
             user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
             time.sleep(0.03)
             user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            if double_click:
+                time.sleep(0.05)
+                user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                time.sleep(0.03)
+                user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            click_mode = "PostMessage+mouse_event"
+        else:
+            click_mode = "PostMessage-only"
+
         if debug_label:
             logger.info(
                 "FLASH_LOGIN_DEBUG %s: target_hwnd=%s toplevel_hwnd=%s client=(%s,%s) screen=(%s,%s) "
-                "frac=(%.4f,%.4f) client_size=%sx%s attempt=%s/%s",
+                "frac=(%.4f,%.4f) client_size=%sx%s attempt=%s/%s mode=%s fg=%s "
+                "hwnd_at_point=%s root_at_point=%s flash_under_cursor=%s",
                 debug_label,
                 target,
                 hwnd_cur,
@@ -453,6 +560,11 @@ def _win_click_client_fraction(
                 h,
                 attempt + 1,
                 retries,
+                click_mode,
+                is_fg,
+                hwnd_at_point,
+                root_at_point,
+                point_belongs_to_flash,
             )
         return True
 
@@ -1230,6 +1342,147 @@ def minimize_flash_window(pid: int, slot_label: str) -> bool:
     ctypes.windll.user32.ShowWindow(hwnd, SW_MINIMIZE)
     logger.info("Minimized Flash window HWND=%s (slot %s)", hwnd, slot_label)
     return True
+
+
+def close_flash_window(
+    pid: int,
+    slot_label: str,
+    *,
+    grace_sec: float = 2.0,
+    force_terminate: bool = True,
+) -> bool:
+    """
+    Close the Flash projector window for *pid*.
+
+    Tries a graceful close first (``WM_CLOSE`` to every top-level window owned by the PID),
+    waits up to ``grace_sec`` for the process to exit, then (if ``force_terminate``) calls
+    ``TerminateProcess`` so stale Flash tabs never linger after a failed login.
+
+    Returns True if the process is no longer alive when the call returns.
+    """
+    if sys.platform != "win32" or pid <= 0:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    WM_CLOSE = 0x0010
+
+    hwnds: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(hwnd, _lparam):
+        owner_pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        if int(owner_pid.value) == int(pid) and user32.IsWindowVisible(hwnd):
+            hwnds.append(int(hwnd))
+        return True
+
+    try:
+        user32.EnumWindows(_enum, 0)
+    except OSError:
+        pass
+
+    for h in hwnds:
+        try:
+            user32.PostMessageW(h, WM_CLOSE, 0, 0)
+        except OSError:
+            continue
+
+    if hwnds:
+        logger.info(
+            "Slot %s: sent WM_CLOSE to %d Flash window(s) (PID %s)",
+            slot_label, len(hwnds), pid,
+        )
+
+    deadline = time.monotonic() + max(0.0, grace_sec)
+    while time.monotonic() < deadline:
+        if not flash_pid_is_alive(pid):
+            logger.info("Slot %s: Flash PID %s exited gracefully", slot_label, pid)
+            return True
+        time.sleep(0.1)
+
+    if not force_terminate:
+        return not flash_pid_is_alive(pid)
+
+    PROCESS_TERMINATE = 0x0001
+    h = kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+    if not h:
+        logger.warning(
+            "Slot %s: could not open Flash PID %s for TerminateProcess (already gone?)",
+            slot_label, pid,
+        )
+        return not flash_pid_is_alive(pid)
+    try:
+        if kernel32.TerminateProcess(h, 1):
+            logger.info("Slot %s: force-terminated Flash PID %s", slot_label, pid)
+        else:
+            logger.warning(
+                "Slot %s: TerminateProcess failed for Flash PID %s", slot_label, pid
+            )
+    finally:
+        kernel32.CloseHandle(h)
+
+    time.sleep(0.2)
+    return not flash_pid_is_alive(pid)
+
+
+def list_flash_windows(pid: int) -> list[dict]:
+    """
+    Enumerate every visible top-level window owned by ``pid``.
+
+    Used as a diagnostic when a slot's Flash never opens its MAIN TCP: a secondary
+    window (Error #2048 popup, Flash Player debug "Restricted content", user's
+    "Continue" dialog, etc.) can steal the loader's click target, and seeing all
+    top-level windows for the PID makes that obvious in the log.
+    """
+    if sys.platform != "win32" or pid <= 0:
+        return []
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", wintypes.LONG), ("top", wintypes.LONG),
+            ("right", wintypes.LONG), ("bottom", wintypes.LONG),
+        ]
+
+    results: list[dict] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(hwnd, _lparam):
+        owner_pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        if int(owner_pid.value) != int(pid):
+            return True
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+        rc = RECT()
+        if user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+            w = max(0, rc.right - rc.left)
+            h = max(0, rc.bottom - rc.top)
+        else:
+            w = h = 0
+        results.append({
+            "hwnd": int(hwnd),
+            "title": buf.value,
+            "width": w,
+            "height": h,
+        })
+        return True
+
+    try:
+        user32.EnumWindows(_enum, 0)
+    except OSError:
+        pass
+    return results
 
 
 def flash_pid_is_alive(pid: int) -> bool:

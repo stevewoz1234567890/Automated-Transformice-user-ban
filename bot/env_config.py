@@ -217,4 +217,21 @@ def load_config_from_env(repo_root: Path) -> object:
     if seq_to is not None:
         ns.FLASH_SLOT_LOGIN_TIMEOUT_SEC = seq_to
 
+    # Early Transformice-button re-click loop after Flash launch. The initial click happens
+    # FLASH_LOADER_POST_OPEN_DELAY_SEC after Flash starts; later slots often render the loader
+    # more slowly (CPU saturated by earlier Flash instances) and miss that single click, so we
+    # re-click every EARLY_RETRY_INTERVAL_SEC for EARLY_RETRY_COUNT attempts until MAIN TCP
+    # accept is observed. This is what actually makes slots without bind_ip connect reliably.
+    F("FLASH_LOADER_EARLY_RETRY_INTERVAL_SEC", "BOT_FLASH_LOADER_EARLY_RETRY_INTERVAL_SEC", 3.0)
+    early_cnt = _float_from_env(os.environ.get("BOT_FLASH_LOADER_EARLY_RETRY_COUNT"))
+    ns.FLASH_LOADER_EARLY_RETRY_COUNT = int(early_cnt) if early_cnt is not None else 5
+
+    # Auto-close failed Flash windows: once a slot's login timeout expires without a
+    # LoginSuccessPacket, post WM_CLOSE to its Flash window(s) (and TerminateProcess if
+    # the grace period elapses). Keeps the desktop clean when many slots fail to reach
+    # the login screen so the user doesn't have to hunt and close stale tabs manually.
+    close_fail = _bool_from_env(os.environ.get("BOT_FLASH_CLOSE_ON_LOGIN_FAIL"))
+    ns.FLASH_CLOSE_ON_LOGIN_FAIL = True if close_fail is None else close_fail
+    F("FLASH_CLOSE_GRACE_SEC", "BOT_FLASH_CLOSE_GRACE_SEC", 2.0)
+
     return ns
