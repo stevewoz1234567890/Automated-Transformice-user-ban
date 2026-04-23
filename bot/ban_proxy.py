@@ -678,7 +678,20 @@ class BanBotProxy(Proxy):
             )
             loop.run_in_executor(None, _run_hook)
 
-        await super().new_main_connection(client_reader, client_writer)
+        # Mirror ``new_satellite_connection``: swallow abrupt Flash-side disconnects so the
+        # log isn't flooded with "Task exception was never retrieved" tracebacks when we
+        # force-close a stuck Flash window (BOT_FLASH_CLOSE_ON_LOGIN_FAIL). On Windows the
+        # reset surfaces as WinError 64 ("El nombre de red especificado ya no está
+        # disponible") wrapped in ConnectionResetError.
+        try:
+            await super().new_main_connection(client_reader, client_writer)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+            logger.debug(
+                "Slot %s: main connection closed (%s: %s)",
+                self.slot_label,
+                type(e).__name__,
+                e,
+            )
 
     async def new_satellite_connection(self, client_reader, client_writer):
         peer = None

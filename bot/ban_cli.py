@@ -336,6 +336,24 @@ def _wait_for_game_clients(
         logger.info("All %d slot(s) logged in — proceeding.", len(states))
         return
 
+    # Sequential Flash launch already did a per-slot login wait (FLASH_LOGIN_TIMEOUT_SEC,
+    # default 120s) and moved on. Any slot that still isn't logged in at this point has
+    # been given up on (Flash window closed when BOT_FLASH_CLOSE_ON_LOGIN_FAIL=true, or
+    # st.error populated) — blocking here another 600s will never resurrect it, it just
+    # spams "Still waiting: N/M slots logged in...". Log a terse summary and proceed so
+    # the user can ban with the slots that did come up.
+    if auto_flash_launched:
+        ready = sum(1 for s in states if s.login_success_event.is_set())
+        failed = [s.label for s in states if not s.login_success_event.is_set()]
+        logger.info(
+            "Sequential Flash launch finished: %d/%d logged in; skipping post-launch wait "
+            "(failed slots %s will not recover without re-running). Continuing with ready slots.",
+            ready,
+            len(states),
+            failed or "[none]",
+        )
+        return
+
     if not auto_flash_launched:
         logger.info(
             "Start %s game client(s); point each tfm-proxy-loader at its port from .env (BOT_ACCOUNTS_JSON).",
@@ -1061,10 +1079,21 @@ def main(argv: list[str] | None = None) -> None:
                         if verbose
                         else ""
                     )
+                    # Specific hint for the "incorrect version" symptom: Flash has a MAIN TCP
+                    # connection to the proxy but never sent SystemInformationPacket (the
+                    # trigger for PACKET_AUTO_LOGIN). That typically means the loader SWF hit
+                    # an error BEFORE sending the handshake — most commonly a "incorrect
+                    # version" / rate-limit screen when the game server refuses rapid-fire
+                    # logins from the same public IP. Tell the user how to recover so they
+                    # don't keep staring at "Still waiting..." lines without guidance.
                     logger.info(
                         "Still waiting slot %s (~%.0fs left): no LoginSuccess yet. "
-                        "MAIN TCP already connected — Flash reached 127.0.0.1:%s; next step is a "
-                        "LoginPacket from the client. If none ever appears, login was not submitted.%s",
+                        "MAIN TCP already connected — Flash reached 127.0.0.1:%s but never sent "
+                        "SystemInformationPacket. If Flash shows 'incorrect version' or a blank "
+                        "screen here, the game server is rate-limiting logins or the loader "
+                        "failed its self-check; increase BOT_UI_FLASH_LAUNCH_STAGGER_SEC (try 3-5s), "
+                        "re-run TFM_SECRETS_GAME_VERSION dump, or re-run the bot so only the "
+                        "failing slots retry.%s",
                         st.label,
                         max(0.0, deadline - time.monotonic()),
                         st.port,
