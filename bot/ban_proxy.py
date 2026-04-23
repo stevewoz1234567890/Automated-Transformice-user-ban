@@ -54,7 +54,11 @@ def ensure_flash_trust_config() -> tuple[Path, list[str]] | None:
             seen.add(gp)
             trusted.append(gp)
 
-    bot_root = project_root_dir().resolve()
+    bot_root = (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parent.parent
+    )
     if bot_root not in seen:
         seen.add(bot_root)
         trusted.append(bot_root)
