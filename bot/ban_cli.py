@@ -784,10 +784,9 @@ def main(argv: list[str] | None = None) -> None:
                 ) -> None:
                     while True:
                         time.sleep(_pd)
-                        if _st.login_success_event.is_set():
-                            break
                         pid = _st.flash_pid
                         if pid is None or pid <= 0:
+                            time.sleep(1.0)
                             continue
                         if not flash_launch.flash_pid_is_alive(pid):
                             break
