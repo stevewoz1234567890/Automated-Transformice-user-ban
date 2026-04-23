@@ -1079,6 +1079,107 @@ def _win_log_visible_windows_for_pid(pid: int, slot_label: str) -> None:
         )
 
 
+def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
+    """
+    Dismiss Flash ActionScript/security error dialogs for *pid* **without moving
+    the mouse cursor**.  Finds small top-level windows (< 120 000 px²) owned by
+    the process, enumerates child Button controls, and sends ``BM_CLICK`` to any
+    whose text matches common dismiss labels ("Dismiss", "OK", "Continue", etc.).
+
+    Returns the number of buttons clicked.
+    """
+    if sys.platform != "win32" or pid <= 0:
+        return 0
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    BM_CLICK = 0x00F5
+    WM_CLOSE = 0x0010
+    DISMISS_LABELS = {"dismiss all", "dismiss", "ok", "continue", "close", "yes"}
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", wintypes.LONG),
+            ("top", wintypes.LONG),
+            ("right", wintypes.LONG),
+            ("bottom", wintypes.LONG),
+        ]
+
+    # Collect all visible top-level windows for this pid
+    top_hwnds: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_top(hwnd, _lp):
+        p = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+        if p.value == pid and user32.IsWindowVisible(hwnd):
+            top_hwnds.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(_enum_top, 0)
+
+    clicked = 0
+    for top in top_hwnds:
+        # Skip minimized windows — GetClientRect returns 0×0 for them, which would
+        # pass the area filter falsely and cause WM_CLOSE to be sent to a live slot.
+        if user32.IsIconic(top):
+            continue
+        rc = RECT()
+        if not user32.GetClientRect(top, ctypes.byref(rc)):
+            continue
+        area = max(0, rc.right - rc.left) * max(0, rc.bottom - rc.top)
+        if area >= 120_000:
+            continue  # main game window — skip
+        if area == 0:
+            continue  # invisible or zero-size — skip
+
+        # Enumerate child controls and click buttons matching dismiss labels
+        buttons: list[int] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum_child(ch, _lp):
+            cls_buf = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(ch, cls_buf, 64)
+            if cls_buf.value.lower() == "button":
+                buttons.append(int(ch))
+            return True
+
+        user32.EnumChildWindows(top, _enum_child, 0)
+
+        if not buttons:
+            # No child buttons — try pressing Escape on the dialog itself
+            user32.PostMessageW(top, 0x0100, 0x1B, 0)  # WM_KEYDOWN VK_ESCAPE
+            logger.debug(
+                "dismiss_no_mouse slot %s: no buttons in small HWND=%s (area=%d); sent Escape",
+                slot_label, top, area,
+            )
+            continue
+
+        found_dismiss = False
+        for btn in buttons:
+            txt = ctypes.create_unicode_buffer(128)
+            user32.GetWindowTextW(btn, txt, 128)
+            label = (txt.value or "").strip().lower()
+            if label in DISMISS_LABELS:
+                user32.SendMessageW(btn, BM_CLICK, 0, 0)
+                logger.info(
+                    "dismiss_no_mouse slot %s: clicked %r button on HWND=%s (area=%d)",
+                    slot_label, txt.value.strip(), top, area,
+                )
+                clicked += 1
+                found_dismiss = True
+                break
+
+        if not found_dismiss:
+            logger.debug(
+                "dismiss_no_mouse slot %s: no dismiss button matched in HWND=%s (area=%d)",
+                slot_label, top, area,
+            )
+
+    return clicked
+
+
 def minimize_flash_window(pid: int, slot_label: str) -> bool:
     """
     Minimize the Flash player window for *pid* via SW_MINIMIZE.

@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import logging
 import random
+import os
 import sys
 import threading
 import time
@@ -754,6 +755,14 @@ def main(argv: list[str] | None = None) -> None:
                 st.label,
                 login_timeout,
             )
+            _pd_raw = (os.environ.get("FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC") or "").strip()
+            try:
+                poll_dismiss = float(_pd_raw) if _pd_raw else float(
+                    getattr(cfg, "FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC", 0.0) or 0.0
+                )
+            except ValueError:
+                poll_dismiss = 0.0
+
             try:
                 proc = flash_launch.launch_one_flash_loader(
                     flash_row,
@@ -768,37 +777,27 @@ def main(argv: list[str] | None = None) -> None:
                 st.flash_loader_ready_event.set()
             if proc is None:
                 st.flash_pid = None
-            poll_dismiss = float(
-                getattr(cfg, "FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC", 0.0) or 0.0
-            )
             if (
                 proc is not None
                 and st.flash_pid is not None
                 and poll_dismiss > 0
                 and sys.platform == "win32"
             ):
-
                 def _flash_error_dismiss_poll(
                     _st: SlotState = st,
                     _pd: float = poll_dismiss,
                 ) -> None:
                     while True:
                         time.sleep(_pd)
-                        pid = _st.flash_pid
-                        if pid is None or pid <= 0:
-                            time.sleep(1.0)
+                        current_pid = _st.flash_pid
+                        if current_pid is None or current_pid <= 0:
                             continue
-                        if not flash_launch.flash_pid_is_alive(pid):
+                        if not flash_launch.flash_pid_is_alive(current_pid):
                             break
-                        if not flash_launch.try_acquire_flash_ui(pid):
-                            continue
                         try:
-                            flash_launch.dismiss_flashplayer_actionscript_dialogs(
-                                pid,
+                            flash_launch.dismiss_flash_error_dialogs_no_mouse(
+                                current_pid,
                                 _st.label,
-                                cfg,
-                                pre_dismiss_sec=0.0,
-                                quiet=True,
                             )
                         except Exception:
                             logger.debug(
@@ -806,8 +805,6 @@ def main(argv: list[str] | None = None) -> None:
                                 _st.label,
                                 exc_info=True,
                             )
-                        finally:
-                            flash_launch.release_flash_ui(pid)
 
                 threading.Thread(
                     target=_flash_error_dismiss_poll,
