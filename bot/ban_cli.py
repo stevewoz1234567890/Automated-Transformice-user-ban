@@ -271,6 +271,9 @@ def _run_slot_async(
                 packet_login_start_room=str(
                     getattr(cfg, "PACKET_LOGIN_START_ROOM", "") or ""
                 ),
+                main_keepalive_interval_sec=float(
+                    getattr(cfg, "MAIN_KEEPALIVE_INTERVAL_SEC", 15.0) or 0.0
+                ),
             )
             state.proxy = proxy
             await proxy.startup()

@@ -167,6 +167,11 @@ def load_config_from_env(repo_root: Path) -> object:
     B("PROXY_LOG_ALL_MAIN_PACKETS", "BOT_PROXY_LOG_ALL_MAIN_PACKETS", False)
     B("PACKET_AUTO_LOGIN", "BOT_PACKET_AUTO_LOGIN", False)
     F("PACKET_LOGIN_DELAY_SEC", "BOT_PACKET_LOGIN_DELAY_SEC", 0.35)
+    # Proxy-driven KeepAlivePacket so idle main connections don't get dropped by TFM
+    # while their Flash client is minimized (Flash throttles background timers, so its
+    # own keepalives stop, and the server eventually kills the connection → PARTL status).
+    # 0 or negative disables the feature.
+    F("MAIN_KEEPALIVE_INTERVAL_SEC", "BOT_MAIN_KEEPALIVE_INTERVAL_SEC", 15.0)
     room = (os.environ.get("BOT_PACKET_LOGIN_START_ROOM") or "").strip()
     ns.PACKET_LOGIN_START_ROOM = room
 

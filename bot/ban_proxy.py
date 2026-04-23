@@ -220,6 +220,7 @@ class BanBotProxy(Proxy):
         packet_login_loader_url: str = "",
         packet_login_delay_sec: float = 0.35,
         packet_login_start_room: str = "",
+        main_keepalive_interval_sec: float = 15.0,
         **kwargs,
     ):
         # Flash file:// SWF + Socket: use IPv4 literal so the client never targets the public
@@ -246,6 +247,9 @@ class BanBotProxy(Proxy):
         self._handshake_auth_token: int | None = None
         self._packet_login_sent = False
         self._packet_login_task: asyncio.Task | None = None
+        self._main_keepalive_interval_sec = float(main_keepalive_interval_sec)
+        self._main_keepalive_task: asyncio.Task | None = None
+        self._main_keepalive_started = False
         # Room list collected from RoomListPacket responses; key = room name, value = player count.
         self.known_rooms: dict[str, int] = {}
         self._room_list_ready = threading.Event()
@@ -836,6 +840,80 @@ class BanBotProxy(Proxy):
             logger.exception("Slot %s: /ban failed via %s: %s", self.slot_label, conn_type, e)
             return False
 
+    async def _main_keepalive_loop(self) -> None:
+        """Periodically send serverbound KeepAlivePacket on the main connection.
+
+        Flash throttles Timer events when its window is minimized or in the
+        background, so its own KeepAlivePackets stop firing and the TFM server
+        eventually closes the idle main TCP (slot then shows as [PARTL] /
+        "login ok but upstream closed").  This task runs in the proxy's own
+        asyncio loop, so it is unaffected by Flash throttling, and keeps the
+        main connection alive until we're ready to issue /ban commands.
+
+        The loop exits when the main connection goes away, the task is
+        cancelled, or write_packet raises a connection error.
+        """
+        interval = self._main_keepalive_interval_sec
+        if interval <= 0:
+            return
+        logger.info(
+            "Slot %s: main-keepalive loop started (interval=%.1fs)",
+            self.slot_label,
+            interval,
+        )
+        sent = 0
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                conn = None
+                if self.main_clients:
+                    conn = self.main_clients[0].destination
+                if conn is None:
+                    logger.info(
+                        "Slot %s: main-keepalive loop exiting (no main upstream; sent=%d)",
+                        self.slot_label,
+                        sent,
+                    )
+                    return
+                try:
+                    await conn.write_packet(serverbound.KeepAlivePacket)
+                    sent += 1
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+                    logger.info(
+                        "Slot %s: main-keepalive send failed (%s: %s); stopping loop (sent=%d)",
+                        self.slot_label,
+                        type(e).__name__,
+                        e,
+                        sent,
+                    )
+                    return
+                except Exception:
+                    logger.exception(
+                        "Slot %s: main-keepalive unexpected error; stopping loop",
+                        self.slot_label,
+                    )
+                    return
+        except asyncio.CancelledError:
+            logger.debug(
+                "Slot %s: main-keepalive loop cancelled (sent=%d)",
+                self.slot_label,
+                sent,
+            )
+            raise
+
+    def _start_main_keepalive(self) -> None:
+        if self._main_keepalive_started:
+            return
+        if self._main_keepalive_interval_sec <= 0:
+            logger.debug("Slot %s: main-keepalive disabled (interval<=0)", self.slot_label)
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._main_keepalive_started = True
+        self._main_keepalive_task = loop.create_task(self._main_keepalive_loop())
+
     @pak.packet_listener(clientbound.LoginSuccessPacket)
     async def _on_login_success(self, source, packet):
         source.session_id = packet.session_id
@@ -843,6 +921,7 @@ class BanBotProxy(Proxy):
         if self._own_username:
             self._own_username = self._own_username.strip()
         user = self._own_username or "?"
+        self._start_main_keepalive()
         if self._verbose_login_flow:
             logger.info(
                 "Slot %s: LoginSuccessPacket global_id=%s community=%s registered=%s session_id=%s "
