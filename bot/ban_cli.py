@@ -744,6 +744,38 @@ def main(argv: list[str] | None = None) -> None:
             flash_accounts.append(d)
         login_timeout = float(getattr(cfg, "FLASH_SLOT_LOGIN_TIMEOUT_SEC", 900.0))
         stagger_after = float(getattr(cfg, "FLASH_STAGGER_AFTER_LOGIN_SEC", 0.5))
+
+        # Start global dismiss poller BEFORE launching any Flash windows so
+        # error dialogs are caught from the very first slot onwards.
+        _pd_raw_early = (os.environ.get("FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC") or "").strip()
+        try:
+            _pd_early = float(_pd_raw_early) if _pd_raw_early else 0.0
+        except ValueError:
+            _pd_early = 0.0
+        if _pd_early > 0 and sys.platform == "win32":
+            def _global_dismiss_worker_early(
+                _states: list[SlotState] = states,
+                _pd: float = _pd_early,
+            ) -> None:
+                while True:
+                    time.sleep(_pd)
+                    for _s in _states:
+                        pid = _s.flash_pid
+                        if not pid or not flash_launch.flash_pid_is_alive(pid):
+                            continue
+                        try:
+                            flash_launch.dismiss_flash_error_dialogs_no_mouse(pid, _s.label)
+                        except Exception:
+                            logger.debug(
+                                "Slot %s: periodic dismiss failed", _s.label, exc_info=True
+                            )
+
+            threading.Thread(
+                target=_global_dismiss_worker_early,
+                daemon=True,
+                name="flash-err-dismiss-global",
+            ).start()
+
         for idx, (flash_row, st) in enumerate(zip(flash_accounts, states), start=1):
             st.login_success_event.clear()
             st.flash_main_tcp_seen = False
@@ -755,14 +787,6 @@ def main(argv: list[str] | None = None) -> None:
                 st.label,
                 login_timeout,
             )
-            _pd_raw = (os.environ.get("FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC") or "").strip()
-            try:
-                poll_dismiss = float(_pd_raw) if _pd_raw else float(
-                    getattr(cfg, "FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC", 0.0) or 0.0
-                )
-            except ValueError:
-                poll_dismiss = 0.0
-
             try:
                 proc = flash_launch.launch_one_flash_loader(
                     flash_row,
@@ -777,40 +801,6 @@ def main(argv: list[str] | None = None) -> None:
                 st.flash_loader_ready_event.set()
             if proc is None:
                 st.flash_pid = None
-            if (
-                proc is not None
-                and st.flash_pid is not None
-                and poll_dismiss > 0
-                and sys.platform == "win32"
-            ):
-                def _flash_error_dismiss_poll(
-                    _st: SlotState = st,
-                    _pd: float = poll_dismiss,
-                ) -> None:
-                    while True:
-                        time.sleep(_pd)
-                        current_pid = _st.flash_pid
-                        if current_pid is None or current_pid <= 0:
-                            continue
-                        if not flash_launch.flash_pid_is_alive(current_pid):
-                            break
-                        try:
-                            flash_launch.dismiss_flash_error_dialogs_no_mouse(
-                                current_pid,
-                                _st.label,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Slot %s: periodic Flash error dismiss failed",
-                                _st.label,
-                                exc_info=True,
-                            )
-
-                threading.Thread(
-                    target=_flash_error_dismiss_poll,
-                    daemon=True,
-                    name=f"flash-err-dismiss-{st.label}",
-                ).start()
             if (
                 cfg_flash_auto
                 and flash_login_trigger == "main_tcp"
@@ -928,6 +918,17 @@ def main(argv: list[str] | None = None) -> None:
                             else ""
                         ),
                     )
+                    # Retry the Transformice loader click in case the first one missed.
+                    if st.flash_pid and args.launch_flash_no_click is False:
+                        frac_x = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_X", 0.50))
+                        frac_y = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_Y", 0.55))
+                        logger.info(
+                            "Slot %s: retrying Transformice loader click at (%.2f, %.2f)",
+                            st.label, frac_x, frac_y,
+                        )
+                        flash_launch.click_transformice_in_loader(
+                            st.flash_pid, st.label, frac_x=frac_x, frac_y=frac_y
+                        )
             if not got_login:
                 logger.warning(
                     "Slot %s: no login success within %ss — finish manually or fix loader/proxy; continuing.",

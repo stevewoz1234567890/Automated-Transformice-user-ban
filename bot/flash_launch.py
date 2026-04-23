@@ -1180,6 +1180,36 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     return clicked
 
 
+def click_transformice_in_loader(
+    pid: int,
+    slot_label: str,
+    *,
+    frac_x: float = 0.50,
+    frac_y: float = 0.55,
+) -> bool:
+    """
+    Re-send the Transformice button click to the Flash window owned by *pid*.
+    Safe to call mid-wait when no MAIN TCP accept has been seen yet.
+    Returns True if the click was sent.
+    """
+    if sys.platform != "win32" or pid <= 0:
+        return False
+    hwnd = _win_find_toplevel_hwnd(pid)
+    if hwnd is None:
+        logger.debug("click_transformice_in_loader: no HWND for PID %s (slot %s)", pid, slot_label)
+        return False
+    _win_force_foreground(hwnd)
+    import time as _time
+    _time.sleep(0.15)
+    result = _win_click_client_fraction(hwnd, frac_x=frac_x, frac_y=frac_y, debug_label=slot_label)
+    if result:
+        logger.info(
+            "Slot %s: retry click sent to HWND=%s (%.2f, %.2f)",
+            slot_label, hwnd, frac_x, frac_y,
+        )
+    return result
+
+
 def minimize_flash_window(pid: int, slot_label: str) -> bool:
     """
     Minimize the Flash player window for *pid* via SW_MINIMIZE.
