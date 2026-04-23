@@ -543,7 +543,7 @@ def _win_click_client_fraction(
             click_mode = "PostMessage-only"
 
         if debug_label:
-            logger.info(
+            logger.debug(
                 "FLASH_LOGIN_DEBUG %s: target_hwnd=%s toplevel_hwnd=%s client=(%s,%s) screen=(%s,%s) "
                 "frac=(%.4f,%.4f) client_size=%sx%s attempt=%s/%s mode=%s fg=%s "
                 "hwnd_at_point=%s root_at_point=%s flash_under_cursor=%s",
@@ -728,17 +728,8 @@ def launch_one_flash_loader(
         policy_port=policy,
         connect_host=patch_host,
     )
-    logger.info(
-        "Launching Flash [slot %s] swf_patched=%s connect=%s:%s satellite=%s flash_policy=%s account_bind_ip=%r",
-        label or "?",
-        swf_arg != swf,
-        patch_host,
-        port,
-        satellite,
-        policy,
-        bind_ip or "(not set)",
-    )
     doc_log = doc if len(doc) <= 500 else doc[:500] + "..."
+    t_launch = time.monotonic()
     try:
         p = subprocess.Popen(
             [str(flash), doc],
@@ -755,65 +746,62 @@ def launch_one_flash_loader(
         except Exception as e:
             logger.warning("on_flash_pid failed for slot %s: %s", label, e)
 
+    # Single consolidated launch line (was 3 separate INFO lines before). Full
+    # SWF URL goes to DEBUG so the INFO log stays scannable per slot.
     logger.info(
-        "Flash started slot %s PID=%s exe=%s cwd=%s",
+        "Flash launched slot %s PID=%s swf_patched=%s connect=%s:%s sat=%s policy=%s bind_ip=%r",
         label or "?",
         p.pid,
-        flash,
-        root,
+        swf_arg != swf,
+        patch_host,
+        port,
+        satellite,
+        policy,
+        bind_ip or "(not set)",
     )
-    logger.info("Flash SWF argument (truncated): %s", doc_log)
+    logger.debug(
+        "Slot %s Flash launch detail: exe=%s cwd=%s swf_arg=%s",
+        label or "?", flash, root, doc_log,
+    )
 
     if click_transformice:
-        logger.info("Waiting for Flash window (PID %s, slot %s)...", p.pid, label or "?")
         hwnd = _wait_hwnd_for_pid(p.pid)
         if hwnd is None:
             logger.warning(
-                "No HWND for Flash PID %s (slot %s); click Transformice manually in that window.",
-                p.pid,
-                label,
+                "Slot %s: no HWND for Flash PID %s after window wait; click Transformice manually.",
+                label, p.pid,
             )
         else:
             fx, fy = _loader_click_fractions_from_env()
-            logger.info(
-                "Flash HWND=%s for PID=%s (slot %s); sleeping %ss then real mouse click "
-                "at (frac_x=%.2f, frac_y=%.2f) — set FLASH_LOADER_CLICK_FRAC_X/Y to adjust",
-                hwnd,
-                p.pid,
-                label,
-                post_open_delay_sec,
-                fx,
-                fy,
+            logger.debug(
+                "Slot %s: Flash HWND=%s, sleeping %.2fs before loader click at (%.2f, %.2f)",
+                label, hwnd, post_open_delay_sec, fx, fy,
             )
             time.sleep(post_open_delay_sec)
+            click_dt = time.monotonic() - t_launch
             if _win_click_client_fraction(hwnd, frac_x=fx, frac_y=fy, flash_pid=p.pid):
                 logger.info(
-                    "Sent mouse click to HWND=%s (slot %s) for Transformice button "
-                    "(if MAIN TCP never connects, try frac_y=0.45–0.65 or click manually)",
-                    hwnd,
-                    label,
+                    "Slot %s: Flash HWND=%s — clicked Transformice button at (%.2f, %.2f) +%.2fs after launch",
+                    label, hwnd, fx, fy, click_dt,
                 )
             else:
                 logger.warning(
-                    "Loader click failed for HWND=%s slot %s; click Transformice manually.",
-                    hwnd,
-                    label,
+                    "Slot %s: Flash HWND=%s — loader click FAILED; click Transformice manually.",
+                    label, hwnd,
                 )
     else:
-        logger.info("Auto-click disabled; click Transformice manually (slot %s PID=%s)", label, p.pid)
+        logger.info("Slot %s: auto-click disabled (PID=%s); click Transformice manually.", label, p.pid)
 
     time.sleep(0.45)
     exit_code = p.poll()
     if exit_code is not None:
         logger.error(
-            "Flash process exited immediately (slot %s PID=%s exit_code=%s). "
+            "Slot %s: Flash process exited immediately (PID=%s exit_code=%s). "
             "Check SWF path, trust cfg, or run flashplayer from a console for errors.",
-            label,
-            p.pid,
-            exit_code,
+            label, p.pid, exit_code,
         )
-    else:
-        logger.info("Flash process still running after startup (slot %s PID=%s)", label, p.pid)
+    # (Note: the "still running" INFO line was removed — absence of the error
+    # above already implies success, so logging it on every slot was noise.)
 
     return p
 
@@ -1178,10 +1166,10 @@ def _win_log_visible_windows_for_pid(pid: int, slot_label: str) -> None:
 
     user32.EnumWindows(enum_proc, 0)
     if not found:
-        logger.info("FLASH_LOGIN_DEBUG slot %s: no visible top-level HWNDs for pid=%s", slot_label, pid)
+        logger.debug("FLASH_LOGIN_DEBUG slot %s: no visible top-level HWNDs for pid=%s", slot_label, pid)
         return
     for h, title, cls in found:
-        logger.info(
+        logger.debug(
             "FLASH_LOGIN_DEBUG slot %s: pid=%s hwnd=%s class=%r title=%r",
             slot_label,
             pid,
@@ -1315,7 +1303,7 @@ def click_transformice_in_loader(
     _time.sleep(0.15)
     result = _win_click_client_fraction(hwnd, frac_x=frac_x, frac_y=frac_y, debug_label=slot_label)
     if result:
-        logger.info(
+        logger.debug(
             "Slot %s: retry click sent to HWND=%s (%.2f, %.2f)",
             slot_label, hwnd, frac_x, frac_y,
         )

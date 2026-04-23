@@ -423,19 +423,35 @@ def print_slot_status(states: list[SlotState], *, title: str = "SLOT STATUS") ->
     Print a clearly-formatted per-slot status table to stdout *and* the log so
     the user can immediately see which slots are not working.
     """
-    banner = "=" * 78
+    banner = "=" * 110
     lines = [banner, f"  {title}", banner]
     counts = {"OK   ": 0, "PARTL": 0, "NO_LG": 0, "NO_TCP": 0, "CRASH": 0, "DOWN ": 0}
+    now = time.monotonic()
     for s in states:
         tag, reason = _slot_status_label(s)
         counts[tag] = counts.get(tag, 0) + 1
         nick = "-"
-        if s.proxy is not None:
-            nick = (getattr(s.proxy, "_own_username", None) or "").strip() or "-"
+        conn = "-"
+        liveness = "-"
+        age = ""
+        proxy = s.proxy
+        if proxy is not None:
+            nick = (getattr(proxy, "_own_username", None) or "").strip() or "-"
+            n_main = len(proxy.main_clients or [])
+            n_sat = len(getattr(proxy, "satellite_clients", None) or [])
+            conn = f"m={n_main} s={n_sat}"
+            pm = getattr(proxy, "_auto_pong_sent_main", 0)
+            ps = getattr(proxy, "_auto_pong_sent_satellite", 0)
+            ka = getattr(proxy, "_keepalive_sent_main", 0)
+            liveness = f"pong={pm}/{ps} ka={ka}"
+            login_mono = getattr(proxy, "_login_success_mono", None)
+            if login_mono is not None:
+                age = f"{now - login_mono:5.1f}s"
         mark = "[  OK  ]" if tag == "OK   " else "[ FAIL ]"
         lines.append(
-            f"  {mark}  slot {s.label:>3s}  [{tag}]  "
-            f"{s.flash_username:<28s}  nick={nick:<22s}  port={s.port:<5d}  {reason}"
+            f"  {mark} slot {s.label:>3s} [{tag}] "
+            f"{(s.flash_username or '-'):<24s} nick={nick:<20s} port={s.port:<5d} "
+            f"conn={conn:<7s} {liveness:<16s} login_age={age:<6s} {reason}"
         )
     lines.append(banner)
     summary = " | ".join(f"{k.strip()}={v}" for k, v in counts.items() if v)
@@ -624,20 +640,23 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
     dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
     dmax = float(getattr(cfg, "BAN_DELAY_MAX_SEC", 2.0))
     active = [s for s in states if s.proxy is not None]
-    results: list[tuple[str, bool, str]] = []
+    results: list[tuple[str, bool, str, float]] = []
+    t_round = time.monotonic()
     for i, s in enumerate(active):
+        t_slot = time.monotonic()
         try:
             ok = _run_coro_on_slot(s, s.proxy.send_ban_command(target_user))
             reason = "sent" if ok else "send returned False"
         except Exception as exc:
             ok = False
             reason = f"{type(exc).__name__}: {exc}"
-        results.append((s.label, bool(ok), reason))
-        logger.info(
-            "[slot %s] /ban %r -> %s",
-            s.label,
-            target_user,
-            "sent" if ok else "FAILED",
+        dt_ms = (time.monotonic() - t_slot) * 1000.0
+        results.append((s.label, bool(ok), reason, dt_ms))
+        # Per-slot /ban already logs detail (route, latency) in ban_proxy;
+        # here we only keep a compact summary line to avoid double-printing.
+        logger.debug(
+            "[slot %s] /ban %r -> %s (%.1fms)",
+            s.label, target_user, "sent" if ok else "FAILED", dt_ms,
         )
         if i < len(active) - 1:
             time.sleep(random.uniform(dmin, dmax))
@@ -645,25 +664,31 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
     # Skipped slots (proxy never started) — mark them FAIL explicitly.
     inactive = [s for s in states if s.proxy is None]
     for s in inactive:
-        results.append((s.label, False, "proxy not started"))
+        results.append((s.label, False, "proxy not started", 0.0))
 
-    ok_count = sum(1 for _, ok, _ in results if ok)
+    ok_count = sum(1 for _, ok, *_ in results if ok)
     fail_count = len(results) - ok_count
-    banner = "=" * 78
+    total_dt = time.monotonic() - t_round
+    banner = "=" * 88
     lines = [
         banner,
-        f"  BAN RESULTS for {target_user!r}   (OK: {ok_count}  /  FAIL: {fail_count}  of {len(results)})",
+        f"  BAN RESULTS for {target_user!r}   "
+        f"(OK: {ok_count}  /  FAIL: {fail_count}  of {len(results)}; round {total_dt:.1f}s)",
         banner,
     ]
-    for label, ok, reason in results:
+    for label, ok, reason, dt_ms in results:
         mark = "[  OK  ]" if ok else "[ FAIL ]"
-        lines.append(f"  {mark}  slot {label:>3s}  -> {reason}")
+        lat = f"{dt_ms:6.1f}ms" if dt_ms else "      -"
+        lines.append(f"  {mark}  slot {label:>3s}  [{lat}]  -> {reason}")
     lines.append(banner)
     for line in lines:
         print(line, flush=True)
         logger.info(line)
     _flush_log_handlers()
-    logger.info("All accounts finished sending /ban commands for this round.")
+    logger.info(
+        "Ban round complete: target=%r ok=%d fail=%d elapsed=%.1fs",
+        target_user, ok_count, fail_count, total_dt,
+    )
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -999,7 +1024,7 @@ def main(argv: list[str] | None = None) -> None:
             verbose = bool(getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", True))
             packet_login = bool(getattr(cfg, "PACKET_AUTO_LOGIN", False))
             if packet_login:
-                logger.info(
+                logger.debug(
                     "Slot %s: PACKET_AUTO_LOGIN — waiting for LoginSuccessPacket (proxy injects credentials automatically).",
                     st.label,
                 )
@@ -1047,33 +1072,43 @@ def main(argv: list[str] | None = None) -> None:
                             break
                         time.sleep(0.2)
                     if st.flash_main_tcp_seen or st.login_success_event.is_set():
-                        logger.info(
+                        # MAIN TCP accept already logged the arrival; no need to repeat.
+                        logger.debug(
                             "Slot %s: MAIN TCP observed during early retry window (before attempt %d/%d)",
                             st.label, attempt, early_retries,
                         )
                         break
                     logger.info(
                         "Slot %s: no MAIN TCP after ~%.1fs — re-clicking Transformice "
-                        "loader at several positions [early retry %d/%d]",
+                        "loader [early retry %d/%d]",
                         st.label,
                         early_interval * attempt,
                         attempt, early_retries,
                     )
                     # Dump every visible top-level window belonging to this Flash PID
                     # — if a Flash error popup / "Restricted content" dialog appeared,
-                    # we'll see it here and know clicks need to target it, not the
-                    # main loader window.
+                    # we want to see it so we know clicks need to target it, not the
+                    # main loader window. Keep the "just 1 window" case quiet since
+                    # it's the expected normal path.
                     try:
                         windows = flash_launch.list_flash_windows(st.flash_pid)
-                        logger.info(
-                            "Slot %s: flash_pid=%s has %d top-level window(s): %s",
-                            st.label, st.flash_pid, len(windows),
-                            ", ".join(
-                                f"HWND={w['hwnd']} title={w['title']!r} "
-                                f"size={w['width']}x{w['height']}"
-                                for w in windows
-                            ) or "(none)",
-                        )
+                        if len(windows) != 1:
+                            logger.warning(
+                                "Slot %s: flash_pid=%s has %d top-level window(s): %s",
+                                st.label, st.flash_pid, len(windows),
+                                ", ".join(
+                                    f"HWND={w['hwnd']} title={w['title']!r} "
+                                    f"size={w['width']}x{w['height']}"
+                                    for w in windows
+                                ) or "(none)",
+                            )
+                        else:
+                            logger.debug(
+                                "Slot %s: flash_pid=%s one window (normal) HWND=%s title=%r size=%dx%d",
+                                st.label, st.flash_pid,
+                                windows[0]["hwnd"], windows[0]["title"],
+                                windows[0]["width"], windows[0]["height"],
+                            )
                     except Exception:
                         logger.exception(
                             "Slot %s: list_flash_windows raised", st.label
@@ -1109,7 +1144,9 @@ def main(argv: list[str] | None = None) -> None:
                 chunk = min(poll_sec, left)
                 if st.login_success_event.wait(timeout=chunk):
                     got_login = True
-                    logger.info("Slot %s reported login success; proceeding.", st.label)
+                    # "OK  [slot X] logged in as …" from ban_proxy already covers this;
+                    # a second line would just double the noise.
+                    logger.debug("Slot %s reported login success; proceeding.", st.label)
                     if bool(getattr(cfg, "FLASH_MINIMIZE_AFTER_OPEN", False)) and st.flash_pid:
                         flash_launch.minimize_flash_window(st.flash_pid, st.label)
                     break

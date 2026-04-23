@@ -101,9 +101,13 @@ def ensure_flash_trust_config() -> tuple[Path, list[str]] | None:
         )
         return cfg_path, lines
 
-    logger.info("Flash trust cfg written and verified: %s", cfg_path)
+    logger.info(
+        "Flash trust cfg verified (%d path(s)): %s",
+        len(lines),
+        cfg_path,
+    )
     for i, entry in enumerate(lines, 1):
-        logger.info("  TFMProxyLoader.cfg [%s/%s] %s", i, len(lines), entry)
+        logger.debug("  TFMProxyLoader.cfg [%s/%s] %s", i, len(lines), entry)
     return cfg_path, lines
 
 
@@ -202,6 +206,9 @@ def _account_error_hint(code: int | None) -> str:
     )
 
 
+_PONG_LOG_EVERY = 10  # log every Nth auto-pong reply (per connection class)
+
+
 class BanBotProxy(Proxy):
     """One proxy port ↔ one game instance; sends slash-commands as CommandPacket (no leading /)."""
 
@@ -250,6 +257,19 @@ class BanBotProxy(Proxy):
         self._main_keepalive_interval_sec = float(main_keepalive_interval_sec)
         self._main_keepalive_task: asyncio.Task | None = None
         self._main_keepalive_started = False
+        # Track when startup() opened the listeners and when MAIN TCP / login
+        # success first arrived. Used to annotate the "logged in as …" line with
+        # the wall-clock timing so slow slots are easy to spot.
+        self._startup_mono: float | None = None
+        self._main_tcp_mono: float | None = None
+        self._login_success_mono: float | None = None
+        # Counters for the proxy-side pong reply that keeps the upstream TCP
+        # alive when Flash is minimised (see ``_auto_pong_server_ping``). We log
+        # the first pong at INFO and a running count every ``_PONG_LOG_EVERY``
+        # replies so the log stays readable but still shows liveness health.
+        self._auto_pong_sent_main = 0
+        self._auto_pong_sent_satellite = 0
+        self._keepalive_sent_main = 0
         # Room list collected from RoomListPacket responses; key = room name, value = player count.
         self.known_rooms: dict[str, int] = {}
         self._room_list_ready = threading.Event()
@@ -313,14 +333,40 @@ class BanBotProxy(Proxy):
         event loop for connection liveness.
         """
         payload = getattr(packet, "payload", 0) or 0
+        is_sat = bool(getattr(source, "is_satellite", False))
+        conn = "SAT" if is_sat else "MAIN"
         try:
             await source.write_packet(serverbound.PongPacket, payload=payload)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
             logger.debug(
-                "Slot %s: auto-pong send failed (%s: %s); upstream already closing",
-                self.slot_label,
-                type(e).__name__,
-                e,
+                "Slot %s: auto-pong %s send failed (%s: %s); upstream already closing",
+                self.slot_label, conn, type(e).__name__, e,
+            )
+            return
+
+        if is_sat:
+            self._auto_pong_sent_satellite += 1
+            count = self._auto_pong_sent_satellite
+        else:
+            self._auto_pong_sent_main += 1
+            count = self._auto_pong_sent_main
+
+        # First pong confirms the liveness fix is working; subsequent pongs are
+        # noisy, so only log every Nth one and keep the rest at DEBUG.
+        if count == 1:
+            logger.info(
+                "Slot %s: first auto-pong sent on %s (payload=%s) — connection-liveness fix active",
+                self.slot_label, conn, payload,
+            )
+        elif count % _PONG_LOG_EVERY == 0:
+            logger.info(
+                "Slot %s: %s auto-pong count=%d (payload=%s) — upstream still alive",
+                self.slot_label, conn, count, payload,
+            )
+        else:
+            logger.debug(
+                "Slot %s: %s auto-pong #%d payload=%s",
+                self.slot_label, conn, count, payload,
             )
 
     @pak.packet_listener(clientbound.ChangeSatelliteServerPacket)
@@ -452,7 +498,7 @@ class BanBotProxy(Proxy):
         if getattr(source, "is_satellite", False):
             return
         tn = type(packet).__name__
-        if tn in ("KeepAlivePacket", "IPSPingPacket", "PingPacket"):
+        if tn in ("KeepAlivePacket", "IPSPingPacket", "PingPacket", "PongPacket"):
             return
         direction = "→srv" if isinstance(packet, ServerboundPacket) else "srv→"
         body = str(packet)
@@ -650,22 +696,35 @@ class BanBotProxy(Proxy):
                 await asyncio.sleep(_bind_retry_delay)
         if self.host_socket_policy_port is not None:
             self.socket_policy_srv = await self.open_socket_policy_server()
+        self._startup_mono = time.monotonic()
         bind = self.host_address
-        bind_s = bind if bind is not None else "(all interfaces)"
+        bind_s = bind if bind is not None else "*"
+
+        def _describe(srv) -> str:
+            """Return a compact family summary for every socket a listener owns."""
+            socks = getattr(srv, "sockets", None) or []
+            fams: list[str] = []
+            for s in socks:
+                try:
+                    sa = s.getsockname()
+                except OSError:
+                    continue
+                host = sa[0] if sa else "?"
+                if host in ("0.0.0.0", "::"):
+                    fams.append("IPv6" if ":" in host else "IPv4")
+                else:
+                    fams.append(str(host))
+            return "+".join(fams) or "(no sockets)"
+
         logger.info(
-            "Slot %s listening host=%s main=%s satellite=%s",
+            "Slot %s listening on bind=%s main=%s (%s) satellite=%s (%s)",
             self.slot_label,
             bind_s,
             self.host_main_port,
+            _describe(self.main_srv),
             self.host_satellite_port,
+            _describe(self.satellite_srv),
         )
-        for name, srv in (("main", self.main_srv), ("satellite", self.satellite_srv)):
-            socks = getattr(srv, "sockets", None) or []
-            for s in socks:
-                try:
-                    logger.info("Slot %s %s server bound to %s", self.slot_label, name, s.getsockname())
-                except OSError:
-                    pass
 
     async def new_main_connection(self, client_reader, client_writer):
         peer = None
@@ -674,11 +733,17 @@ class BanBotProxy(Proxy):
                 peer = client_writer.transport.get_extra_info("peername")
         except Exception:
             pass
+        if self._main_tcp_mono is None:
+            self._main_tcp_mono = time.monotonic()
+        since_startup = (
+            time.monotonic() - self._startup_mono if self._startup_mono is not None else None
+        )
         logger.info(
-            "Slot %s: MAIN TCP accept from %r (proxy main port %s) — game/loader reached this slot",
+            "Slot %s: MAIN TCP accept from %r (proxy port %s, +%.2fs after listen) — game/loader reached this slot",
             self.slot_label,
             peer,
             self.host_main_port,
+            since_startup if since_startup is not None else 0.0,
         )
         if self._on_main_tcp_accepted is not None:
             try:
@@ -854,21 +919,36 @@ class BanBotProxy(Proxy):
     async def send_ban_command(self, nickname: str) -> bool:
         """Send /ban nickname#tag."""
         main_conn = self._main_write_conn()
+        n_main = len(self.main_clients or [])
+        n_sat = len(getattr(self, "satellite_clients", None) or [])
         if main_conn is None:
-            logger.error("Slot %s: no main connection for /ban", self.slot_label)
+            logger.error(
+                "Slot %s: cannot send /ban — no upstream connection (main_clients=%d satellite_clients=%d)",
+                self.slot_label, n_main, n_sat,
+            )
             return False
-        conn_type = (
-            "main" if self.main_clients else
-            "satellite[-1]" if getattr(self, "satellite_clients", None) else "unknown"
-        )
+        if self.main_clients:
+            conn_type = "main"
+        elif getattr(self, "satellite_clients", None):
+            conn_type = f"satellite[-1] (main_clients=0, {n_sat} sat)"
+        else:
+            conn_type = "unknown"
         target = normalize_nickname_tag(nickname)
         cmd = f"ban {target}"
+        t0 = time.monotonic()
         try:
             await main_conn.write_packet_instance(serverbound.CommandPacket(command=cmd))
-            logger.info("Slot %s: sent CommandPacket %r via %s", self.slot_label, cmd, conn_type)
+            dt = (time.monotonic() - t0) * 1000.0
+            logger.info(
+                "Slot %s: /ban %s sent via %s in %.1fms (as nick=%r)",
+                self.slot_label, target, conn_type, dt, self._own_username or "?",
+            )
             return True
         except Exception as e:
-            logger.exception("Slot %s: /ban failed via %s: %s", self.slot_label, conn_type, e)
+            logger.exception(
+                "Slot %s: /ban %s failed via %s: %s",
+                self.slot_label, target, conn_type, e,
+            )
             return False
 
     async def _main_keepalive_loop(self) -> None:
@@ -900,35 +980,51 @@ class BanBotProxy(Proxy):
                 if self.main_clients:
                     conn = self.main_clients[0].destination
                 if conn is None:
-                    logger.info(
-                        "Slot %s: main-keepalive loop exiting (no main upstream; sent=%d)",
-                        self.slot_label,
-                        sent,
+                    logger.warning(
+                        "Slot %s: main-keepalive loop exiting — MAIN upstream gone "
+                        "(sent=%d pongs_main=%d pongs_sat=%d)",
+                        self.slot_label, sent,
+                        self._auto_pong_sent_main, self._auto_pong_sent_satellite,
                     )
                     return
                 try:
                     await conn.write_packet(serverbound.KeepAlivePacket)
                     sent += 1
+                    self._keepalive_sent_main = sent
+                    # First keepalive is interesting; then only every N to avoid noise.
+                    if sent == 1:
+                        logger.info(
+                            "Slot %s: first main-keepalive sent (interval=%.1fs)",
+                            self.slot_label, interval,
+                        )
+                    elif sent % _PONG_LOG_EVERY == 0:
+                        logger.info(
+                            "Slot %s: main-keepalive count=%d (pongs_main=%d pongs_sat=%d) — MAIN alive",
+                            self.slot_label, sent,
+                            self._auto_pong_sent_main, self._auto_pong_sent_satellite,
+                        )
+                    else:
+                        logger.debug(
+                            "Slot %s: main-keepalive #%d", self.slot_label, sent,
+                        )
                 except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
-                    logger.info(
-                        "Slot %s: main-keepalive send failed (%s: %s); stopping loop (sent=%d)",
-                        self.slot_label,
-                        type(e).__name__,
-                        e,
-                        sent,
+                    logger.warning(
+                        "Slot %s: main-keepalive send failed (%s: %s); stopping loop "
+                        "(sent=%d pongs_main=%d)",
+                        self.slot_label, type(e).__name__, e, sent,
+                        self._auto_pong_sent_main,
                     )
                     return
                 except Exception:
                     logger.exception(
-                        "Slot %s: main-keepalive unexpected error; stopping loop",
-                        self.slot_label,
+                        "Slot %s: main-keepalive unexpected error; stopping loop (sent=%d)",
+                        self.slot_label, sent,
                     )
                     return
         except asyncio.CancelledError:
             logger.debug(
                 "Slot %s: main-keepalive loop cancelled (sent=%d)",
-                self.slot_label,
-                sent,
+                self.slot_label, sent,
             )
             raise
 
@@ -952,6 +1048,7 @@ class BanBotProxy(Proxy):
         if self._own_username:
             self._own_username = self._own_username.strip()
         user = self._own_username or "?"
+        self._login_success_mono = time.monotonic()
         self._start_main_keepalive()
         if self._verbose_login_flow:
             logger.info(
@@ -966,7 +1063,14 @@ class BanBotProxy(Proxy):
                 getattr(packet, "staff_roles", None),
                 getattr(packet, "modo_can_speak_in_all_staff_channels", None),
             )
-        msg = f"OK  [slot {self.slot_label}] logged in as {user}"
+        # Timing breakdown (if we have it): how long Flash took to reach us and
+        # how long the handshake/login round-trip took once connected.
+        timing = ""
+        if self._main_tcp_mono is not None and self._startup_mono is not None:
+            tcp_after = self._main_tcp_mono - self._startup_mono
+            login_after = self._login_success_mono - self._main_tcp_mono
+            timing = f" (tcp +{tcp_after:.1f}s, login +{login_after:.1f}s)"
+        msg = f"OK  [slot {self.slot_label}] logged in as {user}{timing}"
         logger.info(msg)
         _safe_print(msg)
         if self._login_success_event is not None:
