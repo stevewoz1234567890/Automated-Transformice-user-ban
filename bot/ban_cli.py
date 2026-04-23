@@ -373,6 +373,58 @@ def _run_coro_on_slot(state: SlotState, coro):
     return fut.result(timeout=30)
 
 
+def _slot_status_label(s: SlotState) -> tuple[str, str]:
+    """
+    Return (tag, human-readable reason) for a slot. Tag is one of:
+      OK    — logged in AND connection alive (ready for /ban)
+      PARTL — logged in but upstream connection dropped
+      NO_LG — MAIN TCP accepted but LoginSuccessPacket never arrived
+      NO_TCP— Flash launched but never reached the proxy (main TCP)
+      CRASH — slot thread raised an exception
+      DOWN  — proxy never started
+    """
+    if s.error:
+        return ("CRASH", s.error[:60])
+    if s.proxy is None:
+        return ("DOWN ", "proxy not started")
+    if not s.flash_main_tcp_seen:
+        return ("NO_TCP", "Flash never connected to proxy")
+    if not s.login_success_event.is_set():
+        return ("NO_LG", "MAIN TCP ok but no LoginSuccessPacket")
+    if s.proxy._main_write_conn() is None:
+        return ("PARTL", "login ok but upstream closed")
+    return ("OK   ", "ready")
+
+
+def print_slot_status(states: list[SlotState], *, title: str = "SLOT STATUS") -> None:
+    """
+    Print a clearly-formatted per-slot status table to stdout *and* the log so
+    the user can immediately see which slots are not working.
+    """
+    banner = "=" * 78
+    lines = [banner, f"  {title}", banner]
+    counts = {"OK   ": 0, "PARTL": 0, "NO_LG": 0, "NO_TCP": 0, "CRASH": 0, "DOWN ": 0}
+    for s in states:
+        tag, reason = _slot_status_label(s)
+        counts[tag] = counts.get(tag, 0) + 1
+        nick = "-"
+        if s.proxy is not None:
+            nick = (getattr(s.proxy, "_own_username", None) or "").strip() or "-"
+        mark = "[  OK  ]" if tag == "OK   " else "[ FAIL ]"
+        lines.append(
+            f"  {mark}  slot {s.label:>3s}  [{tag}]  "
+            f"{s.flash_username:<28s}  nick={nick:<22s}  port={s.port:<5d}  {reason}"
+        )
+    lines.append(banner)
+    summary = " | ".join(f"{k.strip()}={v}" for k, v in counts.items() if v)
+    lines.append(f"  Totals: {summary}  (of {len(states)} slot(s))")
+    lines.append(banner)
+    for line in lines:
+        print(line, flush=True)
+        logger.info(line)
+    _flush_log_handlers()
+
+
 def fetch_room_list(
     states: list[SlotState],
     *,
@@ -523,8 +575,15 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
     dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
     dmax = float(getattr(cfg, "BAN_DELAY_MAX_SEC", 2.0))
     active = [s for s in states if s.proxy is not None]
+    results: list[tuple[str, bool, str]] = []
     for i, s in enumerate(active):
-        ok = _run_coro_on_slot(s, s.proxy.send_ban_command(target_user))
+        try:
+            ok = _run_coro_on_slot(s, s.proxy.send_ban_command(target_user))
+            reason = "sent" if ok else "send returned False"
+        except Exception as exc:
+            ok = False
+            reason = f"{type(exc).__name__}: {exc}"
+        results.append((s.label, bool(ok), reason))
         logger.info(
             "[slot %s] /ban %r -> %s",
             s.label,
@@ -533,6 +592,28 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
         )
         if i < len(active) - 1:
             time.sleep(random.uniform(dmin, dmax))
+
+    # Skipped slots (proxy never started) — mark them FAIL explicitly.
+    inactive = [s for s in states if s.proxy is None]
+    for s in inactive:
+        results.append((s.label, False, "proxy not started"))
+
+    ok_count = sum(1 for _, ok, _ in results if ok)
+    fail_count = len(results) - ok_count
+    banner = "=" * 78
+    lines = [
+        banner,
+        f"  BAN RESULTS for {target_user!r}   (OK: {ok_count}  /  FAIL: {fail_count}  of {len(results)})",
+        banner,
+    ]
+    for label, ok, reason in results:
+        mark = "[  OK  ]" if ok else "[ FAIL ]"
+        lines.append(f"  {mark}  slot {label:>3s}  -> {reason}")
+    lines.append(banner)
+    for line in lines:
+        print(line, flush=True)
+        logger.info(line)
+    _flush_log_handlers()
     logger.info("All accounts finished sending /ban commands for this round.")
 
 
@@ -937,6 +1018,8 @@ def main(argv: list[str] | None = None) -> None:
                 )
             time.sleep(max(0.0, stagger_after))
     _wait_for_game_clients(states, auto_flash_launched=auto_flash)
+
+    print_slot_status(states, title="SLOT STATUS AFTER LOGIN PHASE")
 
     while True:
         room = _pick_room(states)
