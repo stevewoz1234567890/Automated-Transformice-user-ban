@@ -292,6 +292,37 @@ class BanBotProxy(Proxy):
             return "127.0.0.1"
         return a
 
+    @pak.packet_listener(clientbound.PingPacket)
+    async def _auto_pong_server_ping(self, source, packet):
+        """Reply to the server's ``PingPacket`` ourselves so the connection survives Flash throttling.
+
+        The TFM server periodically sends a ``clientbound.PingPacket`` (id 28/6) on both
+        the main and satellite connections and expects a matching ``serverbound.PongPacket``
+        back within a few seconds. When the Flash projector window is minimized, Flash
+        throttles its Timer / ENTER_FRAME events (down to ~1 Hz or less), so its pong reply
+        is delayed past the server's timeout and the server closes the TCP. That propagates
+        through caseus and empties ``self.main_clients`` / ``self.satellite_clients``, which
+        is why ``/ban`` later fails with "no main connection for /ban".
+
+        ``serverbound.KeepAlivePacket`` (id 26/26) is a different, *unsolicited* client heartbeat
+        and the server does not treat it as a pong. Only sending a real ``PongPacket`` with the
+        echoed payload keeps the connection alive. We fire the proxy-side pong immediately and
+        still forward the ping to Flash (default ``FORWARD_PACKET`` behaviour) so Flash's own
+        latency/UI bookkeeping is undisturbed. If Flash also pongs later, the server simply sees
+        a duplicate payload byte and ignores it — but we no longer depend on Flash's throttled
+        event loop for connection liveness.
+        """
+        payload = getattr(packet, "payload", 0) or 0
+        try:
+            await source.write_packet(serverbound.PongPacket, payload=payload)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+            logger.debug(
+                "Slot %s: auto-pong send failed (%s: %s); upstream already closing",
+                self.slot_label,
+                type(e).__name__,
+                e,
+            )
+
     @pak.packet_listener(clientbound.ChangeSatelliteServerPacket)
     async def _proxy_satellite_server(self, source, packet):
         """Send Flash only 127.0.0.1 + local satellite port (never the public game host)."""
