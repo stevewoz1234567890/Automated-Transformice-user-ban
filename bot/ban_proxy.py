@@ -29,12 +29,6 @@ def _safe_print(msg: str) -> None:
         print(msg, flush=True)
 
 
-def project_root_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
-
-
 def ensure_flash_trust_config() -> tuple[Path, list[str]] | None:
     """
     Windows Flash Player trust for TFMProxyLoader (same idea as transformice-bot).
@@ -254,7 +248,6 @@ class BanBotProxy(Proxy):
         self.register_packet_listener(self._on_room_list_cb, clientbound.RoomListPacket)
         # Player list collected after joining a room; key = username, value = session_id.
         self.known_players: dict[str, int] = {}
-        self._player_list_ready = threading.Event()
         self._player_list_version: int = 0
         self.register_packet_listener(self._on_set_player_list, clientbound.SetPlayerListPacket)
         self.register_packet_listener(self._on_update_player_list, clientbound.UpdatePlayerListPacket)
@@ -714,7 +707,6 @@ class BanBotProxy(Proxy):
             if username:
                 self.known_players[username] = getattr(p, "session_id", 0) or 0
         self._player_list_version += 1
-        self._player_list_ready.set()
 
     async def _on_update_player_list(self, source, packet):
         """Single player joining the room after us (arrives via satellite)."""
@@ -769,24 +761,6 @@ class BanBotProxy(Proxy):
             serverbound.RoomListPacket(game_mode=gm)
         )
         return True
-
-    async def send_room_command(self, room_user_input: str) -> bool:
-        """
-        Send /room <name>. ``room_user_input`` is what you would type after /room, e.g. ``*Racing1``.
-        """
-        main_conn = self._main_write_conn()
-        if main_conn is None:
-            logger.error("Slot %s: no main connection for /room", self.slot_label)
-            return False
-        raw = room_user_input.strip()
-        cmd = raw if raw.lower().startswith("room ") else f"room {raw}"
-        try:
-            await main_conn.write_packet_instance(serverbound.CommandPacket(command=cmd))
-            logger.info("Slot %s: sent CommandPacket %r", self.slot_label, cmd)
-            return True
-        except Exception as e:
-            logger.exception("Slot %s: /room failed: %s", self.slot_label, e)
-            return False
 
     async def send_ban_command(self, nickname: str) -> bool:
         """Send /ban nickname#tag."""

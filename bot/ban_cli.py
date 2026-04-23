@@ -449,11 +449,12 @@ def _collect_player_list_via_join(
     room: str,
     *,
     timeout_sec: float = 12.0,
+    stagger_sec: float = 0.15,
 ) -> list[str]:
     """
-    Send ``JoinRoomPacket`` to the first live slot's upstream main server and
-    wait for a new ``SetPlayerListPacket``.  This properly triggers the server
-    to send the player list for the target room.
+    Send ``JoinRoomPacket`` to **all** live slots (staggered) so every bot
+    moves to *room*.  Wait for at least one slot's ``SetPlayerListPacket``
+    (version bump), then aggregate player names from all slots that responded.
 
     Returns a sorted list of unique usernames.
     """
@@ -461,27 +462,27 @@ def _collect_player_list_via_join(
     if not live:
         return []
 
-    slot = live[0]
-    proxy = slot.proxy
-    version_before = proxy._player_list_version
+    versions_before = {id(s.proxy): s.proxy._player_list_version for s in live}
 
-    try:
-        _run_coro_on_slot(slot, proxy.join_room(room))
-    except Exception as exc:
-        logger.warning("_collect_player_list_via_join: join_room failed: %s", exc)
-        return []
+    for s in live:
+        try:
+            _run_coro_on_slot(s, s.proxy.join_room(room))
+        except Exception as exc:
+            logger.debug("join_room slot %s failed: %s", s.label, exc)
+        time.sleep(stagger_sec)
 
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
-        if proxy._player_list_version != version_before:
+        if any(s.proxy._player_list_version != versions_before[id(s.proxy)] for s in live):
             time.sleep(0.8)  # let UpdatePlayerListPackets accumulate
             break
         time.sleep(0.2)
 
-    if proxy._player_list_version == version_before:
-        return []
-
-    return sorted(proxy.known_players.keys(), key=str.lower)
+    all_players: set[str] = set()
+    for s in live:
+        if s.proxy._player_list_version != versions_before[id(s.proxy)]:
+            all_players.update(s.proxy.known_players.keys())
+    return sorted(all_players, key=str.lower)
 
 
 def _show_and_pick_player(states: list[SlotState], room: str) -> str:
@@ -516,17 +517,6 @@ def _show_and_pick_player(states: list[SlotState], room: str) -> str:
         return input("Target user (nickname#tag, e.g. Zizao#0000): ").strip()
 
 
-def send_room_to_all(states: list[SlotState], room: str, cfg) -> None:
-    """Send /room to every slot (staggered). Call before collecting player list."""
-    stagger = float(getattr(cfg, "ROOM_STAGGER_SEC", 0.15))
-    for s in states:
-        if s.proxy is None:
-            continue
-        ok = _run_coro_on_slot(s, s.proxy.send_room_command(room))
-        logger.info("[slot %s] /room -> %s", s.label, "sent" if ok else "FAILED")
-        time.sleep(stagger)
-
-
 def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
     """Send /ban to every slot (staggered). Call after player is chosen."""
     dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
@@ -543,12 +533,6 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
         if i < len(active) - 1:
             time.sleep(random.uniform(dmin, dmax))
     logger.info("All accounts finished sending /ban commands for this round.")
-
-
-def run_ban_round(states: list[SlotState], room: str, target_user: str, cfg) -> None:
-    send_room_to_all(states, room, cfg)
-    time.sleep(0.5)
-    send_ban_to_all(states, target_user, cfg)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
