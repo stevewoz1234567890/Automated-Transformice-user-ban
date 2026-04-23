@@ -591,8 +591,28 @@ class BanBotProxy(Proxy):
     async def startup(self):
         # Flash trust is applied once in ban_cli.start_all_slots (not here — avoids 12 threads
         # racing on the same TFMProxyLoader.cfg and WinError 32/5).
-        self.main_srv = await self.open_main_server()
-        self.satellite_srv = await self.open_satellite_server()
+        #
+        # Retry port binding: if the bot is restarted quickly the OS may not have
+        # released the previous TCP ports yet (TIME_WAIT / CLOSE_WAIT).  We retry
+        # a few times with a short delay before giving up.
+        _bind_retries = 8
+        _bind_retry_delay = 2.0
+        for attempt in range(_bind_retries):
+            try:
+                self.main_srv = await self.open_main_server()
+                self.satellite_srv = await self.open_satellite_server()
+                break
+            except OSError as e:
+                if e.errno != 10048 or attempt == _bind_retries - 1:
+                    raise
+                logger.warning(
+                    "Slot %s: port in use (attempt %d/%d), retrying in %.0fs…",
+                    self.slot_label,
+                    attempt + 1,
+                    _bind_retries,
+                    _bind_retry_delay,
+                )
+                await asyncio.sleep(_bind_retry_delay)
         if self.host_socket_policy_port is not None:
             self.socket_policy_srv = await self.open_socket_policy_server()
         bind = self.host_address
@@ -673,7 +693,15 @@ class BanBotProxy(Proxy):
             peer,
             self.host_satellite_port,
         )
-        await super().new_satellite_connection(client_reader, client_writer)
+        try:
+            await super().new_satellite_connection(client_reader, client_writer)
+        except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+            logger.debug(
+                "Slot %s: satellite connection closed (%s: %s)",
+                self.slot_label,
+                type(e).__name__,
+                e,
+            )
 
     async def on_start(self):
         self._loop = asyncio.get_running_loop()
@@ -685,15 +713,16 @@ class BanBotProxy(Proxy):
     def _main_write_conn(self):
         """Return the best upstream connection for sending game commands.
 
-        Prefers the main connection; falls back to the satellite connection
-        if the main TCP was closed (Transformice forwards game traffic via
-        satellite after the initial handshake/login).
+        Prefers the main connection; falls back to the most recent satellite
+        connection if the main TCP was closed.  Using sat[-1] (newest) rather
+        than sat[0] (oldest) ensures we use the room satellite that was
+        established after JoinRoomPacket, not the stale login satellite.
         """
         if self.main_clients:
             return self.main_clients[0].destination
         sat = getattr(self, "satellite_clients", None)
         if sat:
-            return sat[0].destination
+            return sat[-1].destination
         return None
 
     async def _on_room_list_cb(self, source, packet):
@@ -780,14 +809,18 @@ class BanBotProxy(Proxy):
         if main_conn is None:
             logger.error("Slot %s: no main connection for /ban", self.slot_label)
             return False
+        conn_type = (
+            "main" if self.main_clients else
+            "satellite[-1]" if getattr(self, "satellite_clients", None) else "unknown"
+        )
         target = normalize_nickname_tag(nickname)
         cmd = f"ban {target}"
         try:
             await main_conn.write_packet_instance(serverbound.CommandPacket(command=cmd))
-            logger.info("Slot %s: sent CommandPacket %r", self.slot_label, cmd)
+            logger.info("Slot %s: sent CommandPacket %r via %s", self.slot_label, cmd, conn_type)
             return True
         except Exception as e:
-            logger.exception("Slot %s: /ban failed: %s", self.slot_label, e)
+            logger.exception("Slot %s: /ban failed via %s: %s", self.slot_label, conn_type, e)
             return False
 
     @pak.packet_listener(clientbound.LoginSuccessPacket)
