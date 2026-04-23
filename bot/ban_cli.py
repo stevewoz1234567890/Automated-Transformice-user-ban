@@ -896,6 +896,8 @@ def main(argv: list[str] | None = None) -> None:
                 if st.login_success_event.wait(timeout=chunk):
                     got_login = True
                     logger.info("Slot %s reported login success; proceeding.", st.label)
+                    if bool(getattr(cfg, "FLASH_MINIMIZE_AFTER_OPEN", False)) and st.flash_pid:
+                        flash_launch.minimize_flash_window(st.flash_pid, st.label)
                     break
                 if st.flash_main_tcp_seen:
                     extra_verbose = (

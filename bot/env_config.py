@@ -196,6 +196,11 @@ def load_config_from_env(repo_root: Path) -> object:
     # Defaults to True (historical behavior) but .env sets it False to require manual launch.
     B("UI_AUTO_LAUNCH_FLASH", "BOT_UI_AUTO_LAUNCH_FLASH", True)
 
+    # FLASH_MINIMIZE_AFTER_OPEN: minimize each Flash window after login succeeds.
+    # Reads directly from FLASH_MINIMIZE_AFTER_OPEN in .env (not BOT_* prefixed).
+    _min_raw = (os.environ.get("FLASH_MINIMIZE_AFTER_OPEN") or "").strip().lower()
+    ns.FLASH_MINIMIZE_AFTER_OPEN = _min_raw in ("1", "true", "yes", "on")
+
     # BOT_UI_FLASH_PLAYER_PATH: optional path to flashplayer exe; fed into FLASH_PLAYER_EXE
     # which resolve_flash_paths() reads.  Must be applied before flash_launch_files_present().
     fp = (os.environ.get("BOT_UI_FLASH_PLAYER_PATH") or "").strip()
