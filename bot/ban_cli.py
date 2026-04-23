@@ -351,7 +351,7 @@ def _wait_for_game_clients(
         if all(s.login_success_event.is_set() for s in states):
             logger.info("All %d slot(s) logged in — proceeding.", len(states))
             return
-        if all(s.proxy and s.proxy.main_clients for s in states):
+        if all(s.proxy and (s.proxy.main_clients or getattr(s.proxy, "satellite_clients", None)) for s in states):
             logger.info("All configured slots have a connected client.")
             return
         if time.monotonic() >= next_log:
@@ -385,7 +385,7 @@ def fetch_room_list(
 
     Game mode ints: 1=Transformice, 2=Bootcamp, 3=Vanilla, 5=Racing, 9=Module.
     """
-    live = [s for s in states if s.proxy and s.proxy.main_clients]
+    live = [s for s in states if s.proxy and s.proxy._main_write_conn() is not None]
     if not live:
         logger.warning("No live slot available to fetch room list.")
         return []
@@ -459,7 +459,7 @@ def _collect_player_list_via_join(
 
     Returns a sorted list of unique usernames.
     """
-    live = [s for s in states if s.proxy and s.proxy.main_clients]
+    live = [s for s in states if s.proxy and s.proxy._main_write_conn() is not None]
     if not live:
         return []
 

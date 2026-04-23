@@ -683,10 +683,18 @@ class BanBotProxy(Proxy):
         await asyncio.gather(*tasks)
 
     def _main_write_conn(self):
-        if not self.main_clients:
-            return None
-        client = self.main_clients[0]
-        return client.destination
+        """Return the best upstream connection for sending game commands.
+
+        Prefers the main connection; falls back to the satellite connection
+        if the main TCP was closed (Transformice forwards game traffic via
+        satellite after the initial handshake/login).
+        """
+        if self.main_clients:
+            return self.main_clients[0].destination
+        sat = getattr(self, "satellite_clients", None)
+        if sat:
+            return sat[0].destination
+        return None
 
     async def _on_room_list_cb(self, source, packet):
         """Collect rooms from every RoomListPacket the server sends."""
