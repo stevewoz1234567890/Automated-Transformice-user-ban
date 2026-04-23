@@ -270,6 +270,13 @@ class BanBotProxy(Proxy):
         self._auto_pong_sent_main = 0
         self._auto_pong_sent_satellite = 0
         self._keepalive_sent_main = 0
+        # Ring buffer of the last packets seen on MAIN in each direction. Used
+        # by the session-end diagnostic to reveal which side produced the final
+        # packet before EOF (server kicked vs Flash walked away).
+        self._main_recent_from_server: list[tuple[float, str]] = []
+        self._main_recent_from_client: list[tuple[float, str]] = []
+        self._MAIN_RECENT_LIMIT = 6
+        self.register_packet_listener(self._track_main_packet, Packet)
         # Room list collected from RoomListPacket responses; key = room name, value = player count.
         self.known_rooms: dict[str, int] = {}
         self._room_list_ready = threading.Event()
@@ -314,24 +321,29 @@ class BanBotProxy(Proxy):
 
     @pak.packet_listener(clientbound.PingPacket)
     async def _auto_pong_server_ping(self, source, packet):
-        """Reply to the server's ``PingPacket`` ourselves so the connection survives Flash throttling.
+        """Forward ``clientbound.PingPacket`` to Flash so it can pong with its real session
+        fingerprint, and (optionally) also send a proxy-side pong as a safety net.
 
-        The TFM server periodically sends a ``clientbound.PingPacket`` (id 28/6) on both
-        the main and satellite connections and expects a matching ``serverbound.PongPacket``
-        back within a few seconds. When the Flash projector window is minimized, Flash
-        throttles its Timer / ENTER_FRAME events (down to ~1 Hz or less), so its pong reply
-        is delayed past the server's timeout and the server closes the TCP. That propagates
-        through caseus and empties ``self.main_clients`` / ``self.satellite_clients``, which
-        is why ``/ban`` later fails with "no main connection for /ban".
+        The TFM server sends a ``clientbound.PingPacket`` periodically on both the main and
+        satellite connections. It expects a matching ``serverbound.PongPacket`` whose
+        fingerprint (stack layout / prior state) identifies the *real* Flash client. An
+        earlier experiment had the proxy pong on Flash's behalf and **swallow** the ping
+        (``DO_NOTHING``); packet-trail logging showed that server then closed MAIN with
+        ``clean-eof`` exactly 10 s after its last ping — even with ``pongs_main>=1`` — because
+        the proxy pong has a different fingerprint than Flash's real pong (server treats
+        "reply present but wrong" as more suspicious than "no reply yet").
 
-        ``serverbound.KeepAlivePacket`` (id 26/26) is a different, *unsolicited* client heartbeat
-        and the server does not treat it as a pong. Only sending a real ``PongPacket`` with the
-        echoed payload keeps the connection alive. We fire the proxy-side pong immediately and
-        still forward the ping to Flash (default ``FORWARD_PACKET`` behaviour) so Flash's own
-        latency/UI bookkeeping is undisturbed. If Flash also pongs later, the server simply sees
-        a duplicate payload byte and ignores it — but we no longer depend on Flash's throttled
-        event loop for connection liveness.
+        Fix: default behaviour now **forwards** the ping so Flash pongs itself (this requires
+        Flash to not be throttled — see ``_disable_process_throttling`` in ``flash_launch``).
+        Setting env ``BOT_AUTO_PONG=1`` restores the old proxy-pong behaviour as an escape
+        hatch for environments where Flash throttling can't be disabled.
         """
+        auto_pong_disabled = (os.environ.get("BOT_AUTO_PONG", "1").strip().lower()
+                              in ("0", "false", "no", "off"))
+        if auto_pong_disabled:
+            # Opt-out: forward the ping to Flash and let the real client pong.
+            return self.FORWARD_PACKET
+
         payload = getattr(packet, "payload", 0) or 0
         is_sat = bool(getattr(source, "is_satellite", False))
         conn = "SAT" if is_sat else "MAIN"
@@ -342,7 +354,7 @@ class BanBotProxy(Proxy):
                 "Slot %s: auto-pong %s send failed (%s: %s); upstream already closing",
                 self.slot_label, conn, type(e).__name__, e,
             )
-            return
+            return self.DO_NOTHING
 
         if is_sat:
             self._auto_pong_sent_satellite += 1
@@ -351,11 +363,10 @@ class BanBotProxy(Proxy):
             self._auto_pong_sent_main += 1
             count = self._auto_pong_sent_main
 
-        # First pong confirms the liveness fix is working; subsequent pongs are
-        # noisy, so only log every Nth one and keep the rest at DEBUG.
         if count == 1:
             logger.info(
-                "Slot %s: first auto-pong sent on %s (payload=%s) — connection-liveness fix active",
+                "Slot %s: first auto-pong sent on %s (payload=%s) — BOT_AUTO_PONG=1 "
+                "(ping NOT forwarded to Flash)",
                 self.slot_label, conn, payload,
             )
         elif count % _PONG_LOG_EVERY == 0:
@@ -368,6 +379,8 @@ class BanBotProxy(Proxy):
                 "Slot %s: %s auto-pong #%d payload=%s",
                 self.slot_label, conn, count, payload,
             )
+
+        return self.DO_NOTHING
 
     @pak.packet_listener(clientbound.ChangeSatelliteServerPacket)
     async def _proxy_satellite_server(self, source, packet):
@@ -491,6 +504,22 @@ class BanBotProxy(Proxy):
             )
             return self.DO_NOTHING
         self._packet_login_sent = True
+
+    async def _track_main_packet(self, source, packet):
+        """Remember the last few packet types on each MAIN direction for diagnostics."""
+        if getattr(source, "is_satellite", False):
+            return
+        tn = type(packet).__name__
+        now = time.monotonic()
+        # Servers send clientbound packets; caseus delivers them via the
+        # ServerConnection source. ClientConnections deliver serverbound.
+        if isinstance(packet, ServerboundPacket):
+            buf = self._main_recent_from_client
+        else:
+            buf = self._main_recent_from_server
+        buf.append((now, tn))
+        if len(buf) > self._MAIN_RECENT_LIMIT:
+            del buf[: len(buf) - self._MAIN_RECENT_LIMIT]
 
     async def _log_all_main_packet(self, source, packet):
         if not self._log_all_main_packets:
@@ -783,14 +812,65 @@ class BanBotProxy(Proxy):
         # force-close a stuck Flash window (BOT_FLASH_CLOSE_ON_LOGIN_FAIL). On Windows the
         # reset surfaces as WinError 64 ("El nombre de red especificado ya no está
         # disponible") wrapped in ConnectionResetError.
+        #
+        # Also annotate how long the MAIN session survived and which side tore it down —
+        # vital for diagnosing the "login ok but upstream closed" failure mode. The two
+        # likely culprits (Flash watchdog vs TFM idle-kick) leave different fingerprints:
+        #   • Flash-side close  -> logged at/near the time Flash's socket timer fires;
+        #     client reader EOFs first, no server-side exception.
+        #   • Server-side close -> ConnectionResetError/EOF from the upstream socket first;
+        #     caseus propagates via destination.close(), so the client task also ends.
+        tcp_accept_mono = time.monotonic()
+        close_reason = "clean-eof"
+        close_exc: BaseException | None = None
         try:
             await super().new_main_connection(client_reader, client_writer)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+            close_reason = f"{type(e).__name__}"
+            close_exc = e
             logger.debug(
-                "Slot %s: main connection closed (%s: %s)",
+                "Slot %s: main connection OS-level error (%s: %s)",
+                self.slot_label, type(e).__name__, e,
+            )
+        except Exception as e:  # noqa: BLE001
+            close_reason = f"unhandled:{type(e).__name__}"
+            close_exc = e
+            logger.exception(
+                "Slot %s: main connection listener raised unhandled exception",
                 self.slot_label,
-                type(e).__name__,
-                e,
+            )
+        finally:
+            alive_sec = time.monotonic() - tcp_accept_mono
+            since_login = (
+                time.monotonic() - self._login_success_mono
+                if self._login_success_mono is not None
+                else None
+            )
+            # A post-login close that happens within the first few minutes of login is
+            # the failure mode we are hunting — log it at WARNING so it is easy to spot.
+            lvl = logger.warning if (since_login is not None and since_login < 600) else logger.info
+            def _fmt_recent(buf: list[tuple[float, str]]) -> str:
+                if not buf:
+                    return "(none)"
+                now_local = time.monotonic()
+                return ",".join(f"-{now_local - ts:.1f}s:{name}" for ts, name in buf)
+
+            lvl(
+                "Slot %s: MAIN session ended alive=%.1fs login+%ss reason=%s "
+                "(pongs_main=%d pongs_sat=%d ka=%d main_clients_now=%d sat_clients_now=%d)%s "
+                "srv→last=[%s] cli→last=[%s]",
+                self.slot_label,
+                alive_sec,
+                f"{since_login:.1f}" if since_login is not None else "n/a",
+                close_reason,
+                self._auto_pong_sent_main,
+                self._auto_pong_sent_satellite,
+                self._keepalive_sent_main,
+                len(self.main_clients or []),
+                len(getattr(self, "satellite_clients", None) or []),
+                f" exc={close_exc!r}" if close_exc is not None else "",
+                _fmt_recent(self._main_recent_from_server),
+                _fmt_recent(self._main_recent_from_client),
             )
 
     async def new_satellite_connection(self, client_reader, client_writer):

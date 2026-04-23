@@ -1310,25 +1310,227 @@ def click_transformice_in_loader(
     return result
 
 
-def minimize_flash_window(pid: int, slot_label: str) -> bool:
-    """
-    Minimize the Flash player window for *pid* via SW_MINIMIZE.
+_FLASH_TILE_SLOT_INDEX: dict[str, int] = {}
+_FLASH_TILE_LOCK = threading.Lock()
 
-    Safe to call after login succeeds — Flash has already connected and loaded
-    by this point, so minimizing will not suspend the SWF network activity.
-    Returns True if the window was found and minimize was sent.
+
+def _next_tile_index(slot_label: str) -> int:
+    """Allocate a stable zero-based tile index for *slot_label* (first-come-first-served)."""
+    with _FLASH_TILE_LOCK:
+        if slot_label in _FLASH_TILE_SLOT_INDEX:
+            return _FLASH_TILE_SLOT_INDEX[slot_label]
+        idx = len(_FLASH_TILE_SLOT_INDEX)
+        _FLASH_TILE_SLOT_INDEX[slot_label] = idx
+        return idx
+
+
+def _disable_process_throttling(pid: int, slot_label: str) -> bool:
+    """
+    Disable Windows 10/11 background power-throttling (EcoQoS) for *pid* and
+    raise it to HIGH priority.
+
+    Windows 10 1709+ applies **process power throttling** ("EcoQoS" / Efficiency
+    Mode) to any process whose windows are not in the foreground. That throttles
+    CPU/timer resolution and is the *real* reason Flash's ``AnticheatPacket``
+    responder goes silent 15-30 s after login even when the Flash window is
+    visible and un-occluded (tiling alone doesn't rescue it — packet trails
+    show a sudden buffered-event flush at -0.2 s right when ``WM_CLOSE`` wakes
+    the process up).
+
+    Fix (per MS docs, NtSetInformationProcess / ProcessPowerThrottling):
+
+      * ``SetProcessInformation(ProcessPowerThrottling, DISABLE_THROTTLING)``
+        turns EcoQoS off for this process regardless of its window state.
+      * ``SetPriorityClass(HIGH_PRIORITY_CLASS)`` keeps the scheduler from
+        starving Flash when the OS is under load from 14 concurrent instances.
+
+    Both calls silently no-op on older Windows that don't support them.
+    Returns True on any successful call.
     """
     if sys.platform != "win32" or pid <= 0:
         return False
     import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+
+    PROCESS_SET_INFORMATION = 0x0200
+    PROCESS_SET_LIMITED_INFORMATION = 0x2000
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    desired = PROCESS_SET_INFORMATION | PROCESS_SET_LIMITED_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION
+
+    hproc = kernel32.OpenProcess(desired, False, int(pid))
+    if not hproc:
+        err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else "?"
+        logger.warning(
+            "Slot %s: OpenProcess(SET_INFORMATION|SET_LIMITED_INFORMATION) failed for PID %s (err=%s) — "
+            "cannot disable EcoQoS; Flash may throttle",
+            slot_label, pid, err,
+        )
+        return False
+
+    any_ok = False
+    try:
+        HIGH_PRIORITY_CLASS = 0x00000080
+        if kernel32.SetPriorityClass(hproc, HIGH_PRIORITY_CLASS):
+            any_ok = True
+        else:
+            err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else "?"
+            logger.debug(
+                "Slot %s: SetPriorityClass(HIGH) failed for PID %s (err=%s)",
+                slot_label, pid, err,
+            )
+
+        class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+            _fields_ = [
+                ("Version", wintypes.ULONG),
+                ("ControlMask", wintypes.ULONG),
+                ("StateMask", wintypes.ULONG),
+            ]
+
+        ProcessPowerThrottling = 4
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+
+        state = PROCESS_POWER_THROTTLING_STATE()
+        state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION
+        state.ControlMask = (
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        )
+        state.StateMask = 0
+
+        set_info = getattr(kernel32, "SetProcessInformation", None)
+        if set_info is not None:
+            ok = set_info(
+                hproc,
+                ProcessPowerThrottling,
+                ctypes.byref(state),
+                ctypes.sizeof(state),
+            )
+            if ok:
+                any_ok = True
+            else:
+                err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else "?"
+                logger.debug(
+                    "Slot %s: SetProcessInformation(PowerThrottling=off) failed for PID %s (err=%s) — "
+                    "older Windows build",
+                    slot_label, pid, err,
+                )
+        if any_ok:
+            logger.info(
+                "Slot %s: Flash PID %s priority=HIGH, EcoQoS power-throttling DISABLED — "
+                "keeps Anticheat responder running when window is not foreground",
+                slot_label, pid,
+            )
+    finally:
+        kernel32.CloseHandle(hproc)
+    return any_ok
+
+
+def minimize_flash_window(pid: int, slot_label: str) -> bool:
+    """
+    Shrink + tile the Flash Player window for *pid* to a small, non-overlapping
+    cell at the top of the primary monitor.
+
+    Background — why not SW_MINIMIZE or off-screen:
+
+    Flash Player's standalone projector throttles its internal event loop to
+    ~2 Hz whenever the OS considers the window "not visible". That trips in
+    three situations:
+
+      1. Window is minimized (``SW_MINIMIZE``).
+      2. Window is moved fully off-screen (``SetWindowPos`` to negative coords).
+      3. Window is **fully occluded** by another top-level window.
+
+    When throttled Flash stops responding to server ``AnticheatPacket``
+    challenges within 10–20 s, the Transformice server then kicks the TCP
+    session with a clean EOF, and ``/ban`` fails with "no main connection"
+    (see ``BanBotProxy._main_keepalive_loop`` / "MAIN session ended" exit logs).
+
+    With 14 Flash windows stacked on top of each other only *one* is
+    un-occluded, so the other 13 throttle — which is exactly what the logs
+    showed even with ``BOT_FLASH_DIAG_KEEP_ONSCREEN=1``. Moving them off-screen
+    made every single one "invisible" and all of them throttled.
+
+    Fix: put every Flash window in its **own** tiny on-screen rectangle so no
+    two overlap. Each window is visible, non-occluded, and Flash's throttling
+    heuristic never fires — but the 80×60 tiles are small enough that the
+    overall footprint is barely noticeable (14 tiles → 1 row of ~1120×60 pixels
+    at the top of the primary display).
+
+    ``close_flash_window`` still finds the HWND by PID and can send ``WM_CLOSE``
+    normally because the window remains on-screen and visible.
+
+    Returns True if the window was found and repositioned.
+    """
+    if sys.platform != "win32" or pid <= 0:
+        return False
+    import ctypes
+    from ctypes import wintypes
 
     hwnd = _win_find_toplevel_hwnd(pid)
     if hwnd is None:
         logger.debug("minimize_flash_window: no HWND for PID %s (slot %s)", pid, slot_label)
         return False
-    SW_MINIMIZE = 6
-    ctypes.windll.user32.ShowWindow(hwnd, SW_MINIMIZE)
-    logger.info("Minimized Flash window HWND=%s (slot %s)", hwnd, slot_label)
+
+    user32 = ctypes.windll.user32
+
+    TILE_W = int(os.environ.get("BOT_FLASH_TILE_W", "80"))
+    TILE_H = int(os.environ.get("BOT_FLASH_TILE_H", "60"))
+    TILE_W = max(32, TILE_W)
+    TILE_H = max(32, TILE_H)
+
+    screen_w = int(user32.GetSystemMetrics(0)) or 1920
+    screen_h = int(user32.GetSystemMetrics(1)) or 1080
+
+    cols = max(1, screen_w // TILE_W)
+    idx = _next_tile_index(str(slot_label))
+    col = idx % cols
+    row = idx // cols
+
+    x = col * TILE_W
+    y = row * TILE_H
+    if y + TILE_H > screen_h:
+        y = max(0, screen_h - TILE_H - (row * 2))
+
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    SWP_ASYNCWINDOWPOS = 0x4000
+    HWND_BOTTOM = 1
+
+    ok = bool(
+        user32.SetWindowPos(
+            hwnd,
+            HWND_BOTTOM,
+            x,
+            y,
+            TILE_W,
+            TILE_H,
+            SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        )
+    )
+    if not ok:
+        err = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else "?"
+        logger.warning(
+            "Slot %s: SetWindowPos tile failed for HWND=%s (err=%s); "
+            "leaving window in place — do NOT SW_MINIMIZE or move off-screen "
+            "(both throttle Flash's event loop and drop MAIN TCP)",
+            slot_label, hwnd, err,
+        )
+        return False
+
+    logger.info(
+        "Slot %s: Flash HWND=%s tiled to (%d,%d) %dx%d [row=%d col=%d] — "
+        "kept on-screen + un-occluded so Flash event loop does NOT throttle "
+        "(avoids Anticheat silence → server clean-eof kick)",
+        slot_label, hwnd, x, y, TILE_W, TILE_H, row, col,
+    )
+    # Tiling alone isn't enough — Windows 10+ power-throttles background
+    # processes regardless of window visibility. Disable EcoQoS + raise
+    # priority so Flash's Anticheat responder keeps running.
+    _disable_process_throttling(pid, slot_label)
     return True
 
 
