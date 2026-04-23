@@ -21,7 +21,7 @@ block_cipher = None
 datas, binaries, hiddenimports = [], [], []
 # ``pak`` is a separate PyPI package (caseus dependency) and is imported in ``bot/ban_proxy.py``;
 # PyInstaller often omits it from the one-file bundle unless collected explicitly.
-for pkg in ("caseus", "pak", "aiohttp", "colorama"):
+for pkg in ("caseus", "pak", "aiohttp", "colorama", "dotenv"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
