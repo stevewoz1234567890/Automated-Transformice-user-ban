@@ -870,7 +870,13 @@ def main(argv: list[str] | None = None) -> None:
             deadline = time.monotonic() + login_timeout
             got_login = False
             verbose = bool(getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", True))
-            if not cfg_flash_auto:
+            packet_login = bool(getattr(cfg, "PACKET_AUTO_LOGIN", False))
+            if packet_login:
+                logger.info(
+                    "Slot %s: PACKET_AUTO_LOGIN — waiting for LoginSuccessPacket (proxy injects credentials automatically).",
+                    st.label,
+                )
+            elif not cfg_flash_auto:
                 logger.info(
                     "Slot %s: manual login — type username/password and submit in Flash. "
                     "Watch log for HandshakeResponse, LoginPacket (password redacted), "
