@@ -674,6 +674,8 @@ def launch_one_flash_loader(
                 fy,
             )
             time.sleep(post_open_delay_sec)
+            minimize_raw = (os.environ.get("FLASH_MINIMIZE_AFTER_OPEN") or "").strip().lower()
+            minimize_after = minimize_raw in ("1", "true", "yes", "on")
             if _win_click_client_fraction(hwnd, frac_x=fx, frac_y=fy, flash_pid=p.pid):
                 logger.info(
                     "Sent mouse click to HWND=%s (slot %s) for Transformice button "
@@ -681,6 +683,11 @@ def launch_one_flash_loader(
                     hwnd,
                     label,
                 )
+                if minimize_after:
+                    import ctypes
+                    SW_MINIMIZE = 6
+                    ctypes.windll.user32.ShowWindow(hwnd, SW_MINIMIZE)
+                    logger.info("Minimized Flash window HWND=%s (slot %s)", hwnd, label)
             else:
                 logger.warning(
                     "Loader click failed for HWND=%s slot %s; click Transformice manually.",
