@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import logging
 import random
 import os
@@ -443,6 +444,33 @@ def print_slot_status(states: list[SlotState], *, title: str = "SLOT STATUS") ->
     _flush_log_handlers()
 
 
+def close_all_flash_windows(states: list[SlotState], cfg: object | None = None) -> None:
+    """
+    Close every Flash projector window this bot session launched.
+
+    Called from the ``main()`` ``finally`` block so the user never has to
+    hand-close 14 Flash windows after the bot finishes (or crashes). Mirrors
+    the per-slot close used when a login times out: WM_CLOSE first, then
+    ``TerminateProcess`` after ``FLASH_CLOSE_GRACE_SEC`` if needed.
+    """
+    grace = float(getattr(cfg, "FLASH_CLOSE_GRACE_SEC", 2.0)) if cfg is not None else 2.0
+    live = [s for s in states if s.flash_pid and flash_launch.flash_pid_is_alive(s.flash_pid)]
+    if not live:
+        logger.info("Flash cleanup: no live Flash processes to close.")
+        return
+    logger.info("Flash cleanup: closing %d Flash window(s) for slots %s...",
+                len(live), [s.label for s in live])
+    for s in live:
+        pid = s.flash_pid
+        try:
+            flash_launch.close_flash_window(pid, s.label, grace_sec=grace)
+        except Exception:
+            logger.exception("Slot %s: close_flash_window raised during shutdown", s.label)
+        s.flash_pid = None
+    logger.info("Flash cleanup: done.")
+    _flush_log_handlers()
+
+
 def fetch_room_list(
     states: list[SlotState],
     *,
@@ -714,6 +742,17 @@ def main(argv: list[str] | None = None) -> None:
         else:
             slot_listen = proxy_bind
         states.append(SlotState(label=label, port=port, proxy_bind_host=slot_listen))
+
+    # Belt-and-suspenders cleanup: register an atexit hook as soon as ``states``
+    # exists so Flash windows still get closed if the user hits Ctrl-C during
+    # the long login phase (before the ban-loop try/finally wraps things).
+    # The hook reads ``s.flash_pid`` live, so slots launched later are covered.
+    def _atexit_close_flash(_states: list[SlotState] = states, _cfg: object = cfg) -> None:
+        try:
+            close_all_flash_windows(_states, _cfg)
+        except Exception:
+            logger.exception("atexit Flash cleanup raised")
+    atexit.register(_atexit_close_flash)
 
     if not use_account_bind_ip and any(str(row.get("bind_ip", "")).strip() for row in raw_accounts):
         logger.info(
@@ -1161,28 +1200,40 @@ def main(argv: list[str] | None = None) -> None:
 
     print_slot_status(states, title="SLOT STATUS AFTER LOGIN PHASE")
 
-    while True:
-        room = _pick_room(states)
-        logger.info("Target room: %r", room)
-        if not room:
-            logger.info("Empty room; try again.")
-            continue
+    # Wrap the ban loop in try/finally so every Flash projector window the bot
+    # launched gets closed on the way out — normal exit ("n" to the prompt),
+    # Ctrl-C, or an uncaught exception. Without this the user ends up with
+    # ~14 Flash windows to hand-close every session.
+    try:
+        while True:
+            room = _pick_room(states)
+            logger.info("Target room: %r", room)
+            if not room:
+                logger.info("Empty room; try again.")
+                continue
 
-        target = _show_and_pick_player(states, room)
-        logger.info("Target user: %r", target)
-        if not target:
-            logger.info("Empty user; try again.")
-            continue
+            target = _show_and_pick_player(states, room)
+            logger.info("Target user: %r", target)
+            if not target:
+                logger.info("Empty user; try again.")
+                continue
 
-        send_ban_to_all(states, target, cfg)
+            send_ban_to_all(states, target, cfg)
 
-        _flush_log_handlers()
-        again = input('Ban someone else? (y/n): ').strip().lower()
-        logger.info("Ban someone else? answered: %r", again)
-        if again not in ("y", "yes"):
-            break
+            _flush_log_handlers()
+            again = input('Ban someone else? (y/n): ').strip().lower()
+            logger.info("Ban someone else? answered: %r", again)
+            if again not in ("y", "yes"):
+                break
 
-    logger.info("Exiting (proxy threads stop when you close this process).")
+        logger.info("Exiting (proxy threads stop when you close this process).")
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user (Ctrl-C); closing Flash windows before exit.")
+    finally:
+        try:
+            close_all_flash_windows(states, cfg)
+        except Exception:
+            logger.exception("Flash cleanup raised during shutdown")
 
 
 if __name__ == "__main__":
