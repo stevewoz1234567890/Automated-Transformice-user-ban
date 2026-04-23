@@ -3,7 +3,6 @@
 caseus @ git+https://github.com/friedkeenan/caseus.git
 pak>=1.0.0
 colorama>=0.4.6
-python-dotenv>=1.0.0
 
 # Build ban_bot.exe: python build_exe.py
 pyinstaller>=6.0
