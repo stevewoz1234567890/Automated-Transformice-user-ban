@@ -172,6 +172,14 @@ def load_config_from_env(repo_root: Path) -> object:
     # own keepalives stop, and the server eventually kills the connection → PARTL status).
     # 0 or negative disables the feature.
     F("MAIN_KEEPALIVE_INTERVAL_SEC", "BOT_MAIN_KEEPALIVE_INTERVAL_SEC", 15.0)
+    F("ROOM_LIST_TIMEOUT_SEC", "BOT_ROOM_LIST_TIMEOUT_SEC", 10.0)
+    _rmax = (os.environ.get("BOT_ROOM_LIST_MAX_SLOT_ATTEMPTS") or "").strip()
+    try:
+        ns.ROOM_LIST_MAX_SLOT_ATTEMPTS = int(_rmax) if _rmax else 3
+    except ValueError:
+        ns.ROOM_LIST_MAX_SLOT_ATTEMPTS = 3
+    ns.ROOM_LIST_MAX_SLOT_ATTEMPTS = max(1, min(32, int(ns.ROOM_LIST_MAX_SLOT_ATTEMPTS)))
+    B("BAN_PRE_ROUND_DISMISS_FLASH", "BOT_BAN_PRE_ROUND_DISMISS_FLASH", True)
     room = (os.environ.get("BOT_PACKET_LOGIN_START_ROOM") or "").strip()
     ns.PACKET_LOGIN_START_ROOM = room
 

@@ -1184,7 +1184,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     Dismiss Flash ActionScript/security error dialogs for *pid* **without moving
     the mouse cursor**.  Finds small top-level windows (< 120 000 px²) owned by
     the process, enumerates child Button controls, and sends ``BM_CLICK`` to any
-    whose text matches common dismiss labels ("Dismiss", "OK", "Continue", etc.).
+    whose text matches common dismiss labels ("Dismiss", "OK", "Continue", "Continuar", etc.).
 
     Returns the number of buttons clicked.
     """
@@ -1196,7 +1196,19 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     user32 = ctypes.windll.user32
     BM_CLICK = 0x00F5
     WM_CLOSE = 0x0010
-    DISMISS_LABELS = {"dismiss all", "dismiss", "ok", "continue", "close", "yes"}
+    # English + common Spanish (Flash / Windows locale) primary buttons.
+    DISMISS_LABELS = {
+        "dismiss all",
+        "dismiss",
+        "ok",
+        "continue",
+        "continuar",
+        "aceptar",
+        "sí",
+        "si",
+        "close",
+        "yes",
+    }
 
     class RECT(ctypes.Structure):
         _fields_ = [
@@ -1312,6 +1324,107 @@ def click_transformice_in_loader(
 
 _FLASH_TILE_SLOT_INDEX: dict[str, int] = {}
 _FLASH_TILE_LOCK = threading.Lock()
+
+# HWNDs registered after tiling; the focus-pump thread cycles foreground across them so
+# Flash's ActionScript / Anticheat keep running (background windows still throttle).
+_FLASH_FOCUS_PUMP: list[tuple[int, str]] = []
+_FLASH_FOCUS_PUMP_LOCK = threading.Lock()
+
+
+def _try_bring_hwnd_to_foreground(hwnd: int) -> bool:
+    """Best-effort SetForegroundWindow using AttachThreadInput (see Win32 Q67164 pattern)."""
+    if sys.platform != "win32" or hwnd <= 0:
+        return False
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    if not user32.IsWindow(int(hwnd)):
+        return False
+    if int(user32.GetForegroundWindow() or 0) == int(hwnd):
+        return True
+    current_tid = kernel32.GetCurrentThreadId()
+    fg = user32.GetForegroundWindow()
+    fg_tid = 0
+    if fg:
+        fg_tid = int(user32.GetWindowThreadProcessId(fg, None))
+    try:
+        if fg_tid and fg_tid != int(current_tid):
+            user32.AttachThreadInput(fg_tid, int(current_tid), True)
+        user32.BringWindowToTop(int(hwnd))
+        ok = bool(user32.SetForegroundWindow(int(hwnd)))
+        if fg_tid and fg_tid != int(current_tid):
+            user32.AttachThreadInput(fg_tid, int(current_tid), False)
+        return ok
+    except OSError:
+        if fg_tid and fg_tid != int(current_tid):
+            try:
+                user32.AttachThreadInput(fg_tid, int(current_tid), False)
+            except OSError:
+                pass
+        return False
+
+
+def register_flash_focus_pump_window(hwnd: int, slot_label: str) -> None:
+    """Register a tiled Flash top-level *hwnd* for the global focus-rotation loop."""
+    if sys.platform != "win32" or hwnd <= 0:
+        return
+    with _FLASH_FOCUS_PUMP_LOCK:
+        _FLASH_FOCUS_PUMP.append((int(hwnd), str(slot_label)))
+
+
+def _focus_pump_snapshot() -> list[tuple[int, str]]:
+    with _FLASH_FOCUS_PUMP_LOCK:
+        return list(_FLASH_FOCUS_PUMP)
+
+
+def run_flash_focus_pump(*, stop: threading.Event, per_slot_ms: float) -> None:
+    """
+    While *stop* is not set, cycle through registered HWNDs: briefly make each
+    foreground so Flash's event loop and Anticheat code run at full rate.
+    """
+    per = max(15.0, float(per_slot_ms)) / 1000.0
+    idle = 0.05
+    while not stop.is_set():
+        rows = _focus_pump_snapshot()
+        if not rows:
+            if stop.wait(timeout=idle):
+                break
+            continue
+        for hwnd, _label in rows:
+            if stop.is_set():
+                break
+            if not _try_bring_hwnd_to_foreground(hwnd):
+                # Fallback: nudge z-order (non-activating) — some builds accept this when
+                # SetForegroundWindow is blocked by focus rules.
+                try:
+                    import ctypes
+                    u = ctypes.windll.user32
+                    if u.IsWindow(int(hwnd)):
+                        u.ShowWindow(int(hwnd), 4)  # SW_SHOWNOACTIVATE
+                except OSError:
+                    pass
+            time.sleep(per)
+        if not stop.is_set():
+            stop.wait(timeout=idle)
+
+
+def start_flash_focus_pump_thread() -> tuple[threading.Thread, threading.Event]:
+    """Start daemon *run_flash_focus_pump*; returns (thread, stop_event)."""
+    raw = (os.environ.get("BOT_FLASH_FOCUS_PUMP_MS") or "").strip()
+    try:
+        per_ms = float(raw) if raw else 90.0
+    except ValueError:
+        per_ms = 90.0
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_flash_focus_pump,
+        kwargs={"stop": stop, "per_slot_ms": per_ms},
+        daemon=True,
+        name="flash-focus-pump",
+    )
+    t.start()
+    return t, stop
 
 
 def _next_tile_index(slot_label: str) -> int:
@@ -1531,6 +1644,9 @@ def minimize_flash_window(pid: int, slot_label: str) -> bool:
     # processes regardless of window visibility. Disable EcoQoS + raise
     # priority so Flash's Anticheat responder keeps running.
     _disable_process_throttling(pid, slot_label)
+    if (os.environ.get("BOT_FLASH_FOCUS_PUMP", "1").strip().lower()
+            not in ("0", "false", "no", "off")):
+        register_flash_focus_pump_window(int(hwnd), slot_label)
     return True
 
 

@@ -5,7 +5,11 @@ from __future__ import annotations
 import subprocess
 import sys
 
-from .env_setup import env_truthy, prepare_runtime_environment
+from .env_setup import (
+    env_truthy,
+    prepare_runtime_environment,
+    require_source_runtime_imports,
+)
 
 prepare_runtime_environment()
 
@@ -42,6 +46,8 @@ def _maybe_pip_install_tfm_secrets_cli() -> None:
 
 _maybe_pip_install_tfm_secrets_cli()
 _maybe_pip_install_caseus_git()
+
+require_source_runtime_imports()
 
 from .ban_cli import main
 

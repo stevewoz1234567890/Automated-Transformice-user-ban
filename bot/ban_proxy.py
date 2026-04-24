@@ -1053,9 +1053,12 @@ class BanBotProxy(Proxy):
             interval,
         )
         sent = 0
+        # First keepalive: the loop used to sleep the full interval before the first
+        # KeepAlivePacket. Idle MAIN can be closed by the game server in that window.
+        _first_delay = min(4.0, max(0.4, float(interval) * 0.25))
         try:
             while True:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(_first_delay if sent == 0 else interval)
                 conn = None
                 if self.main_clients:
                     conn = self.main_clients[0].destination

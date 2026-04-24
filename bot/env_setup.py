@@ -312,6 +312,35 @@ def _bootstrap_dotenv_path() -> Path:
     return p
 
 
+def require_source_runtime_imports() -> None:
+    """
+    Exit with a clear ``pip install`` hint if running from source without ``requirements.txt`` deps.
+    Skipped for PyInstaller builds (``sys.frozen``) where packages are bundled.
+    """
+    if getattr(sys, "frozen", False):
+        return
+    need = ("pak", "caseus")
+    missing: list[str] = []
+    for name in need:
+        try:
+            __import__(name)
+        except ModuleNotFoundError:
+            missing.append(name)
+    if not missing:
+        return
+    root = repo_root()
+    print(
+        "Missing Python package(s): "
+        + ", ".join(missing)
+        + ".\n"
+        "From the repository root, run:\n"
+        f"  {sys.executable} -m pip install -r requirements.txt\n"
+        f"Repository: {root}\n",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
 def prepare_runtime_environment() -> None:
     """Copy ``.env.example`` → ``.env`` when missing, merge ``BOT_*`` defaults, load into the process env."""
     root = repo_root()

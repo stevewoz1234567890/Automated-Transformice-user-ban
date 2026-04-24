@@ -495,10 +495,14 @@ def fetch_room_list(
     *,
     game_modes: tuple[int, ...] = (1, 2, 3, 5, 9),
     timeout_sec: float = 6.0,
+    max_slot_attempts: int = 3,
 ) -> list[tuple[str, int]]:
     """
-    Request room lists for *game_modes* from the first live slot and return
+    Request room lists for *game_modes* from one or more live slots and return
     ``[(room_name, num_players), ...]`` sorted by name.
+
+    If the first slot's MAIN is slow or already dying, the same request is retried
+    on additional live slots (up to *max_slot_attempts*) so the menu is less often empty.
 
     Game mode ints: 1=Transformice, 2=Bootcamp, 3=Vanilla, 5=Racing, 9=Module.
     """
@@ -507,30 +511,74 @@ def fetch_room_list(
         logger.warning("No live slot available to fetch room list.")
         return []
 
-    slot = live[0]
-    proxy = slot.proxy
-    proxy.known_rooms.clear()
-    proxy._room_list_ready.clear()
+    attempts = min(len(live), max(1, int(max_slot_attempts)))
+    for bi in range(attempts):
+        slot = live[bi]
+        proxy = slot.proxy
+        proxy.known_rooms.clear()
+        proxy._room_list_ready.clear()
 
-    for gm_int in game_modes:
+        for gm_int in game_modes:
+            try:
+                _run_coro_on_slot(slot, proxy.request_room_list(gm_int))
+            except Exception as exc:
+                logger.debug(
+                    "fetch_room_list: slot %s request mode %s failed: %s",
+                    slot.label,
+                    gm_int,
+                    exc,
+                )
+            time.sleep(0.15)
+
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if proxy._room_list_ready.is_set():
+                time.sleep(0.8)  # let remaining responses arrive
+                break
+            time.sleep(0.2)
+
+        if proxy.known_rooms:
+            if bi > 0:
+                logger.info(
+                    "Room list: using data from slot %s (after %d empty attempt(s) on other slot(s)).",
+                    slot.label,
+                    bi,
+                )
+            return sorted(proxy.known_rooms.items(), key=lambda x: x[0].lower())
+        if bi + 1 < attempts:
+            logger.info(
+                "Room list: no rooms from slot %s — trying next live slot…",
+                slot.label,
+            )
+
+    logger.warning(
+        "Room list: still empty after %d slot attempt(s) — you can type a room name manually.",
+        attempts,
+    )
+    return []
+
+
+def pre_ban_dismiss_flash_dialogs(states: list[SlotState], cfg: object) -> None:
+    """
+    One-shot dismiss of Win32 **Continue** / error buttons on all Flash PIDs
+    (Spanish *Continuar*, etc.) before room list / /ban. Cheap and reduces stuck popups.
+    """
+    if sys.platform != "win32" or not bool(getattr(cfg, "BAN_PRE_ROUND_DISMISS_FLASH", True)):
+        return
+    total = 0
+    for s in states:
+        pid = s.flash_pid
+        if not pid or not flash_launch.flash_pid_is_alive(pid):
+            continue
         try:
-            _run_coro_on_slot(slot, proxy.request_room_list(gm_int))
-        except Exception as exc:
-            logger.debug("fetch_room_list: request mode %s failed: %s", gm_int, exc)
-        time.sleep(0.15)
-
-    deadline = time.monotonic() + timeout_sec
-    while time.monotonic() < deadline:
-        if proxy._room_list_ready.is_set():
-            time.sleep(0.8)  # let remaining responses arrive
-            break
-        time.sleep(0.2)
-
-    rooms = sorted(proxy.known_rooms.items(), key=lambda x: x[0].lower())
-    return rooms
+            total += flash_launch.dismiss_flash_error_dialogs_no_mouse(pid, s.label)
+        except Exception:
+            logger.debug("pre-ban dismiss: slot %s failed", s.label, exc_info=True)
+    if total:
+        logger.info("Pre-round Flash dismiss: auto-clicked %d dialog button(s).", total)
 
 
-def _pick_room(states: list[SlotState]) -> str:
+def _pick_room(states: list[SlotState], cfg: object) -> str:
     """
     Fetch available rooms from the game server, print a numbered list, and let
     the user pick by number or type a name directly.
@@ -539,7 +587,11 @@ def _pick_room(states: list[SlotState]) -> str:
     logger.info("Fetching room list from game server...")
     _flush_log_handlers()
 
-    rooms = fetch_room_list(states)
+    rooms = fetch_room_list(
+        states,
+        timeout_sec=float(getattr(cfg, "ROOM_LIST_TIMEOUT_SEC", 10.0) or 10.0),
+        max_slot_attempts=int(getattr(cfg, "ROOM_LIST_MAX_SLOT_ATTEMPTS", 3) or 3),
+    )
 
     if rooms:
         print(f"\nAvailable rooms ({len(rooms)} total):", flush=True)
@@ -636,11 +688,32 @@ def _show_and_pick_player(states: list[SlotState], room: str) -> str:
 
 
 def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
-    """Send /ban to every slot (staggered). Call after player is chosen."""
+    """
+    Staggered /ban on every slot with a **live upstream write path** (MAIN or satellite).
+
+    Slots with no connection are skipped (recorded as skipped, not as failed sends) so
+    a half-dead farm does not spam errors or sleep through useless attempts.
+    """
     dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
     dmax = float(getattr(cfg, "BAN_DELAY_MAX_SEC", 2.0))
-    active = [s for s in states if s.proxy is not None]
-    results: list[tuple[str, bool, str, float]] = []
+
+    def _can_ban(s: SlotState) -> bool:
+        return bool(s.proxy and s.proxy._main_write_conn() is not None)
+
+    active = [s for s in states if _can_ban(s)]
+    skipped_no_conn = [s for s in states if s.proxy is not None and not _can_ban(s)]
+    inactive = [s for s in states if s.proxy is None]
+
+    if skipped_no_conn:
+        logger.info(
+            "Ban round: %d slot(s) with no upstream (PARTL) — skipped; sending from %d live slot(s).",
+            len(skipped_no_conn),
+            len(active),
+        )
+    else:
+        logger.info("Ban round: sending from %d slot(s) with live upstream.", len(active))
+
+    results: list[tuple[str, bool, str, float, str]] = []
     t_round = time.monotonic()
     for i, s in enumerate(active):
         t_slot = time.monotonic()
@@ -651,9 +724,7 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
             ok = False
             reason = f"{type(exc).__name__}: {exc}"
         dt_ms = (time.monotonic() - t_slot) * 1000.0
-        results.append((s.label, bool(ok), reason, dt_ms))
-        # Per-slot /ban already logs detail (route, latency) in ban_proxy;
-        # here we only keep a compact summary line to avoid double-printing.
+        results.append((s.label, bool(ok), reason, dt_ms, "ok" if ok else "fail"))
         logger.debug(
             "[slot %s] /ban %r -> %s (%.1fms)",
             s.label, target_user, "sent" if ok else "FAILED", dt_ms,
@@ -661,23 +732,27 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
         if i < len(active) - 1:
             time.sleep(random.uniform(dmin, dmax))
 
-    # Skipped slots (proxy never started) — mark them FAIL explicitly.
-    inactive = [s for s in states if s.proxy is None]
+    for s in skipped_no_conn:
+        results.append((s.label, False, "no upstream (skipped)", 0.0, "skip"))
     for s in inactive:
-        results.append((s.label, False, "proxy not started", 0.0))
+        results.append((s.label, False, "proxy not started", 0.0, "skip"))
 
-    ok_count = sum(1 for _, ok, *_ in results if ok)
-    fail_count = len(results) - ok_count
+    ok_count = sum(1 for _, o, _, _, _ in results if o)
+    skip_count = sum(1 for *_, k in results if k == "skip")
+    fail_send = sum(1 for _, o, _, _, k in results if not o and k != "skip")
     total_dt = time.monotonic() - t_round
     banner = "=" * 88
     lines = [
         banner,
-        f"  BAN RESULTS for {target_user!r}   "
-        f"(OK: {ok_count}  /  FAIL: {fail_count}  of {len(results)}; round {total_dt:.1f}s)",
+        f"  BAN RESULTS for {target_user!r}   (OK: {ok_count}  /  send failed: {fail_send}  /  "
+        f"skipped: {skip_count}  of {len(results)}; round {total_dt:.1f}s)",
         banner,
     ]
-    for label, ok, reason, dt_ms in results:
-        mark = "[  OK  ]" if ok else "[ FAIL ]"
+    for label, ok, reason, dt_ms, kind in results:
+        if kind == "skip":
+            mark = "[SKIP ]"
+        else:
+            mark = "[  OK  ]" if ok else "[ FAIL ]"
         lat = f"{dt_ms:6.1f}ms" if dt_ms else "      -"
         lines.append(f"  {mark}  slot {label:>3s}  [{lat}]  -> {reason}")
     lines.append(banner)
@@ -686,8 +761,8 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
         logger.info(line)
     _flush_log_handlers()
     logger.info(
-        "Ban round complete: target=%r ok=%d fail=%d elapsed=%.1fs",
-        target_user, ok_count, fail_count, total_dt,
+        "Ban round complete: target=%r ok=%d send_fail=%d skipped=%d elapsed=%.1fs",
+        target_user, ok_count, fail_send, skip_count, total_dt,
     )
 
 
@@ -770,6 +845,8 @@ def main(argv: list[str] | None = None) -> None:
         else:
             slot_listen = proxy_bind
         states.append(SlotState(label=label, port=port, proxy_bind_host=slot_listen))
+
+    focus_pump_stop: threading.Event | None = None
 
     # Belt-and-suspenders cleanup: register an atexit hook as soon as ``states``
     # exists so Flash windows still get closed if the user hits Ctrl-C during
@@ -941,6 +1018,21 @@ def main(argv: list[str] | None = None) -> None:
                 daemon=True,
                 name="flash-err-dismiss-global",
             ).start()
+
+        # Rotate which Flash window is briefly foreground: background Flash throttles
+        # Anticheat/ActionScript; this keeps all tiled slots responsive during login.
+        _fpump_raw = (os.environ.get("BOT_FLASH_FOCUS_PUMP", "1") or "").strip().lower()
+        if (
+            sys.platform == "win32"
+            and len(states) > 1
+            and bool(getattr(cfg, "FLASH_MINIMIZE_AFTER_OPEN", False))
+            and _fpump_raw not in ("0", "false", "no", "off")
+        ):
+            _, focus_pump_stop = flash_launch.start_flash_focus_pump_thread()
+            logger.info(
+                "Flash focus-pump: BOT_FLASH_FOCUS_PUMP_MS (default 90) — "
+                "rotates foreground across tiled clients so server Anticheat stays satisfied.",
+            )
 
         for idx, (flash_row, st) in enumerate(zip(flash_accounts, states), start=1):
             st.login_success_event.clear()
@@ -1257,7 +1349,8 @@ def main(argv: list[str] | None = None) -> None:
     # ~14 Flash windows to hand-close every session.
     try:
         while True:
-            room = _pick_room(states)
+            pre_ban_dismiss_flash_dialogs(states, cfg)
+            room = _pick_room(states, cfg)
             logger.info("Target room: %r", room)
             if not room:
                 logger.info("Empty room; try again.")
@@ -1281,6 +1374,8 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         logger.info("Interrupted by user (Ctrl-C); closing Flash windows before exit.")
     finally:
+        if focus_pump_stop is not None:
+            focus_pump_stop.set()
         try:
             close_all_flash_windows(states, cfg)
         except Exception:
