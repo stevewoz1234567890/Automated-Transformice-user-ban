@@ -659,6 +659,13 @@ def _pick_room(states: list[SlotState], cfg: object) -> str:
             print(f"  {i:3d}. {name:<30s}  [{players} players]", flush=True)
         print(flush=True)
         _flush_log_handlers()
+        print(
+            "\n---\n"
+            ">>> Interactive step: enter room below. (Proxy logs are throttled; if the console is busy,\n"
+            "    look for the line `Enter room number` — or scroll to the end.)\n"
+            "---\n",
+            flush=True,
+        )
         choice = input("Enter room number or room name (e.g. *Racing1): ").strip()
         if choice.isdigit():
             idx = int(choice) - 1
@@ -671,6 +678,12 @@ def _pick_room(states: list[SlotState], cfg: object) -> str:
     else:
         logger.info("No room list received — enter room name manually.")
         _flush_log_handlers()
+        print(
+            "\n---\n"
+            ">>> Interactive step: target room. Proxy heartbeats are logged infrequently; type below.\n"
+            "---\n",
+            flush=True,
+        )
         return input("Target room (text after /room, e.g. *Racing1): ").strip()
 
 
@@ -732,6 +745,12 @@ def _show_and_pick_player(states: list[SlotState], room: str) -> str:
             print(f"  {i:3d}. {name}", flush=True)
         print(flush=True)
         _flush_log_handlers()
+        print(
+            "\n---\n"
+            ">>> Interactive step: pick player — enter below. (You may need to scroll past proxy logs.)\n"
+            "---\n",
+            flush=True,
+        )
         choice = input("Enter player number or nickname (e.g. Zizao#0000): ").strip()
         if choice.isdigit():
             idx = int(choice) - 1
@@ -744,6 +763,12 @@ def _show_and_pick_player(states: list[SlotState], room: str) -> str:
     else:
         logger.info("No player list received — enter nickname manually.")
         _flush_log_handlers()
+        print(
+            "\n---\n"
+            ">>> Interactive step: target user — type nickname below.\n"
+            "---\n",
+            flush=True,
+        )
         return input("Target user (nickname#tag, e.g. Zizao#0000): ").strip()
 
 

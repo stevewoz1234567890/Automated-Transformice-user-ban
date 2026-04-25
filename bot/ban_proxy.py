@@ -206,7 +206,29 @@ def _account_error_hint(code: int | None) -> str:
     )
 
 
-_PONG_LOG_EVERY = 10  # log every Nth auto-pong reply (per connection class)
+_proxy_heartbeat_log_every_n: int | None = None
+
+
+def _proxy_heartbeat_log_every() -> int:
+    """
+    How often to log auto-pong / main-keepalive at INFO (every Nth event per slot).
+    With many slots, logging every 10 fills the console during ``input()`` prompts
+    and looks like an infinite loop. Set ``BOT_PROXY_HEARTBEAT_LOG_EVERY=100`` (default)
+    or higher to quiet; set lower for debugging.
+    """
+    global _proxy_heartbeat_log_every_n
+    if _proxy_heartbeat_log_every_n is not None:
+        return _proxy_heartbeat_log_every_n
+    raw = (os.environ.get("BOT_PROXY_HEARTBEAT_LOG_EVERY") or "").strip()
+    if not raw:
+        n = 100
+    else:
+        try:
+            n = max(1, min(10_000, int(raw, 0)))
+        except ValueError:
+            n = 100
+    _proxy_heartbeat_log_every_n = n
+    return n
 
 
 class BanBotProxy(Proxy):
@@ -265,7 +287,7 @@ class BanBotProxy(Proxy):
         self._login_success_mono: float | None = None
         # Counters for the proxy-side pong reply that keeps the upstream TCP
         # alive when Flash is minimised (see ``_auto_pong_server_ping``). We log
-        # the first pong at INFO and a running count every ``_PONG_LOG_EVERY``
+        # the first pong at INFO and a running count every ``BOT_PROXY_HEARTBEAT_LOG_EVERY``
         # replies so the log stays readable but still shows liveness health.
         self._auto_pong_sent_main = 0
         self._auto_pong_sent_satellite = 0
@@ -369,7 +391,7 @@ class BanBotProxy(Proxy):
                 "(ping NOT forwarded to Flash)",
                 self.slot_label, conn, payload,
             )
-        elif count % _PONG_LOG_EVERY == 0:
+        elif count % _proxy_heartbeat_log_every() == 0:
             logger.info(
                 "Slot %s: %s auto-pong count=%d (payload=%s) — upstream still alive",
                 self.slot_label, conn, count, payload,
@@ -1080,7 +1102,7 @@ class BanBotProxy(Proxy):
                             "Slot %s: first main-keepalive sent (interval=%.1fs)",
                             self.slot_label, interval,
                         )
-                    elif sent % _PONG_LOG_EVERY == 0:
+                    elif sent % _proxy_heartbeat_log_every() == 0:
                         logger.info(
                             "Slot %s: main-keepalive count=%d (pongs_main=%d pongs_sat=%d) — MAIN alive",
                             self.slot_label, sent,
