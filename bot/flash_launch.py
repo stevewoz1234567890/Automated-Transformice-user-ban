@@ -1413,9 +1413,10 @@ def start_flash_focus_pump_thread() -> tuple[threading.Thread, threading.Event]:
     """Start daemon *run_flash_focus_pump*; returns (thread, stop_event)."""
     raw = (os.environ.get("BOT_FLASH_FOCUS_PUMP_MS") or "").strip()
     try:
-        per_ms = float(raw) if raw else 90.0
+        # Default 600ms/slot: 90ms × many slots hogs the foreground and freezes out the terminal.
+        per_ms = float(raw) if raw else 600.0
     except ValueError:
-        per_ms = 90.0
+        per_ms = 600.0
     stop = threading.Event()
     t = threading.Thread(
         target=run_flash_focus_pump,

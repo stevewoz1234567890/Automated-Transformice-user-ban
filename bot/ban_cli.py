@@ -1030,8 +1030,9 @@ def main(argv: list[str] | None = None) -> None:
         ):
             _, focus_pump_stop = flash_launch.start_flash_focus_pump_thread()
             logger.info(
-                "Flash focus-pump: BOT_FLASH_FOCUS_PUMP_MS (default 90) — "
-                "rotates foreground across tiled clients so server Anticheat stays satisfied.",
+                "Flash focus-pump: BOT_FLASH_FOCUS_PUMP_MS (default 600) — "
+                "rotates foreground across tiled clients during login only; stops after login phase "
+                "so the terminal stays usable.",
             )
 
         for idx, (flash_row, st) in enumerate(zip(flash_accounts, states), start=1):
@@ -1342,6 +1343,15 @@ def main(argv: list[str] | None = None) -> None:
     _wait_for_game_clients(states, auto_flash_launched=auto_flash)
 
     print_slot_status(states, title="SLOT STATUS AFTER LOGIN PHASE")
+
+    # Focus pump exists so minimized/tiled Flash still gets occasional foreground during
+    # login (Anticheat / event loop). If it keeps running, SetForegroundWindow hammers
+    # every slot ~forever — the user cannot type in this console or use other apps.
+    if focus_pump_stop is not None:
+        focus_pump_stop.set()
+        logger.info(
+            "Flash focus-pump stopped after login phase — console input and other windows work normally.",
+        )
 
     # Wrap the ban loop in try/finally so every Flash projector window the bot
     # launched gets closed on the way out — normal exit ("n" to the prompt),
