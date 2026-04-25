@@ -851,6 +851,9 @@ def main(argv: list[str] | None = None) -> None:
         states.append(SlotState(label=label, port=port, proxy_bind_host=slot_listen))
 
     focus_pump_stop: threading.Event | None = None
+    # Stopped after login phase; while running it hammers all Flash PIDs and spams logs during
+    # "Fetching room list" / room name input.
+    flash_dismiss_poll_stop: threading.Event | None = None
 
     # Belt-and-suspenders cleanup: register an atexit hook as soon as ``states``
     # exists so Flash windows still get closed if the user hits Ctrl-C during
@@ -1005,13 +1008,20 @@ def main(argv: list[str] | None = None) -> None:
         except ValueError:
             _pd_early = 1.25
         if _pd_early > 0 and sys.platform == "win32":
+            flash_dismiss_poll_stop = threading.Event()
+            _dismiss_stop = flash_dismiss_poll_stop
+
             def _global_dismiss_worker_early(
                 _states: list[SlotState] = states,
                 _pd: float = _pd_early,
             ) -> None:
-                while True:
-                    time.sleep(_pd)
+                while not _dismiss_stop.is_set():
+                    # Wait in one shot so we exit promptly when login phase ends.
+                    if _dismiss_stop.wait(timeout=_pd):
+                        break
                     for _s in _states:
+                        if _dismiss_stop.is_set():
+                            return
                         pid = _s.flash_pid
                         if not pid or not flash_launch.flash_pid_is_alive(pid):
                             continue
@@ -1035,8 +1045,9 @@ def main(argv: list[str] | None = None) -> None:
                 name="flash-err-dismiss-global",
             ).start()
             logger.info(
-                "ActionScript error dismiss: background poll every %.2fs for all slots "
-                "(set FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC=0 to disable).",
+                "ActionScript error dismiss: background poll every %.2fs during login only "
+                "(stops with focus-pump after all slots log in; set "
+                "FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC=0 to disable).",
                 _pd_early,
             )
 
@@ -1373,6 +1384,12 @@ def main(argv: list[str] | None = None) -> None:
         logger.info(
             "Flash focus-pump stopped after login phase — console input and other windows work normally.",
         )
+    if flash_dismiss_poll_stop is not None:
+        flash_dismiss_poll_stop.set()
+        logger.info(
+            "ActionScript error dismiss: background poll stopped after login phase — you can use "
+            "the room list and type the room name without the bot scanning Flash windows every few seconds.",
+        )
 
     # Wrap the ban loop in try/finally so every Flash projector window the bot
     # launched gets closed on the way out — normal exit ("n" to the prompt),
@@ -1407,6 +1424,8 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         if focus_pump_stop is not None:
             focus_pump_stop.set()
+        if flash_dismiss_poll_stop is not None:
+            flash_dismiss_poll_stop.set()
         try:
             close_all_flash_windows(states, cfg)
         except Exception:
