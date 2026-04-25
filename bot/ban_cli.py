@@ -575,7 +575,11 @@ def pre_ban_dismiss_flash_dialogs(states: list[SlotState], cfg: object) -> None:
         except Exception:
             logger.debug("pre-ban dismiss: slot %s failed", s.label, exc_info=True)
     if total:
-        logger.info("Pre-round Flash dismiss: auto-clicked %d dialog button(s).", total)
+        logger.info(
+            "ActionScript error dismiss: pre-round pass closed or clicked %d Flash error "
+            "dialog control(s) (ActionScript/Adobe popups, security errors, etc.).",
+            total,
+        )
 
 
 def _pick_room(states: list[SlotState], cfg: object) -> str:
@@ -990,11 +994,16 @@ def main(argv: list[str] | None = None) -> None:
 
         # Start global dismiss poller BEFORE launching any Flash windows so
         # error dialogs are caught from the very first slot onwards.
+        # Default 1.25s: ActionScript / #2044 / #2048 error dialogs (often one per slot) need
+        # periodic dismiss; set to 0 to disable. See dismiss_flash_error_dialogs_no_mouse in flash_launch.
         _pd_raw_early = (os.environ.get("FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC") or "").strip()
         try:
-            _pd_early = float(_pd_raw_early) if _pd_raw_early else 0.0
+            if _pd_raw_early:
+                _pd_early = float(_pd_raw_early)
+            else:
+                _pd_early = 1.25
         except ValueError:
-            _pd_early = 0.0
+            _pd_early = 1.25
         if _pd_early > 0 and sys.platform == "win32":
             def _global_dismiss_worker_early(
                 _states: list[SlotState] = states,
@@ -1006,18 +1015,30 @@ def main(argv: list[str] | None = None) -> None:
                         pid = _s.flash_pid
                         if not pid or not flash_launch.flash_pid_is_alive(pid):
                             continue
+                        if not flash_launch.try_acquire_flash_ui(pid):
+                            continue
                         try:
+                            # Logs each pass from flash_launch (scan start / skip reasons at DEBUG;
+                            # each close at INFO; pass summary if anything closed).
                             flash_launch.dismiss_flash_error_dialogs_no_mouse(pid, _s.label)
                         except Exception:
                             logger.debug(
-                                "Slot %s: periodic dismiss failed", _s.label, exc_info=True
+                                "Slot %s: periodic ActionScript/Flash error dismiss failed",
+                                _s.label, exc_info=True
                             )
+                        finally:
+                            flash_launch.release_flash_ui(pid)
 
             threading.Thread(
                 target=_global_dismiss_worker_early,
                 daemon=True,
                 name="flash-err-dismiss-global",
             ).start()
+            logger.info(
+                "ActionScript error dismiss: background poll every %.2fs for all slots "
+                "(set FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC=0 to disable).",
+                _pd_early,
+            )
 
         # Rotate which Flash window is briefly foreground: background Flash throttles
         # Anticheat/ActionScript; this keeps all tiled slots responsive during login.

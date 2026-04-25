@@ -1179,14 +1179,51 @@ def _win_log_visible_windows_for_pid(pid: int, slot_label: str) -> None:
         )
 
 
+def _win_button_label_normalize(raw: str) -> str:
+    # Strip & accelerator; collapse whitespace (handles "&Dismiss &All" etc.)
+    t = (raw or "").replace("&", "").strip().lower()
+    return " ".join(t.split())
+
+
+def _flash_error_dismiss_button_rank(label_norm: str) -> int | None:
+    """
+    Lower is better. None = do not use this button for auto-dismiss.
+    Prefer Dismiss All over Continue.
+    """
+    if not label_norm:
+        return None
+    if "dismiss" in label_norm and "all" in label_norm:
+        return 0
+    if label_norm in ("dismiss",) or (
+        "dismiss" in label_norm and "continue" not in label_norm
+    ):
+        return 1
+    for exact in (
+        "ok",
+        "close",
+        "yes",
+        "sí",
+        "si",
+        "aceptar",
+    ):
+        if label_norm == exact:
+            return 2
+    if label_norm in ("continuar",):
+        return 3
+    if label_norm == "continue":
+        return 4
+    return None
+
+
 def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     """
     Dismiss Flash ActionScript/security error dialogs for *pid* **without moving
-    the mouse cursor**.  Finds small top-level windows (< 120 000 px²) owned by
-    the process, enumerates child Button controls, and sends ``BM_CLICK`` to any
-    whose text matches common dismiss labels ("Dismiss", "OK", "Continue", "Continuar", etc.).
-
-    Returns the number of buttons clicked.
+    the mouse cursor**.  Finds top-level windows owned by the process (small
+    popups, or **large** \"Adobe Flash Player\" ActionScript error windows),
+    enumerates child Button controls, and sends ``BM_CLICK`` to the best match
+    (prefers *Dismiss All*).  Falls back to Escape or ``WM_CLOSE`` on the
+    dialog.  The previous 120_000 px² cap skipped typical #2044/#2048 error
+    windows with a large text area; those are handled by title heuristics.
     """
     if sys.platform != "win32" or pid <= 0:
         return 0
@@ -1196,7 +1233,10 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     user32 = ctypes.windll.user32
     BM_CLICK = 0x00F5
     WM_CLOSE = 0x0010
-    # English + common Spanish (Flash / Windows locale) primary buttons.
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    VK_ESCAPE = 0x1B
+    # English + common Spanish (Flash / Windows locale) — used for simple exact-set fallback
     DISMISS_LABELS = {
         "dismiss all",
         "dismiss",
@@ -1209,6 +1249,9 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
         "close",
         "yes",
     }
+    # ActionScript / securityError dialogs from Flash Player (large client area is normal).
+    _MAX_SMALL_POPUP_AREA = 120_000
+    _MAX_ADOBE_ERR_AREA = 2_500_000
 
     class RECT(ctypes.Structure):
         _fields_ = [
@@ -1217,6 +1260,14 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
             ("right", wintypes.LONG),
             ("bottom", wintypes.LONG),
         ]
+
+    def _is_adobe_flashplayer_error_title(title: str) -> bool:
+        tl = (title or "").strip().lower()
+        if "adobe flash player" in tl:
+            return True
+        if "flash player" in tl and "actionscript" in tl:
+            return True
+        return False
 
     # Collect all visible top-level windows for this pid
     top_hwnds: list[int] = []
@@ -1231,21 +1282,70 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
 
     user32.EnumWindows(_enum_top, 0)
 
+    logger.debug(
+        "ActionScript error dismiss: scan start slot=%s pid=%s visible_toplevel_windows=%d",
+        slot_label,
+        pid,
+        len(top_hwnds),
+    )
+
+    def _try_escape_on_dialog(top_hwnd: int) -> None:
+        user32.PostMessageW(top_hwnd, WM_KEYDOWN, VK_ESCAPE, 0)
+        user32.PostMessageW(top_hwnd, WM_KEYUP, VK_ESCAPE, 0)
+
     clicked = 0
     for top in top_hwnds:
         # Skip minimized windows — GetClientRect returns 0×0 for them, which would
         # pass the area filter falsely and cause WM_CLOSE to be sent to a live slot.
         if user32.IsIconic(top):
+            logger.debug(
+                "ActionScript error dismiss: skip slot=%s hwnd=%s (minimized)",
+                slot_label, top,
+            )
             continue
+        title_buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(top, title_buf, 512)
+        title = title_buf.value or ""
+        adobe_err = _is_adobe_flashplayer_error_title(title)
+
         rc = RECT()
         if not user32.GetClientRect(top, ctypes.byref(rc)):
+            logger.debug(
+                "ActionScript error dismiss: skip slot=%s hwnd=%s (no client rect)",
+                slot_label, top,
+            )
             continue
         area = max(0, rc.right - rc.left) * max(0, rc.bottom - rc.top)
-        if area >= 120_000:
-            continue  # main game window — skip
         if area == 0:
-            continue  # invisible or zero-size — skip
+            logger.debug(
+                "ActionScript error dismiss: skip slot=%s hwnd=%s (zero area)",
+                slot_label, top,
+            )
+            continue
+        if not adobe_err and area >= _MAX_SMALL_POPUP_AREA:
+            logger.debug(
+                "ActionScript error dismiss: skip slot=%s hwnd=%s (area=%d >= %d, not Adobe-titled "
+                "— likely main game window, not a small error popup)",
+                slot_label, top, area, _MAX_SMALL_POPUP_AREA,
+            )
+            continue
+        if adobe_err and area > _MAX_ADOBE_ERR_AREA:
+            logger.debug(
+                "ActionScript error dismiss: skip slot=%s hwnd=%s (area=%d > %d, Adobe-titled but "
+                "huge — refusing WM_CLOSE for safety)",
+                slot_label, top, area, _MAX_ADOBE_ERR_AREA,
+            )
+            continue  # main stage should not use this title; stay safe
 
+        logger.debug(
+            "ActionScript error dismiss: candidate slot=%s pid=%s hwnd=%s adobe_titled=%s area=%d title=%r",
+            slot_label,
+            pid,
+            top,
+            adobe_err,
+            area,
+            (title or "")[:120],
+        )
         # Enumerate child controls and click buttons matching dismiss labels
         buttons: list[int] = []
 
@@ -1259,36 +1359,99 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
 
         user32.EnumChildWindows(top, _enum_child, 0)
 
-        if not buttons:
-            # No child buttons — try pressing Escape on the dialog itself
-            user32.PostMessageW(top, 0x0100, 0x1B, 0)  # WM_KEYDOWN VK_ESCAPE
+        if logger.isEnabledFor(logging.DEBUG) and buttons:
+            _caps: list[str] = []
+            for _b in buttons:
+                _t = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(_b, _t, 256)
+                _caps.append((_t.value or "").strip())
             logger.debug(
-                "dismiss_no_mouse slot %s: no buttons in small HWND=%s (area=%d); sent Escape",
-                slot_label, top, area,
+                "ActionScript error dismiss: child Button captions slot=%s hwnd=%s: %r",
+                slot_label, top, _caps,
             )
+
+        if not buttons:
+            if adobe_err or area < _MAX_SMALL_POPUP_AREA:
+                _try_escape_on_dialog(top)
+                if adobe_err:
+                    user32.PostMessageW(top, WM_CLOSE, 0, 0)
+                    logger.info(
+                        "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (no Button "
+                        "children; method=WM_KEYUP Escape + WM_CLOSE) area=%d title=%r",
+                        slot_label, pid, top, area, (title or "")[:80],
+                    )
+                    clicked += 1
+                else:
+                    logger.debug(
+                        "ActionScript error dismiss: small window slot=%s hwnd=%s (area=%d) — "
+                        "Sent Escape only (no standard buttons).",
+                        slot_label, top, area,
+                    )
             continue
 
-        found_dismiss = False
+        best_btn: int | None = None
+        best_rank = 99
+        best_lbl: str = ""
         for btn in buttons:
-            txt = ctypes.create_unicode_buffer(128)
-            user32.GetWindowTextW(btn, txt, 128)
-            label = (txt.value or "").strip().lower()
+            txt = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(btn, txt, 256)
+            label_norm = _win_button_label_normalize(txt.value)
+            r = _flash_error_dismiss_button_rank(label_norm)
+            if r is not None and r < best_rank:
+                best_rank = r
+                best_btn = btn
+                best_lbl = txt.value.strip()
+            elif r is None and label_norm in DISMISS_LABELS and best_rank > 5:
+                best_rank = 5
+                best_btn = btn
+                best_lbl = txt.value.strip()
+
+        if best_btn is not None:
+            user32.SendMessageW(best_btn, BM_CLICK, 0, 0)
+            logger.info(
+                "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (method=BM_CLICK "
+                "ranked button %r rank=%s) area=%d title=%r",
+                slot_label, pid, top, best_lbl, best_rank, area, (title or "")[:80],
+            )
+            clicked += 1
+            continue
+
+        for btn in buttons:
+            txt = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(btn, txt, 256)
+            label = _win_button_label_normalize(txt.value)
             if label in DISMISS_LABELS:
                 user32.SendMessageW(btn, BM_CLICK, 0, 0)
                 logger.info(
-                    "dismiss_no_mouse slot %s: clicked %r button on HWND=%s (area=%d)",
-                    slot_label, txt.value.strip(), top, area,
+                    "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (method=BM_CLICK "
+                    "exact label %r) area=%d",
+                    slot_label, pid, top, txt.value.strip(), area,
                 )
                 clicked += 1
-                found_dismiss = True
                 break
+        else:
+            if adobe_err or area < _MAX_SMALL_POPUP_AREA:
+                _try_escape_on_dialog(top)
+                if adobe_err:
+                    user32.PostMessageW(top, WM_CLOSE, 0, 0)
+                    logger.info(
+                        "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (buttons present "
+                        "but no match; method=Escape + WM_CLOSE) area=%d",
+                        slot_label, pid, top, area,
+                    )
+                    clicked += 1
+                else:
+                    logger.debug(
+                        "ActionScript error dismiss: no matching button label; Escape only "
+                        "slot=%s hwnd=%s (area=%d)",
+                        slot_label, top, area,
+                    )
 
-        if not found_dismiss:
-            logger.debug(
-                "dismiss_no_mouse slot %s: no dismiss button matched in HWND=%s (area=%d)",
-                slot_label, top, area,
-            )
-
+    if clicked:
+        logger.info(
+            "ActionScript error dismiss: pass summary slot=%s pid=%s total_closed=%d this scan",
+            slot_label, pid, clicked,
+        )
     return clicked
 
 
