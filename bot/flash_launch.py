@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -1222,8 +1223,11 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     popups, or **large** \"Adobe Flash Player\" ActionScript error windows),
     enumerates child Button controls, and sends ``BM_CLICK`` to the best match
     (prefers *Dismiss All*).  Falls back to Escape or ``WM_CLOSE`` on the
-    dialog.  The previous 120_000 px² cap skipped typical #2044/#2048 error
+    dialog.      The previous 120_000 px² cap skipped typical #2044/#2048 error
     windows with a large text area; those are handled by title heuristics.
+
+    The standalone projector window is titled e.g. ``Adobe Flash Player 32`` and has no
+    Win32 ``Button`` children — it must not be treated as the ActionScript error dialog.
     """
     if sys.platform != "win32" or pid <= 0:
         return 0
@@ -1261,8 +1265,19 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
             ("bottom", wintypes.LONG),
         ]
 
+    def _is_flash_standalone_main_window_title(t: str) -> bool:
+        """
+        Projector top-level is typically ``Adobe Flash Player 32`` (digits = SA version).
+        The official ActionScript error dialog is titled ``Adobe Flash Player`` without
+        that trailing version suffix — that distinction prevented killing the main stage.
+        """
+        tl = (t or "").strip().lower()
+        return bool(re.match(r"^adobe flash player\s+\d+\s*$", tl))
+
     def _is_adobe_flashplayer_error_title(title: str) -> bool:
         tl = (title or "").strip().lower()
+        if _is_flash_standalone_main_window_title(title or ""):
+            return False
         if "adobe flash player" in tl:
             return True
         if "flash player" in tl and "actionscript" in tl:
@@ -1371,22 +1386,24 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
             )
 
         if not buttons:
-            if adobe_err or area < _MAX_SMALL_POPUP_AREA:
-                _try_escape_on_dialog(top)
-                if adobe_err:
-                    user32.PostMessageW(top, WM_CLOSE, 0, 0)
-                    logger.info(
-                        "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (no Button "
-                        "children; method=WM_KEYUP Escape + WM_CLOSE) area=%d title=%r",
-                        slot_label, pid, top, area, (title or "")[:80],
-                    )
-                    clicked += 1
-                else:
-                    logger.debug(
-                        "ActionScript error dismiss: small window slot=%s hwnd=%s (area=%d) — "
-                        "Sent Escape only (no standard buttons).",
-                        slot_label, top, area,
-                    )
+            # Main Flash stage is large and has **no** Win32 "Button" children — the SWF draws UI.
+            # The real #2044 / #2048 ActionScript error dialog always exposes Dismiss/Continue as
+            # child Button controls. Never WM_CLOSE here or we quit the whole projector (see log:
+            # hwnd was the main "Adobe Flash Player 32" window).
+            if area >= _MAX_SMALL_POPUP_AREA:
+                logger.debug(
+                    "ActionScript error dismiss: skip slot=%s hwnd=%s (no Win32 Button children, "
+                    "area=%d — main Flash stage; ActionScript error dialogs have Button children). "
+                    "title=%r",
+                    slot_label, top, area, (title or "")[:100],
+                )
+                continue
+            _try_escape_on_dialog(top)
+            logger.debug(
+                "ActionScript error dismiss: tiny top-level slot=%s hwnd=%s (area=%d) no Buttons — "
+                "Escape only (never WM_CLOSE without BM_CLICK target). adobe_titled=%s title=%r",
+                slot_label, top, area, adobe_err, (title or "")[:80],
+            )
             continue
 
         best_btn: int | None = None
