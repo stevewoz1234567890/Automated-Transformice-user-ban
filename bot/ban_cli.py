@@ -582,6 +582,62 @@ def pre_ban_dismiss_flash_dialogs(states: list[SlotState], cfg: object) -> None:
         )
 
 
+def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
+    """
+    After all slots report login, #2044 / #2048 popups can still appear a few seconds late
+    on the last-opened clients. The background poller may stop before those HWNDs exist;
+    this runs several passes with short delays so **Dismiss All** is applied to stragglers.
+    """
+    if sys.platform != "win32":
+        return
+    raw = (os.environ.get("BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_PASSES") or "").strip()
+    try:
+        n_passes = int(raw) if raw else 6
+    except ValueError:
+        n_passes = 6
+    n_passes = max(1, min(20, n_passes))
+    raw_d = (os.environ.get("BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_DELAY_SEC") or "").strip()
+    try:
+        delay = float(raw_d) if raw_d else 0.55
+    except ValueError:
+        delay = 0.55
+    delay = max(0.05, min(3.0, delay))
+
+    logger.info(
+        "ActionScript error dismiss: post-login sweep %d pass(es), %.2fs between passes — "
+        "catching late ActionScript error windows (often the last slots).",
+        n_passes,
+        delay,
+    )
+    total = 0
+    for p in range(n_passes):
+        if p:
+            time.sleep(delay)
+        for s in states:
+            pid = s.flash_pid
+            if not pid or not flash_launch.flash_pid_is_alive(pid):
+                continue
+            if not flash_launch.try_acquire_flash_ui(pid):
+                continue
+            try:
+                total += flash_launch.dismiss_flash_error_dialogs_no_mouse(pid, s.label)
+            except Exception:
+                logger.debug("post-login sweep: slot %s failed", s.label, exc_info=True)
+            finally:
+                flash_launch.release_flash_ui(pid)
+    if total:
+        logger.info(
+            "ActionScript error dismiss: post-login sweep finished — closed or clicked %d "
+            "error dialog(s) in this sweep.",
+            total,
+        )
+    else:
+        logger.info(
+            "ActionScript error dismiss: post-login sweep finished — no extra dialogs to close "
+            "(already handled during login, or no ActionScript popups).",
+        )
+
+
 def _pick_room(states: list[SlotState], cfg: object) -> str:
     """
     Fetch available rooms from the game server, print a numbered list, and let
@@ -1375,6 +1431,12 @@ def main(argv: list[str] | None = None) -> None:
     _wait_for_game_clients(states, auto_flash_launched=auto_flash)
 
     print_slot_status(states, title="SLOT STATUS AFTER LOGIN PHASE")
+
+    # Late #2044/#2048 boxes (commonly the last 3 Flash clients) often appear *after* the
+    # "logged in" line but before the next poll; run a multi-pass dismiss before we stop
+    # the background poller.
+    if auto_flash and sys.platform == "win32":
+        post_login_actionscript_error_sweep(states)
 
     # Focus pump exists so minimized/tiled Flash still gets occasional foreground during
     # login (Anticheat / event loop). If it keeps running, SetForegroundWindow hammers
