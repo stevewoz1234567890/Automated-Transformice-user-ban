@@ -602,13 +602,22 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
     except ValueError:
         delay = 0.55
     delay = max(0.05, min(3.0, delay))
+    raw_lead = (os.environ.get("BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_LEAD_SEC") or "").strip()
+    try:
+        lead_sec = float(raw_lead) if raw_lead else 1.5
+    except ValueError:
+        lead_sec = 1.5
+    lead_sec = max(0.0, min(10.0, lead_sec))
 
     logger.info(
-        "ActionScript error dismiss: post-login sweep %d pass(es), %.2fs between passes — "
-        "catching late ActionScript error windows (often the last slots).",
+        "ActionScript error dismiss: post-login sweep %d pass(es), %.2fs between passes, "
+        "%.2fs lead delay — catching late ActionScript error windows (often the last slots).",
         n_passes,
         delay,
+        lead_sec,
     )
+    if lead_sec:
+        time.sleep(lead_sec)
     total = 0
     for p in range(n_passes):
         if p:
@@ -635,6 +644,22 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
         logger.info(
             "ActionScript error dismiss: post-login sweep finished — no extra dialogs to close "
             "(already handled during login, or no ActionScript popups).",
+        )
+
+
+def _input_nonempty(prompt: str, *, what: str = "your answer") -> str:
+    """
+    Read from stdin until a non-empty line. Empty input often happens if an ActionScript
+    / Flash error dialog or the game has focus; avoid treating Enter as a valid room/name.
+    """
+    while True:
+        s = input(prompt).strip()
+        if s:
+            return s
+        print(
+            "\n[!] Empty line — not accepted. Dismiss any Flash 'Adobe Flash Player' error "
+            f"on top of a client, then click this console and type {what}.\n",
+            flush=True,
         )
 
 
@@ -666,7 +691,10 @@ def _pick_room(states: list[SlotState], cfg: object) -> str:
             "---\n",
             flush=True,
         )
-        choice = input("Enter room number or room name (e.g. *Racing1): ").strip()
+        choice = _input_nonempty(
+            "Enter room number or room name (e.g. *Racing1): ",
+            what="a room number or name",
+        )
         if choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < len(rooms):
@@ -684,7 +712,10 @@ def _pick_room(states: list[SlotState], cfg: object) -> str:
             "---\n",
             flush=True,
         )
-        return input("Target room (text after /room, e.g. *Racing1): ").strip()
+        return _input_nonempty(
+            "Target room (text after /room, e.g. *Racing1): ",
+            what="the room name",
+        )
 
 
 def _collect_player_list_via_join(
@@ -751,7 +782,10 @@ def _show_and_pick_player(states: list[SlotState], room: str) -> str:
             "---\n",
             flush=True,
         )
-        choice = input("Enter player number or nickname (e.g. Zizao#0000): ").strip()
+        choice = _input_nonempty(
+            "Enter player number or nickname (e.g. Zizao#0000): ",
+            what="a player number or nickname",
+        )
         if choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < len(players):
@@ -769,7 +803,10 @@ def _show_and_pick_player(states: list[SlotState], room: str) -> str:
             "---\n",
             flush=True,
         )
-        return input("Target user (nickname#tag, e.g. Zizao#0000): ").strip()
+        return _input_nonempty(
+            "Target user (nickname#tag, e.g. Zizao#0000): ",
+            what="the nickname#tag",
+        )
 
 
 def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
