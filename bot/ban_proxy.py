@@ -292,6 +292,17 @@ class BanBotProxy(Proxy):
         self._auto_pong_sent_main = 0
         self._auto_pong_sent_satellite = 0
         self._keepalive_sent_main = 0
+        # Log the first ChangeSatelliteServer redirect at INFO with full detail;
+        # subsequent ones (every JoinRoomPacket triggers a fresh redirect) drop
+        # to DEBUG to avoid 14× noise on every room change.
+        self._sat_redirect_logged = False
+        # Last MAIN session close info, populated by ``new_main_connection``'s
+        # finally block. Surfaced in the post-login slot-status table so a
+        # PARTL row carries its specific cause (e.g. ``clean-eof@9.6s pong=0/1``)
+        # without forcing the operator to grep the WARNING stream above.
+        self._main_last_close_reason: str | None = None
+        self._main_last_close_alive_sec: float | None = None
+        self._main_last_close_since_login_sec: float | None = None
         # Ring buffer of the last packets seen on MAIN in each direction. Used
         # by the session-end diagnostic to reveal which side produced the final
         # packet before EOF (server kicked vs Flash walked away).
@@ -398,19 +409,14 @@ class BanBotProxy(Proxy):
             count = self._auto_pong_sent_main
 
         if count == 1:
-            if mode == "both":
-                logger.info(
-                    "Slot %s: first auto-pong sent on %s (payload=%s) — BOT_AUTO_PONG=both "
-                    "(proxy ponges AND forwards the ping to Flash; needed for "
-                    "PACKET_AUTO_LOGIN where Flash never pongs on its own).",
-                    self.slot_label, conn, payload,
-                )
-            else:
-                logger.info(
-                    "Slot %s: first auto-pong sent on %s (payload=%s) — BOT_AUTO_PONG=swallow "
-                    "(proxy ponges, ping NOT forwarded to Flash).",
-                    self.slot_label, conn, payload,
-                )
+            # The verbose mode-explanation is logged once at CLI startup
+            # ("BOT_AUTO_PONG=both — ..."); per-slot first-pong only needs the
+            # facts (slot, MAIN/SAT, payload) so the operator can confirm the
+            # connection is live without 14 copies of the rationale.
+            logger.info(
+                "Slot %s: first auto-pong %s payload=%s",
+                self.slot_label, conn, payload,
+            )
         elif count % _proxy_heartbeat_log_every() == 0:
             logger.info(
                 "Slot %s: %s auto-pong count=%d (payload=%s) — upstream still alive",
@@ -447,15 +453,23 @@ class BanBotProxy(Proxy):
             address=addr,
             ports=proxied_ports,
         )
-        logger.info(
-            "Slot %s: ChangeSatelliteServer → Flash client: address=%r ports=%s "
-            "(server sent %r ports %s; all local — avoids Flash #2048 on public host)",
-            self.slot_label,
-            addr,
-            proxied_ports,
-            getattr(packet, "address", None),
-            getattr(packet, "ports", None),
-        )
+        # Only log the first SAT redirect at INFO with full detail (the public
+        # host + ports are useful exactly once for diagnosis). Subsequent
+        # redirects (which happen on every JoinRoomPacket) are DEBUG so the
+        # ban round doesn't pollute the console.
+        srv_addr = getattr(packet, "address", None)
+        if not getattr(self, "_sat_redirect_logged", False):
+            logger.info(
+                "Slot %s: SAT redirect → Flash uses 127.0.0.1:%s (server sent %r ports %s)",
+                self.slot_label, self.host_satellite_port, srv_addr,
+                getattr(packet, "ports", None),
+            )
+            self._sat_redirect_logged = True
+        else:
+            logger.debug(
+                "Slot %s: SAT redirect → 127.0.0.1:%s (server %r)",
+                self.slot_label, self.host_satellite_port, srv_addr,
+            )
         await source.destination.write_packet_instance(proxied)
         return self.DO_NOTHING
 
@@ -790,7 +804,17 @@ class BanBotProxy(Proxy):
                     fams.append(str(host))
             return "+".join(fams) or "(no sockets)"
 
-        logger.info(
+        # The CLI already logs ``Slot N: listen_host=... main=X satellite=Y`` for
+        # every slot before this proxy runs; this line is the bind-family detail
+        # (IPv4/IPv6) which is rarely interesting in production. DEBUG by default;
+        # promote with ``BOT_PROXY_LOG_BIND_DETAIL=1`` if you need it.
+        _bind_lvl = (
+            logger.info
+            if os.environ.get("BOT_PROXY_LOG_BIND_DETAIL", "").strip().lower()
+                in ("1", "true", "yes", "on")
+            else logger.debug
+        )
+        _bind_lvl(
             "Slot %s listening on bind=%s main=%s (%s) satellite=%s (%s)",
             self.slot_label,
             bind_s,
@@ -891,6 +915,11 @@ class BanBotProxy(Proxy):
                 if self._login_success_mono is not None
                 else None
             )
+            # Surface the last-close summary on the proxy itself so the
+            # post-login slot-status table can include it on PARTL rows.
+            self._main_last_close_reason = close_reason
+            self._main_last_close_alive_sec = alive_sec
+            self._main_last_close_since_login_sec = since_login
             # A post-login close that happens within the first few minutes of login is
             # the failure mode we are hunting — log it at WARNING so it is easy to spot.
             lvl = logger.warning if (since_login is not None and since_login < 600) else logger.info
@@ -1121,7 +1150,10 @@ class BanBotProxy(Proxy):
                     self._keepalive_sent_main = sent
                     # First keepalive is interesting; then only every N to avoid noise.
                     if sent == 1:
-                        logger.info(
+                        # Already logged "main-keepalive loop started (interval=..)" at
+                        # INFO before the first await. Demoting this confirmation to DEBUG
+                        # keeps the log to one line per slot's keepalive lifecycle.
+                        logger.debug(
                             "Slot %s: first main-keepalive sent (interval=%.1fs)",
                             self.slot_label, interval,
                         )

@@ -450,6 +450,17 @@ def _slot_status_label(s: SlotState) -> tuple[str, str]:
     if not s.login_success_event.is_set():
         return ("NO_LG", "MAIN TCP ok but no LoginSuccessPacket")
     if s.proxy._main_write_conn() is None:
+        # Pull the last-close summary off the proxy if available — gives
+        # PARTL rows a per-slot cause (clean-eof, ConnectionResetError, ...)
+        # plus how long the slot survived after login. Avoids forcing the
+        # operator to scroll through the WARNING stream to figure out what
+        # happened to which slot.
+        reason = getattr(s.proxy, "_main_last_close_reason", None)
+        since_login = getattr(s.proxy, "_main_last_close_since_login_sec", None)
+        if reason and since_login is not None:
+            return ("PARTL", f"upstream closed: {reason}@{since_login:.1f}s after login")
+        if reason:
+            return ("PARTL", f"upstream closed: {reason}")
         return ("PARTL", "login ok but upstream closed")
     return ("OK   ", "ready")
 

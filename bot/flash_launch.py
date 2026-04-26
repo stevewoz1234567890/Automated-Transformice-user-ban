@@ -1508,10 +1508,19 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                     )
 
     if clicked:
-        logger.info(
-            "ActionScript error dismiss: pass summary slot=%s pid=%s total_closed=%d this scan",
-            slot_label, pid, clicked,
-        )
+        # When only one dialog closed, the per-dialog "closed slot=... title=..."
+        # line above already covers it — the summary just doubles the noise.
+        # Keep INFO only for the multi-close case (rare and useful).
+        if clicked > 1:
+            logger.info(
+                "ActionScript error dismiss: pass summary slot=%s pid=%s total_closed=%d this scan",
+                slot_label, pid, clicked,
+            )
+        else:
+            logger.debug(
+                "ActionScript error dismiss: pass summary slot=%s pid=%s total_closed=%d this scan",
+                slot_label, pid, clicked,
+            )
     return clicked
 
 
@@ -1756,9 +1765,10 @@ def _disable_process_throttling(pid: int, slot_label: str) -> bool:
                     slot_label, pid, err,
                 )
         if any_ok:
+            # Rationale ("keeps Anticheat responder running...") is logged once at
+            # CLI startup; per-slot just confirms the system call landed.
             logger.info(
-                "Slot %s: Flash PID %s priority=HIGH, EcoQoS power-throttling DISABLED — "
-                "keeps Anticheat responder running when window is not foreground",
+                "Slot %s: Flash PID %s priority=HIGH, EcoQoS throttling=off",
                 slot_label, pid,
             )
     finally:
@@ -1858,10 +1868,10 @@ def minimize_flash_window(pid: int, slot_label: str) -> bool:
         )
         return False
 
+    # Long rationale (why we tile instead of SW_MINIMIZE / off-screen) is in the
+    # docstring above; keep the per-slot log tight.
     logger.info(
-        "Slot %s: Flash HWND=%s tiled to (%d,%d) %dx%d [row=%d col=%d] — "
-        "kept on-screen + un-occluded so Flash event loop does NOT throttle "
-        "(avoids Anticheat silence → server clean-eof kick)",
+        "Slot %s: tiled HWND=%s to (%d,%d) %dx%d [row=%d col=%d]",
         slot_label, hwnd, x, y, TILE_W, TILE_H, row, col,
     )
     # Tiling alone isn't enough — Windows 10+ power-throttles background
