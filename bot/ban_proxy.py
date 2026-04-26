@@ -356,14 +356,19 @@ class BanBotProxy(Proxy):
         "reply present but wrong" as more suspicious than "no reply yet").
 
         Fix: default behaviour now **forwards** the ping so Flash pongs itself (this requires
-        Flash to not be throttled — see ``_disable_process_throttling`` in ``flash_launch``).
+        Flash to not be throttled — see ``_disable_process_throttling`` in ``flash_launch``;
+        we already disable EcoQoS + raise to HIGH priority + tile windows on-screen, so the
+        prerequisite is satisfied for our default Windows launch path).
         Setting env ``BOT_AUTO_PONG=1`` restores the old proxy-pong behaviour as an escape
-        hatch for environments where Flash throttling can't be disabled.
+        hatch for environments where Flash throttling can't be disabled. The default is
+        ``BOT_AUTO_PONG=0`` (forward) — keeping it at ``1`` reproduces the ``clean-eof``
+        kicks even when ``pongs_main>=1``, because the proxy pong has the wrong fingerprint.
         """
-        auto_pong_disabled = (os.environ.get("BOT_AUTO_PONG", "1").strip().lower()
-                              in ("0", "false", "no", "off"))
-        if auto_pong_disabled:
-            # Opt-out: forward the ping to Flash and let the real client pong.
+        auto_pong_mode = os.environ.get("BOT_AUTO_PONG", "0").strip().lower()
+        # Default ("0"/"false"/"no"/"off"/unset): forward the ping to Flash and let the
+        # real client pong with its session fingerprint. Only the explicit opt-in values
+        # ("1"/"true"/"yes"/"on") activate the proxy-pong escape hatch.
+        if auto_pong_mode not in ("1", "true", "yes", "on"):
             return self.FORWARD_PACKET
 
         payload = getattr(packet, "payload", 0) or 0
@@ -387,8 +392,11 @@ class BanBotProxy(Proxy):
 
         if count == 1:
             logger.info(
-                "Slot %s: first auto-pong sent on %s (payload=%s) — BOT_AUTO_PONG=1 "
-                "(ping NOT forwarded to Flash)",
+                "Slot %s: first auto-pong sent on %s (payload=%s) — BOT_AUTO_PONG=1 escape "
+                "hatch active (ping NOT forwarded to Flash). NOTE: TFM may still close MAIN "
+                "with clean-eof because the proxy pong has a different fingerprint than "
+                "Flash's real pong; unset BOT_AUTO_PONG (default forwards to Flash) if "
+                "Flash is un-throttled.",
                 self.slot_label, conn, payload,
             )
         elif count % _proxy_heartbeat_log_every() == 0:
