@@ -118,6 +118,21 @@ class SlotState:
     packet_loader_url: str = ""
     # Set when this slot's proxy accepts MAIN TCP (Flash reached the proxy).
     flash_main_tcp_seen: bool = False
+    # Retry bookkeeping (used by ``_retry_partl_slots``):
+    #   attempts_used    — number of relaunches we've already issued for this slot
+    #                      after the initial sequential login phase. Capped by
+    #                      BOT_RETRY_MAX_ATTEMPTS so a permanently flagged
+    #                      account can't loop forever.
+    #   bind_ip_pool     — ordered list of bind_ip values to cycle through across
+    #                      retries: starts with [row['bind_ip']] + row['extra_bind_ips'].
+    #                      Drained on each retry; once exhausted, retry will
+    #                      borrow from the global BOT_SPARE_BIND_IPS pool (if any).
+    #   current_bind_ip  — bind_ip currently associated with this slot (the value
+    #                      stamped on the Flash launch line and consumed by Proxifier
+    #                      rules). Initialised to row['bind_ip'].
+    attempts_used: int = 0
+    bind_ip_pool: list[str] = field(default_factory=list)
+    current_bind_ip: str = ""
 
 
 def _assign_listen_ports(
@@ -618,6 +633,358 @@ def close_all_flash_windows(states: list[SlotState], cfg: object | None = None) 
     _flush_log_handlers()
 
 
+# --------------------------------------------------------------------------- #
+# PARTL retry — relaunch failed Flash tabs (optionally with a different bind_ip)
+# --------------------------------------------------------------------------- #
+#
+# After the initial sequential login phase, ``_retry_partl_slots`` walks every
+# slot whose status is PARTL (logged in but upstream connection dropped) and
+# attempts to bring it back: close the dead Flash tab, reset proxy session
+# state, optionally swap to the next bind_ip from the slot's pool / the global
+# spare pool, and relaunch Flash. Up to BOT_RETRY_MAX_ATTEMPTS attempts per
+# slot, with BOT_RETRY_DELAY_SEC between the close and the relaunch.
+#
+# IMPORTANT: bind_ip rotation only changes the WAN exit IP if Proxifier (or the
+# multi-NIC bind path enabled by PROXY_LISTEN_USE_ACCOUNT_BIND_IP=true) is
+# wired to map each bind_ip to a distinct upstream egress. Otherwise rotating
+# bind_ip is just relabelling — useful for diagnostics, but the server still
+# sees the same public IP and is likely to kick again. The retry without a
+# rotation is still worth running because it can recover from transient kicks
+# (server-side rate-limit windows, missed first-pong races) where the same IP
+# does work on the second try.
+# --------------------------------------------------------------------------- #
+
+
+_GLOBAL_SPARE_BIND_IPS: list[str] | None = None
+
+
+def _load_global_spare_bind_ips() -> list[str]:
+    """
+    Parse ``BOT_SPARE_BIND_IPS`` once into an ordered list of unique IPs.
+    Format: comma- or whitespace-separated. Drained as PARTL retries borrow.
+    """
+    global _GLOBAL_SPARE_BIND_IPS
+    if _GLOBAL_SPARE_BIND_IPS is not None:
+        return _GLOBAL_SPARE_BIND_IPS
+    raw = (os.environ.get("BOT_SPARE_BIND_IPS") or "").strip()
+    if not raw:
+        _GLOBAL_SPARE_BIND_IPS = []
+        return _GLOBAL_SPARE_BIND_IPS
+    parts = [p.strip() for p in raw.replace(";", ",").replace(" ", ",").split(",")]
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    _GLOBAL_SPARE_BIND_IPS = out
+    if out:
+        logger.info(
+            "Retry: %d spare bind_ip(s) available from BOT_SPARE_BIND_IPS pool: %s",
+            len(out), out,
+        )
+    return _GLOBAL_SPARE_BIND_IPS
+
+
+def _pick_next_bind_ip_for_retry(st: SlotState, used_ips: set[str]) -> str | None:
+    """
+    Return the next bind_ip the slot should use on its next retry, or ``None``
+    if no fresh IP is available (caller may still relaunch with the current IP).
+
+    Resolution order:
+      1. Slot's own ``bind_ip_pool`` (from row['bind_ip'] + row['extra_bind_ips'])
+      2. Global ``BOT_SPARE_BIND_IPS`` pool (drained per borrow)
+
+    ``used_ips`` is updated in place so the global pool isn't double-issued
+    across slots within the same retry pass.
+    """
+    while st.bind_ip_pool:
+        cand = st.bind_ip_pool.pop(0)
+        if cand and cand != st.current_bind_ip and cand not in used_ips:
+            used_ips.add(cand)
+            return cand
+    spares = _load_global_spare_bind_ips()
+    while spares:
+        cand = spares.pop(0)
+        if cand and cand != st.current_bind_ip and cand not in used_ips:
+            used_ips.add(cand)
+            return cand
+    return None
+
+
+def _reset_slot_state_for_retry(st: SlotState) -> None:
+    """
+    Wipe per-session events on the slot and per-MAIN-session counters on the
+    underlying proxy so a fresh MAIN TCP accept looks like a brand-new session
+    instead of being interpreted as a reconnect.
+    """
+    st.login_success_event.clear()
+    st.flash_main_tcp_seen = False
+    st.flash_loader_ready_event.clear()
+    st.error = None
+    proxy = st.proxy
+    if proxy is None:
+        return
+    # Session-level fields populated by ``new_main_connection``'s finally
+    # block. Clearing them means the post-retry status table won't display
+    # the previous session's close reason once a fresh MAIN session opens.
+    try:
+        proxy._login_success_mono = None
+        proxy._main_tcp_mono = None
+        proxy._main_last_close_reason = None
+        proxy._main_last_close_alive_sec = None
+        proxy._main_last_close_since_login_sec = None
+        proxy._sat_redirect_logged = False
+        proxy._main_recent_from_server.clear()
+        proxy._main_recent_from_client.clear()
+        # Counters: zero per-session pong / keepalive numbers so the post-retry
+        # status table reports the *new* session's liveness instead of the
+        # stale figures from the kicked session.
+        proxy._auto_pong_sent_main = 0
+        proxy._auto_pong_sent_satellite = 0
+        proxy._keepalive_sent_main = 0
+        # ``_main_keepalive_started`` is sticky — once set, ``_start_main_keepalive``
+        # short-circuits even if the previous keepalive task exited (its
+        # ``_main_keepalive_loop`` returns when MAIN upstream is gone). Clear
+        # it so the next LoginSuccess on the new MAIN session restarts the
+        # heartbeat instead of running pong-only.
+        proxy._main_keepalive_started = False
+        proxy._main_keepalive_task = None
+    except Exception:
+        logger.debug("Slot %s: proxy state reset hit unexpected attr", st.label, exc_info=True)
+
+
+def _close_flash_for_slot_retry(st: SlotState, cfg: object) -> None:
+    """Graceful close of the slot's Flash window before relaunch (no-op if dead)."""
+    pid = st.flash_pid
+    if not pid:
+        return
+    try:
+        if not flash_launch.flash_pid_is_alive(pid):
+            st.flash_pid = None
+            return
+    except Exception:
+        # If the liveness probe blows up, still try to close so we don't
+        # leave a zombie behind on retry — close_flash_window is itself
+        # defensive about a missing PID.
+        pass
+    grace = float(getattr(cfg, "FLASH_CLOSE_GRACE_SEC", 2.0))
+    try:
+        flash_launch.close_flash_window(pid, st.label, grace_sec=grace)
+    except Exception:
+        logger.exception("Slot %s: close_flash_window raised during retry", st.label)
+    st.flash_pid = None
+
+
+def _build_flash_row_for_retry(
+    *,
+    raw_row: dict,
+    st: SlotState,
+    shared_flash_policy_port: int | None,
+) -> dict:
+    """Reproduce the per-slot ``flash_row`` shape that the initial launch loop builds."""
+    flash_row = dict(raw_row)
+    flash_row["_flash_satellite_port"] = st.satellite_port
+    flash_row["_flash_policy_port"] = (
+        shared_flash_policy_port
+        if shared_flash_policy_port is not None
+        else st.policy_port
+    )
+    flash_row["_flash_connect_host"] = st.proxy_bind_host if st.proxy_bind_host else "127.0.0.1"
+    if st.current_bind_ip:
+        flash_row["bind_ip"] = st.current_bind_ip
+    return flash_row
+
+
+def _wait_for_login_simple(st: SlotState, login_timeout: float) -> bool:
+    """Poll for ``login_success_event`` up to ``login_timeout`` seconds with periodic INFO."""
+    deadline = time.monotonic() + login_timeout
+    next_log = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        # Wait in small slices so the periodic-log clock stays accurate.
+        if st.login_success_event.wait(timeout=1.0):
+            return True
+        now = time.monotonic()
+        if now >= next_log:
+            left = max(0.0, deadline - now)
+            logger.info(
+                "Retry: slot %s still waiting for login (~%.0fs left, MAIN_TCP=%s)",
+                st.label, left, "yes" if st.flash_main_tcp_seen else "no",
+            )
+            next_log = now + 15.0
+    return False
+
+
+def _retry_partl_slots(
+    states: list[SlotState],
+    raw_accounts: list[dict],
+    cfg: object,
+    args,
+    *,
+    shared_flash_policy_port: int | None,
+) -> None:
+    """
+    Walk PARTL slots after the initial login phase and attempt to bring each
+    one back online by closing its Flash tab and relaunching (optionally with
+    a different bind_ip). See module-level docstring above for the wiring
+    needed for bind_ip rotation to actually change the WAN exit IP.
+    """
+    if not _env_bool("BOT_RETRY_FAILED_SLOTS", default=True):
+        logger.info(
+            "Retry: BOT_RETRY_FAILED_SLOTS=false — skipping PARTL relaunch pass.",
+        )
+        return
+    try:
+        max_attempts = int(os.environ.get("BOT_RETRY_MAX_ATTEMPTS", "3"))
+    except ValueError:
+        max_attempts = 3
+    max_attempts = max(0, min(max_attempts, 10))
+    if max_attempts == 0:
+        logger.info("Retry: BOT_RETRY_MAX_ATTEMPTS=0 — disabled.")
+        return
+    try:
+        retry_delay = float(os.environ.get("BOT_RETRY_DELAY_SEC", "3.0"))
+    except ValueError:
+        retry_delay = 3.0
+    retry_delay = max(0.0, min(retry_delay, 30.0))
+    try:
+        retry_login_timeout = float(os.environ.get("BOT_RETRY_LOGIN_TIMEOUT_SEC", "120.0"))
+    except ValueError:
+        retry_login_timeout = 120.0
+    retry_login_timeout = max(15.0, min(retry_login_timeout, 600.0))
+
+    # Map slot label -> raw account row so we can rebuild flash_row each attempt.
+    row_by_label: dict[str, dict] = {}
+    for row in raw_accounts:
+        lbl = str(row.get("label", "") or "").strip()
+        if lbl:
+            row_by_label[lbl] = row
+
+    spares = _load_global_spare_bind_ips()
+    used_ips_global: set[str] = {
+        s.current_bind_ip for s in states if s.current_bind_ip
+    }
+    # Track which spare IPs have been issued so the same one doesn't get
+    # handed to two failing slots in the same pass.
+    used_spares: set[str] = set()
+
+    for round_num in range(1, max_attempts + 1):
+        partl_slots = [s for s in states if _slot_status_label(s)[0] == "PARTL"]
+        if not partl_slots:
+            logger.info("Retry: no PARTL slot remaining — relaunch loop done.")
+            return
+        eligible = [s for s in partl_slots if s.attempts_used < max_attempts]
+        if not eligible:
+            logger.info(
+                "Retry: round %d — %d PARTL slot(s) remain but all hit BOT_RETRY_MAX_ATTEMPTS=%d; giving up.",
+                round_num, len(partl_slots), max_attempts,
+            )
+            break
+        logger.info(
+            "Retry round %d/%d: relaunching %d PARTL slot(s) %s%s",
+            round_num,
+            max_attempts,
+            len(eligible),
+            [s.label for s in eligible],
+            f" (global spares left: {len(spares)})" if spares else "",
+        )
+
+        for st in eligible:
+            row = row_by_label.get(st.label)
+            if row is None:
+                logger.warning(
+                    "Retry: slot %s has no matching account row — skipping.", st.label,
+                )
+                continue
+
+            new_ip = _pick_next_bind_ip_for_retry(st, used_spares | used_ips_global)
+            if new_ip:
+                logger.info(
+                    "Retry: slot %s switching bind_ip %r -> %r (attempt %d/%d)",
+                    st.label, st.current_bind_ip or "(none)", new_ip,
+                    st.attempts_used + 1, max_attempts,
+                )
+                # Free the old IP so it can be reused by a later round; keep
+                # the new one out of the global eligible set for the rest of
+                # this pass.
+                used_ips_global.discard(st.current_bind_ip)
+                st.current_bind_ip = new_ip
+                used_ips_global.add(new_ip)
+            else:
+                logger.info(
+                    "Retry: slot %s no fresh bind_ip available — relaunching with current %r (attempt %d/%d)",
+                    st.label, st.current_bind_ip or "(none)",
+                    st.attempts_used + 1, max_attempts,
+                )
+
+            _close_flash_for_slot_retry(st, cfg)
+            _reset_slot_state_for_retry(st)
+            if retry_delay > 0:
+                time.sleep(retry_delay)
+
+            flash_row = _build_flash_row_for_retry(
+                raw_row=row, st=st,
+                shared_flash_policy_port=shared_flash_policy_port,
+            )
+            try:
+                proc = flash_launch.launch_one_flash_loader(
+                    flash_row,
+                    root=_repo_root(),
+                    click_transformice=not args.launch_flash_no_click,
+                    on_flash_pid=lambda pid, _st=st: setattr(_st, "flash_pid", pid),
+                    post_open_delay_sec=float(
+                        getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Retry: slot %s — launch_one_flash_loader raised; skipping this attempt.",
+                    st.label,
+                )
+                st.attempts_used += 1
+                continue
+
+            if proc is None:
+                logger.warning(
+                    "Retry: slot %s — Flash launcher returned no process; counting attempt and moving on.",
+                    st.label,
+                )
+                st.attempts_used += 1
+                continue
+
+            st.flash_loader_ready_event.set()
+            ok = _wait_for_login_simple(st, retry_login_timeout)
+            st.attempts_used += 1
+            if ok:
+                tag, _ = _slot_status_label(st)
+                logger.info(
+                    "Retry: slot %s — relaunch login %s (status=%s, attempt %d/%d)",
+                    st.label,
+                    "succeeded" if tag == "OK   " else "succeeded (still PARTL — server kicked again)",
+                    tag.strip(), st.attempts_used, max_attempts,
+                )
+            else:
+                logger.warning(
+                    "Retry: slot %s — no LoginSuccess within %.0fs (attempt %d/%d).",
+                    st.label, retry_login_timeout, st.attempts_used, max_attempts,
+                )
+                # Close the Flash window we just opened so the next round (or
+                # the caller's eventual cleanup) starts from a clean slate.
+                _close_flash_for_slot_retry(st, cfg)
+
+    print_slot_status(states, title="SLOT STATUS AFTER RETRY")
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    """Tiny helper: read ``name`` from env, accepting common true/false spellings."""
+    raw = (os.environ.get(name, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 def fetch_room_list(
     states: list[SlotState],
     *,
@@ -1099,7 +1466,33 @@ def main(argv: list[str] | None = None) -> None:
             slot_listen: str | None = ip if ip else proxy_bind
         else:
             slot_listen = proxy_bind
-        states.append(SlotState(label=label, port=port, proxy_bind_host=slot_listen))
+        # Build the slot's bind_ip_pool from the row's primary bind_ip plus any
+        # extra_bind_ips. The current bind_ip starts as row['bind_ip'] (so the
+        # initial Flash launch sees the same value it always has). Subsequent
+        # values are consumed by ``_retry_partl_slots`` on PARTL recovery.
+        extras_raw = row.get("extra_bind_ips") or []
+        if isinstance(extras_raw, str):
+            extras = [
+                p.strip()
+                for p in extras_raw.replace(";", ",").replace(" ", ",").split(",")
+                if p.strip()
+            ]
+        else:
+            try:
+                extras = [str(x).strip() for x in extras_raw if str(x).strip()]
+            except TypeError:
+                extras = []
+        # Skip the primary in extras to avoid issuing the same IP twice.
+        extras = [e for e in extras if e and e != ip]
+        states.append(
+            SlotState(
+                label=label,
+                port=port,
+                proxy_bind_host=slot_listen,
+                current_bind_ip=ip,
+                bind_ip_pool=list(extras),
+            )
+        )
 
     focus_pump_stop: threading.Event | None = None
     # Stopped after login phase; while running it hammers all Flash PIDs and spams logs during
@@ -1655,6 +2048,22 @@ def main(argv: list[str] | None = None) -> None:
     _wait_for_game_clients(states, auto_flash_launched=auto_flash)
 
     print_slot_status(states, title="SLOT STATUS AFTER LOGIN PHASE")
+
+    # Try to revive PARTL slots: relaunch each failed Flash tab (optionally with a
+    # different bind_ip from the slot's pool / BOT_SPARE_BIND_IPS) before we ask
+    # the user to pick a room. Only runs when Flash was auto-launched — without
+    # auto-launch we have no PID to close and nothing to relaunch.
+    if auto_flash:
+        try:
+            _retry_partl_slots(
+                states,
+                raw_accounts,
+                cfg,
+                args,
+                shared_flash_policy_port=shared_flash_policy_port,
+            )
+        except Exception:
+            logger.exception("PARTL retry pass raised; continuing with current slot states.")
 
     # Late #2044/#2048 boxes (commonly the last 3 Flash clients) often appear *after* the
     # "logged in" line but before the next poll; run a multi-pass dismiss before we stop
