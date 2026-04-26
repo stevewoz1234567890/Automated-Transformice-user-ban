@@ -161,10 +161,13 @@ _ENV_DEFAULTS: dict[str, str] = {
     "BOT_PROXY_BIND_HOST": "",
     "BOT_PROXY_LISTEN_USE_ACCOUNT_BIND_IP": "false",
     "BOT_SHARED_FLASH_SOCKET_POLICY_PORT": "10801",
-    # 0 = forward server PingPacket to Flash (default; required to avoid clean-eof kicks
-    # because Flash's pong has the correct session fingerprint). 1 = proxy-pong escape
-    # hatch (only useful when Flash is throttled and cannot pong in time).
-    "BOT_AUTO_PONG": "0",
+    # Server PingPacket handling. Default "both": proxy ponges immediately AND forwards the
+    # ping to Flash (Flash's own pong, if any, also reaches the server). Required when
+    # BOT_PACKET_AUTO_LOGIN=true because Flash never enters the post-login state and so
+    # never pongs on its own — without the proxy pong every slot gets clean-eof'd. Other
+    # values: "flash"/"0" forward only (Flash must pong; only viable with the UI login
+    # flow); "swallow" proxy-pongs and never forwards.
+    "BOT_AUTO_PONG": "both",
     "BOT_HEADLESS_AUTO_LOGIN": "false",
     "BOT_HEADLESS_SECRETS_DOTENV_PATH": ".env",
     "BOT_HEADLESS_SECRETS_SEED_DOTENV_FROM_EXAMPLE": "true",

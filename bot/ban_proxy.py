@@ -343,32 +343,39 @@ class BanBotProxy(Proxy):
 
     @pak.packet_listener(clientbound.PingPacket)
     async def _auto_pong_server_ping(self, source, packet):
-        """Forward ``clientbound.PingPacket`` to Flash so it can pong with its real session
-        fingerprint, and (optionally) also send a proxy-side pong as a safety net.
+        """Reply to the server's ``PingPacket`` so the connection survives whatever Flash does.
 
-        The TFM server sends a ``clientbound.PingPacket`` periodically on both the main and
-        satellite connections. It expects a matching ``serverbound.PongPacket`` whose
-        fingerprint (stack layout / prior state) identifies the *real* Flash client. An
-        earlier experiment had the proxy pong on Flash's behalf and **swallow** the ping
-        (``DO_NOTHING``); packet-trail logging showed that server then closed MAIN with
-        ``clean-eof`` exactly 10 s after its last ping — even with ``pongs_main>=1`` — because
-        the proxy pong has a different fingerprint than Flash's real pong (server treats
-        "reply present but wrong" as more suspicious than "no reply yet").
+        Three modes, controlled by env ``BOT_AUTO_PONG`` (default: ``both``):
 
-        Fix: default behaviour now **forwards** the ping so Flash pongs itself (this requires
-        Flash to not be throttled — see ``_disable_process_throttling`` in ``flash_launch``;
-        we already disable EcoQoS + raise to HIGH priority + tile windows on-screen, so the
-        prerequisite is satisfied for our default Windows launch path).
-        Setting env ``BOT_AUTO_PONG=1`` restores the old proxy-pong behaviour as an escape
-        hatch for environments where Flash throttling can't be disabled. The default is
-        ``BOT_AUTO_PONG=0`` (forward) — keeping it at ``1`` reproduces the ``clean-eof``
-        kicks even when ``pongs_main>=1``, because the proxy pong has the wrong fingerprint.
+        * ``both`` (default, also accepts ``1`` / ``true`` / ``on``): proxy fires
+          ``serverbound.PongPacket`` immediately *and* forwards the ping to Flash so the
+          real client also pongs. This is what the original implementation did and is the
+          safest setting because it survives both ``BOT_PACKET_AUTO_LOGIN=true`` (Flash
+          never enters the post-login state and therefore never pongs on its own — observed
+          as ``pongs_main=0`` for every slot followed by ``clean-eof``) *and* Flash being
+          partially throttled.
+        * ``flash`` / ``forward`` / ``0``: do **not** proxy-pong; only forward the ping to
+          Flash. Useful when Flash is fully un-throttled *and* logged in via the UI flow,
+          but breaks when ``BOT_PACKET_AUTO_LOGIN`` is on (Flash never pongs).
+        * ``swallow`` / ``proxy_only``: proxy ponges and swallows the ping so Flash never
+          sees it. Equivalent to the legacy ``56dfddd`` behaviour. Discouraged: server may
+          detect "reply present but wrong fingerprint" and still close MAIN with
+          ``clean-eof`` ~10 s after its last ping.
+
+        ``serverbound.KeepAlivePacket`` is unrelated — the server does not treat it as a
+        pong, so we still need a real ``PongPacket`` to pacify the server.
         """
-        auto_pong_mode = os.environ.get("BOT_AUTO_PONG", "0").strip().lower()
-        # Default ("0"/"false"/"no"/"off"/unset): forward the ping to Flash and let the
-        # real client pong with its session fingerprint. Only the explicit opt-in values
-        # ("1"/"true"/"yes"/"on") activate the proxy-pong escape hatch.
-        if auto_pong_mode not in ("1", "true", "yes", "on"):
+        raw = os.environ.get("BOT_AUTO_PONG", "").strip().lower()
+        if raw in ("", "both", "1", "true", "yes", "on"):
+            mode = "both"
+        elif raw in ("0", "flash", "forward", "off", "no", "false"):
+            mode = "flash"
+        elif raw in ("swallow", "proxy", "proxy_only"):
+            mode = "swallow"
+        else:
+            mode = "both"
+
+        if mode == "flash":
             return self.FORWARD_PACKET
 
         payload = getattr(packet, "payload", 0) or 0
@@ -391,14 +398,19 @@ class BanBotProxy(Proxy):
             count = self._auto_pong_sent_main
 
         if count == 1:
-            logger.info(
-                "Slot %s: first auto-pong sent on %s (payload=%s) — BOT_AUTO_PONG=1 escape "
-                "hatch active (ping NOT forwarded to Flash). NOTE: TFM may still close MAIN "
-                "with clean-eof because the proxy pong has a different fingerprint than "
-                "Flash's real pong; unset BOT_AUTO_PONG (default forwards to Flash) if "
-                "Flash is un-throttled.",
-                self.slot_label, conn, payload,
-            )
+            if mode == "both":
+                logger.info(
+                    "Slot %s: first auto-pong sent on %s (payload=%s) — BOT_AUTO_PONG=both "
+                    "(proxy ponges AND forwards the ping to Flash; needed for "
+                    "PACKET_AUTO_LOGIN where Flash never pongs on its own).",
+                    self.slot_label, conn, payload,
+                )
+            else:
+                logger.info(
+                    "Slot %s: first auto-pong sent on %s (payload=%s) — BOT_AUTO_PONG=swallow "
+                    "(proxy ponges, ping NOT forwarded to Flash).",
+                    self.slot_label, conn, payload,
+                )
         elif count % _proxy_heartbeat_log_every() == 0:
             logger.info(
                 "Slot %s: %s auto-pong count=%d (payload=%s) — upstream still alive",
@@ -410,6 +422,9 @@ class BanBotProxy(Proxy):
                 self.slot_label, conn, count, payload,
             )
 
+        if mode == "both":
+            # Let the ping continue to Flash so its own pong (if any) also reaches server.
+            return self.FORWARD_PACKET
         return self.DO_NOTHING
 
     @pak.packet_listener(clientbound.ChangeSatelliteServerPacket)

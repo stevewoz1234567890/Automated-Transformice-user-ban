@@ -1061,10 +1061,39 @@ def main(argv: list[str] | None = None) -> None:
     cfg_flash_auto = bool(getattr(cfg, "FLASH_AUTO_LOGIN_UI", False))
     if args.no_flash_auto_login:
         cfg_flash_auto = False
-    if bool(getattr(cfg, "PACKET_AUTO_LOGIN", False)):
+    packet_auto_login_active = bool(getattr(cfg, "PACKET_AUTO_LOGIN", False))
+    if packet_auto_login_active:
         cfg_flash_auto = False
         logger.info(
             "PACKET_AUTO_LOGIN=True — FLASH_AUTO_LOGIN_UI disabled (login is sent as LoginPacket by the proxy)",
+        )
+
+    _ap_raw = (os.environ.get("BOT_AUTO_PONG", "") or "").strip().lower()
+    if _ap_raw in ("", "both", "1", "true", "yes", "on"):
+        _ap_mode = "both"
+    elif _ap_raw in ("0", "flash", "forward", "off", "no", "false"):
+        _ap_mode = "flash"
+    elif _ap_raw in ("swallow", "proxy", "proxy_only"):
+        _ap_mode = "swallow"
+    else:
+        _ap_mode = "both"
+    if _ap_mode == "flash" and packet_auto_login_active:
+        logger.warning(
+            "BOT_AUTO_PONG=%r resolves to 'flash' (forward-only) but PACKET_AUTO_LOGIN=True — "
+            "Flash never enters its post-login state, so it will NOT pong forwarded "
+            "PingPackets and every slot will be closed by the server (clean-eof, pong=0/0). "
+            "Set BOT_AUTO_PONG=both (or remove the line from .env).",
+            _ap_raw,
+        )
+    else:
+        logger.info(
+            "BOT_AUTO_PONG=%s — %s",
+            _ap_mode,
+            {
+                "both":    "proxy ponges AND forwards ping to Flash (recommended; required for PACKET_AUTO_LOGIN).",
+                "flash":   "forward-only (Flash must pong; only viable with the UI login flow).",
+                "swallow": "proxy-pong only, ping NOT forwarded to Flash.",
+            }[_ap_mode],
         )
 
     def _flash_login_trigger(c) -> str:
