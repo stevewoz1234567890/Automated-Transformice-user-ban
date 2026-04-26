@@ -499,6 +499,60 @@ def print_slot_status(states: list[SlotState], *, title: str = "SLOT STATUS") ->
     _flush_log_handlers()
 
 
+def _taskkill_all_flash_windows(reason: str = "shutdown") -> None:
+    """
+    Windows-only nuclear fallback: ``taskkill /F /FI "WINDOWTITLE eq Adobe Flash Player*"``.
+
+    Closes every visible Adobe Flash Player projector window in one shot, regardless
+    of which PID owns it. Used as a safety net when:
+      * the per-slot WM_CLOSE/TerminateProcess walk in :func:`close_all_flash_windows`
+        leaves stragglers (Flash projector occasionally ignores WM_CLOSE during a
+        modal "Adobe Flash Player" error dialog), or
+      * the operator hits Ctrl-C a second time while cleanup is still mid-flight
+        and we never want them to be staring at 14 zombie projector windows.
+
+    No-op on non-Windows platforms.
+    """
+    if sys.platform != "win32":
+        return
+    import subprocess
+    cmd = ['taskkill', '/F', '/FI', 'WINDOWTITLE eq Adobe Flash Player*']
+    try:
+        # Hide the taskkill child console; capture output so we can quote it on a single line.
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        cp = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+            startupinfo=startupinfo,
+        )
+        out = (cp.stdout or "").strip().replace("\r", "").replace("\n", " | ")
+        err = (cp.stderr or "").strip().replace("\r", "").replace("\n", " | ")
+        if cp.returncode == 0:
+            logger.info(
+                "Flash cleanup: taskkill 'WINDOWTITLE eq Adobe Flash Player*' OK (%s) — %s",
+                reason, out or "(no output)",
+            )
+        elif cp.returncode == 128:
+            # ERROR: The search filter cannot be recognized — happens when zero matching
+            # processes exist. Treat as success: nothing to clean.
+            logger.info(
+                "Flash cleanup: taskkill found no Adobe Flash Player windows (%s).",
+                reason,
+            )
+        else:
+            logger.info(
+                "Flash cleanup: taskkill rc=%s (%s) — out=%r err=%r",
+                cp.returncode, reason, out, err,
+            )
+    except FileNotFoundError:
+        logger.debug("taskkill not on PATH; skipping nuclear Flash cleanup.")
+    except Exception:
+        logger.exception("Flash cleanup: taskkill raised during shutdown")
+
+
 def close_all_flash_windows(states: list[SlotState], cfg: object | None = None) -> None:
     """
     Close every Flash projector window this bot session launched.
@@ -507,21 +561,48 @@ def close_all_flash_windows(states: list[SlotState], cfg: object | None = None) 
     hand-close 14 Flash windows after the bot finishes (or crashes). Mirrors
     the per-slot close used when a login times out: WM_CLOSE first, then
     ``TerminateProcess`` after ``FLASH_CLOSE_GRACE_SEC`` if needed.
+
+    A second Ctrl-C during the per-slot walk falls through to the
+    ``taskkill /F /FI "WINDOWTITLE eq Adobe Flash Player*"`` fallback at the
+    end so the operator never ends up with zombie projector windows even when
+    they impatient-cancel cleanup.
     """
     grace = float(getattr(cfg, "FLASH_CLOSE_GRACE_SEC", 2.0)) if cfg is not None else 2.0
     live = [s for s in states if s.flash_pid and flash_launch.flash_pid_is_alive(s.flash_pid)]
     if not live:
         logger.info("Flash cleanup: no live Flash processes to close.")
+        # Still run the nuclear fallback in case stale Flash windows from a previous
+        # crashed run linger (no PID known to us, but the WINDOWTITLE filter still
+        # nukes them). Cheap on Windows; no-op elsewhere.
+        _taskkill_all_flash_windows(reason="no live PIDs known")
+        _flush_log_handlers()
         return
     logger.info("Flash cleanup: closing %d Flash window(s) for slots %s...",
                 len(live), [s.label for s in live])
+    interrupted = False
     for s in live:
         pid = s.flash_pid
         try:
             flash_launch.close_flash_window(pid, s.label, grace_sec=grace)
+        except KeyboardInterrupt:
+            # Operator slammed Ctrl-C again — bail out of the per-slot walk and
+            # go straight to taskkill below so they aren't waiting on per-PID grace.
+            logger.info(
+                "Flash cleanup: second Ctrl-C — skipping remaining per-slot closes "
+                "and falling through to taskkill nuke."
+            )
+            interrupted = True
+            break
         except Exception:
             logger.exception("Slot %s: close_flash_window raised during shutdown", s.label)
         s.flash_pid = None
+    # Always run the nuclear fallback at the end. If the per-slot walk succeeded,
+    # taskkill returns "no Adobe Flash Player windows" (rc=128) and we just log
+    # that. If anything was left behind — modal error dialog blocking WM_CLOSE,
+    # second-Ctrl-C abort, projector hung in DwmFlush — taskkill kills it dead.
+    _taskkill_all_flash_windows(
+        reason="post per-slot cleanup" if not interrupted else "Ctrl-C during cleanup",
+    )
     logger.info("Flash cleanup: done.")
     _flush_log_handlers()
 
@@ -1623,8 +1704,23 @@ def main(argv: list[str] | None = None) -> None:
             flash_dismiss_poll_stop.set()
         try:
             close_all_flash_windows(states, cfg)
+        except KeyboardInterrupt:
+            # Second/third Ctrl-C — operator wants out NOW. Skip the per-slot
+            # walk entirely and go straight to taskkill so we still don't leak
+            # 14 Flash windows.
+            logger.info(
+                "Flash cleanup: Ctrl-C again — running taskkill nuke directly."
+            )
+            try:
+                _taskkill_all_flash_windows(reason="Ctrl-C escaped close_all_flash_windows")
+            except Exception:
+                logger.exception("Flash cleanup: taskkill fallback raised")
         except Exception:
             logger.exception("Flash cleanup raised during shutdown")
+            try:
+                _taskkill_all_flash_windows(reason="exception escaped close_all_flash_windows")
+            except Exception:
+                logger.exception("Flash cleanup: taskkill fallback raised")
 
 
 if __name__ == "__main__":
