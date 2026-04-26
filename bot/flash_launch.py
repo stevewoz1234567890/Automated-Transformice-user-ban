@@ -1361,18 +1361,44 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
             area,
             (title or "")[:120],
         )
-        # Enumerate child controls and click buttons matching dismiss labels
+        # Enumerate child controls and click buttons matching dismiss labels.
+        # Also capture Static-control body text so the operator (and log.txt) can
+        # see *which* error fired — e.g. the "incorrect version" / rate-limit
+        # screen that the TFM server throws back at rapid-fire logins. The
+        # dialog title is always plain "Adobe Flash Player", so without the
+        # body text the dismiss line says nothing useful.
         buttons: list[int] = []
+        statics: list[int] = []
 
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         def _enum_child(ch, _lp):
             cls_buf = ctypes.create_unicode_buffer(64)
             user32.GetClassNameW(ch, cls_buf, 64)
-            if cls_buf.value.lower() == "button":
+            cls = cls_buf.value.lower()
+            if cls == "button":
                 buttons.append(int(ch))
+            elif cls == "static":
+                statics.append(int(ch))
             return True
 
         user32.EnumChildWindows(top, _enum_child, 0)
+
+        body_text = ""
+        if statics:
+            parts: list[str] = []
+            for st in statics:
+                tb = ctypes.create_unicode_buffer(2048)
+                user32.GetWindowTextW(st, tb, 2048)
+                t = (tb.value or "").strip()
+                if t:
+                    parts.append(t)
+            body_text = " | ".join(parts)
+        body_norm = body_text.lower()
+        looks_like_incorrect_version = (
+            "incorrect version" in body_norm
+            or "wrong version" in body_norm
+            or "version incorrect" in body_norm
+        )
 
         if logger.isEnabledFor(logging.DEBUG) and buttons:
             _caps: list[str] = []
@@ -1427,9 +1453,18 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
             user32.SendMessageW(best_btn, BM_CLICK, 0, 0)
             logger.info(
                 "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (method=BM_CLICK "
-                "ranked button %r rank=%s) area=%d title=%r",
-                slot_label, pid, top, best_lbl, best_rank, area, (title or "")[:80],
+                "ranked button %r rank=%s) area=%d title=%r body=%r",
+                slot_label, pid, top, best_lbl, best_rank, area,
+                (title or "")[:80], (body_text or "")[:240],
             )
+            if looks_like_incorrect_version:
+                logger.warning(
+                    "Slot %s: Flash dialog reported INCORRECT GAME VERSION — the SWF/loader's "
+                    "embedded version no longer matches what the live TFM server expects. "
+                    "Re-dump TFM_SECRETS_GAME_VERSION (and the loader SWF if you patched a stale "
+                    "client). Body: %r",
+                    slot_label, (body_text or "")[:240],
+                )
             clicked += 1
             continue
 
@@ -1441,9 +1476,17 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                 user32.SendMessageW(btn, BM_CLICK, 0, 0)
                 logger.info(
                     "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (method=BM_CLICK "
-                    "exact label %r) area=%d",
+                    "exact label %r) area=%d body=%r",
                     slot_label, pid, top, txt.value.strip(), area,
+                    (body_text or "")[:240],
                 )
+                if looks_like_incorrect_version:
+                    logger.warning(
+                        "Slot %s: Flash dialog reported INCORRECT GAME VERSION — re-dump "
+                        "TFM_SECRETS_GAME_VERSION (and re-patch the loader SWF if stale). "
+                        "Body: %r",
+                        slot_label, (body_text or "")[:240],
+                    )
                 clicked += 1
                 break
         else:

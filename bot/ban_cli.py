@@ -155,6 +155,24 @@ def _assign_listen_ports(
         raise SystemExit(msg)
 
 
+# When ``_CONSOLE_QUIET`` is set, the *console* (stderr) handler suppresses
+# every record below ERROR. The file handler is unaffected — log.txt still
+# captures everything for post-mortem. We use this around interactive
+# ``input()`` calls so that asynchronous proxy chatter (e.g. WARNING "MAIN
+# session ended" lines from the post-login keepalive loops) does not stomp on
+# the prompt while the operator is typing a room name or nickname.
+_CONSOLE_QUIET = threading.Event()
+
+
+class _ConsoleQuietFilter(logging.Filter):
+    """Drop sub-ERROR records from the console while ``_CONSOLE_QUIET`` is set."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+        if _CONSOLE_QUIET.is_set() and record.levelno < logging.ERROR:
+            return False
+        return True
+
+
 def _configure_logging() -> None:
     root = logging.getLogger()
     if root.handlers:
@@ -164,6 +182,7 @@ def _configure_logging() -> None:
 
     stderr_h = logging.StreamHandler(sys.stderr)
     stderr_h.setFormatter(fmt)
+    stderr_h.addFilter(_ConsoleQuietFilter())
     root.addHandler(stderr_h)
 
     log_path = _repo_root() / "log.txt"
@@ -172,6 +191,23 @@ def _configure_logging() -> None:
     root.addHandler(file_h)
 
     logging.info("Logging to %s", log_path)
+
+
+class _quiet_console:
+    """Context manager: silence stderr log handler (file logging unaffected).
+
+    Use around ``input()`` so async proxy WARNINGs (e.g. ``MAIN session ended``)
+    don't shred the prompt. log.txt still receives every record.
+    """
+
+    def __enter__(self) -> "_quiet_console":
+        _CONSOLE_QUIET.set()
+        _flush_log_handlers()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        _CONSOLE_QUIET.clear()
+        _flush_log_handlers()
 
 
 def _flush_log_handlers() -> None:
@@ -651,16 +687,21 @@ def _input_nonempty(prompt: str, *, what: str = "your answer") -> str:
     """
     Read from stdin until a non-empty line. Empty input often happens if an ActionScript
     / Flash error dialog or the game has focus; avoid treating Enter as a valid room/name.
+
+    Wrapped in :class:`_quiet_console` so that proxy ``WARNING``/``INFO`` lines from
+    background slots (e.g. post-login ``MAIN session ended ... clean-eof``) do not
+    interrupt the prompt. The full traffic is still captured in ``log.txt``.
     """
-    while True:
-        s = input(prompt).strip()
-        if s:
-            return s
-        print(
-            "\n[!] Empty line — not accepted. Dismiss any Flash 'Adobe Flash Player' error "
-            f"on top of a client, then click this console and type {what}.\n",
-            flush=True,
-        )
+    with _quiet_console():
+        while True:
+            s = input(prompt).strip()
+            if s:
+                return s
+            print(
+                "\n[!] Empty line — not accepted. Dismiss any Flash 'Adobe Flash Player' error "
+                f"on top of a client, then click this console and type {what}.\n",
+                flush=True,
+            )
 
 
 def _pick_room(states: list[SlotState], cfg: object) -> str:
@@ -1566,7 +1607,8 @@ def main(argv: list[str] | None = None) -> None:
             send_ban_to_all(states, target, cfg)
 
             _flush_log_handlers()
-            again = input('Ban someone else? (y/n): ').strip().lower()
+            with _quiet_console():
+                again = input('Ban someone else? (y/n): ').strip().lower()
             logger.info("Ban someone else? answered: %r", again)
             if again not in ("y", "yes"):
                 break
