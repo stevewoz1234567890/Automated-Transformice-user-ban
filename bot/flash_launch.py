@@ -1209,7 +1209,7 @@ def _flash_error_dismiss_button_rank(label_norm: str) -> int | None:
     ):
         if label_norm == exact:
             return 2
-    if label_norm in ("continuar",):
+    if label_norm in ("continuar", "continuer"):
         return 3
     if label_norm == "continue":
         return 4
@@ -1230,15 +1230,29 @@ def _env_flag_false_by_default(name: str) -> bool:
     return False
 
 
+def _env_flag_true_by_default(name: str) -> bool:
+    """
+    ``True`` when unset. Use ``0``/``false``/``no``/``off`` to disable.
+    Suits * farm defaults * where the safe behavior is to opt *out* (e.g. sole Continue click).
+    """
+    v = (os.environ.get(name) or "").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
 def flash_error_dismiss_policy_log_line() -> str:
     """One line for logs: proves FLASH_ERROR_DISMISS_* env (which build/flags are active)."""
     ac = _env_flag_false_by_default("FLASH_ERROR_DISMISS_ALLOW_CONTINUE")
     wm = _env_flag_false_by_default("FLASH_ERROR_DISMISS_USE_WMCLOSE")
+    sole = _env_flag_true_by_default("FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION")
     return (
         "ActionScript error dismiss: policy "
         f"FLASH_ERROR_DISMISS_ALLOW_CONTINUE={ac} "
         f"FLASH_ERROR_DISMISS_USE_WMCLOSE={wm} "
-        "— Continuar/Continue is only auto-clicked when ALLOW_CONTINUE is true."
+        f"FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION={sole} "
+        "— Continuar/Continue is only auto-clicked when ALLOW_CONTINUE is true, or when the "
+        "dialog has no Dismiss/OK and CONTINUE_IF_SOLE_OPTION is true (default)."
     )
 
 
@@ -1251,11 +1265,13 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     (prefers *Dismiss All*).  Falls back to Escape or, only if
     ``FLASH_ERROR_DISMISS_USE_WMCLOSE`` is set, ``WM_CLOSE`` on the dialog.
 
-    **Continue / Continuar (default: do not auto-click).**  On many TFM+Flash setups,
-    the only button on a generic #2044/#2048 error is *Continuar*; ``BM_CLICK`` on it
-    ends the ActionScript VM and the game drops MAIN (``clean-eof``) — the same as a
-    manual click \"closes everything\" for that client.  Set
-    ``FLASH_ERROR_DISMISS_ALLOW_CONTINUE=true`` only if you accept that.
+    **Continue / Continuar (default: do not auto-click when Dismiss exists).**  On many
+    TFM+Flash setups the only button is *Continuar*; ``BM_CLICK`` on it can end the AS
+    session and drop MAIN — the same as a manual click.  Use
+    ``FLASH_ERROR_DISMISS_ALLOW_CONTINUE=true`` to always prefer Continuar when it is
+    ranked against Dismiss.  When the dialog offers **only** Continuar/Continue (no
+    Dismiss/OK/Aceptar), ``FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION`` defaults to
+    **true** so Escape-only no longer leaves a blocking modal that breaks multi-slot runs.
 
     The previous 120_000 px² cap skipped typical #2044/#2048 error
     windows with a large text area; those are handled by title heuristics.
@@ -1276,6 +1292,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     VK_ESCAPE = 0x1B
     allow_continue = _env_flag_false_by_default("FLASH_ERROR_DISMISS_ALLOW_CONTINUE")
     use_wmclose = _env_flag_false_by_default("FLASH_ERROR_DISMISS_USE_WMCLOSE")
+    continue_if_sole = _env_flag_true_by_default("FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION")
     # English + common Spanish (Flash / Windows locale) — used for simple exact-set fallback
     DISMISS_LABELS = {
         "dismiss all",
@@ -1490,6 +1507,30 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                 best_btn = btn
                 best_lbl = txt.value.strip()
 
+        if best_btn is None and continue_if_sole:
+            unfiltered: list[tuple[int, int, str]] = []
+            for btn2 in buttons:
+                t2 = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(btn2, t2, 256)
+                ln2 = _win_button_label_normalize(t2.value)
+                ru = _flash_error_dismiss_button_rank(ln2)
+                if ru is not None:
+                    unfiltered.append((btn2, ru, t2.value.strip()))
+            if unfiltered and not any(ru in (0, 1, 2) for _, ru, _ in unfiltered):
+                conts = [(b, ru, lab) for b, ru, lab in unfiltered if ru in (3, 4)]
+                if conts:
+                    conts.sort(key=lambda t: t[1])
+                    bb, rrk, bll = conts[0]
+                    best_btn = bb
+                    best_rank = rrk
+                    best_lbl = bll
+                    logger.info(
+                        "ActionScript error dismiss: slot=%s pid=%s hwnd=%s — only Continuar/Continue "
+                        "(no Dismiss/OK); BM_CLICK (FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION) "
+                        "label=%r",
+                        slot_label, pid, top, best_lbl,
+                    )
+
         if best_btn is not None:
             user32.SendMessageW(best_btn, BM_CLICK, 0, 0)
             logger.info(
@@ -1543,10 +1584,10 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                     clicked += 1
                 elif adobe_err and not use_wmclose:
                     logger.warning(
-                        "ActionScript error dismiss: slot=%s pid=%s hwnd=%s — no safe button "
-                        "(Continuar/Continue is skipped unless FLASH_ERROR_DISMISS_ALLOW_CONTINUE=true). "
-                        "Escape sent only; clear the dialog in Flash or fix the root AS error. area=%d "
-                        "title=%r",
+                        "ActionScript error dismiss: slot=%s pid=%s hwnd=%s — no safe button; "
+                        "Escape only. (Try FLASH_ERROR_DISMISS_ALLOW_CONTINUE=true, or "
+                        "FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION=true when Continue is the "
+                        "sole option — default is on). area=%d title=%r",
                         slot_label, pid, top, area, (title or "")[:80],
                     )
                 else:
