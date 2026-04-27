@@ -1774,6 +1774,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Disable dismiss-all + username/password typing after MAIN TCP (see .env / BOT_FLASH_AUTO_LOGIN_UI).",
     )
+    p.add_argument(
+        "--skip-net-check",
+        action="store_true",
+        help="Do not run TCP preflight to the game host (or 1.1.1.1:443 if no host is set).",
+    )
     return p.parse_args(argv)
 
 
@@ -1798,6 +1803,10 @@ def main(argv: list[str] | None = None) -> None:
                     pass
     _configure_logging()
     args = _parse_args(argv)
+    if not args.skip_net_check:
+        from .net_preflight import run_network_preflight
+
+        run_network_preflight()
     cfg = _load_accounts_module()
 
     this_exe = Path(sys.executable).resolve()
