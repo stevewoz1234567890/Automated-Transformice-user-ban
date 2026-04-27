@@ -1248,9 +1248,14 @@ class BanBotProxy(Proxy):
         n_main = len(self.main_clients or [])
         n_sat = len(getattr(self, "satellite_clients", None) or [])
         if main_conn is None:
+            hint = getattr(self, "_main_last_close_diag", None) or getattr(
+                self, "_main_last_close_reason", None
+            )
+            extra = f" last_main_close={hint!r}" if hint else ""
             logger.error(
-                "Slot %s: cannot send /ban — no upstream connection (main_clients=%d satellite_clients=%d)",
-                self.slot_label, n_main, n_sat,
+                "Slot %s: cannot send /ban — no upstream connection "
+                "(main_clients=%d satellite_clients=%d)%s",
+                self.slot_label, n_main, n_sat, extra,
             )
             return False
         if self.main_clients:

@@ -1,5 +1,5 @@
 """
-CMD entry: multi-slot local proxies, /room on all clients, then staggered /ban.
+CMD entry: multi-slot local proxies, /room on all clients, then /ban on every live slot (burst by default).
 
 Prerequisite: one Transformice + tfm-proxy-loader per ``proxy_port``. Row ``bind_ip`` is for
 Proxifier unless ``PROXY_LISTEN_USE_ACCOUNT_BIND_IP`` is True and that IP exists on this machine.
@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import concurrent.futures
 import logging
 import random
 import os
@@ -1482,13 +1483,19 @@ def _show_and_pick_player(states: list[SlotState], room: str, cfg: object | None
 
 def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
     """
-    Staggered /ban on every slot with a **live upstream write path** (MAIN or satellite).
+    /ban on every slot with a **live upstream write path** (MAIN or satellite).
 
-    Slots with no connection are skipped (recorded as skipped, not as failed sends) so
-    a half-dead farm does not spam errors or sleep through useless attempts.
+    Default **burst** mode (``BOT_BAN_BURST_MODE``): with 2+ live slots, each ``send_ban_command``
+    is scheduled immediately (no long sleeps between), then we await results. That prevents
+    later slots from losing MAIN during the old random 1–2s inter-send delay.
+
+    Set ``BOT_BAN_BURST_MODE=false`` to restore staggered sends (``BOT_BAN_DELAY_MIN/MAX_SEC``).
+
+    Slots with no connection at snapshot time are skipped (not counted as send failures).
     """
     dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
     dmax = float(getattr(cfg, "BAN_DELAY_MAX_SEC", 2.0))
+    burst = bool(getattr(cfg, "BAN_BURST_MODE", True))
 
     def _can_ban(s: SlotState) -> bool:
         return bool(s.proxy and s.proxy._main_write_conn() is not None)
@@ -1514,9 +1521,18 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
     else:
         logger.info("Ban round: sending from %d slot(s) with live upstream.", len(active))
 
+    if active:
+        order_h = ", ".join(s.label for s in active)
+        logger.info(
+            "Ban round: send order %s — mode=%s",
+            order_h,
+            "burst (schedule all, then await)" if burst and len(active) > 1 else "sequential",
+        )
+
     results: list[tuple[str, bool, str, float, str]] = []
     t_round = time.monotonic()
-    for i, s in enumerate(active):
+
+    def _do_one_slot(s: SlotState) -> tuple[bool, str, float]:
         t_slot = time.monotonic()
         try:
             ok = _run_coro_on_slot(s, s.proxy.send_ban_command(target_user))
@@ -1525,13 +1541,67 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
             ok = False
             reason = f"{type(exc).__name__}: {exc}"
         dt_ms = (time.monotonic() - t_slot) * 1000.0
-        results.append((s.label, bool(ok), reason, dt_ms, "ok" if ok else "fail"))
         logger.debug(
             "[slot %s] /ban %r -> %s (%.1fms)",
             s.label, target_user, "sent" if ok else "FAILED", dt_ms,
         )
-        if i < len(active) - 1:
-            time.sleep(random.uniform(dmin, dmax))
+        return ok, reason, dt_ms
+
+    if burst and len(active) > 1:
+        # Schedule every coroutine before awaiting any: avoids N×(1–2s) window where last slots' MAIN dies.
+        scheduled: list[tuple[SlotState, concurrent.futures.Future]] = []
+        for s in active:
+            if not _can_ban(s):
+                logger.warning(
+                    "Ban round: slot %s — no write path at schedule time (~%.2fs into round, "
+                    "after live snapshot). Skipping (reason=upstream_lost_before_schedule).",
+                    s.label, time.monotonic() - t_round,
+                )
+                results.append(
+                    (s.label, False, "upstream lost before schedule (burst)", 0.0, "fail")
+                )
+                continue
+            if s.loop is None:
+                logger.error("Ban round: slot %s — no event loop", s.label)
+                results.append(
+                    (s.label, False, "event loop not ready", 0.0, "fail")
+                )
+                continue
+            fut = asyncio.run_coroutine_threadsafe(
+                s.proxy.send_ban_command(target_user), s.loop
+            )
+            scheduled.append((s, fut))
+        for s, fut in scheduled:
+            t_wait = time.monotonic()
+            try:
+                ok = fut.result(timeout=30)
+                reason = "sent" if ok else "send returned False"
+            except Exception as exc:
+                ok = False
+                reason = f"{type(exc).__name__}: {exc}"
+            dt_ms = (time.monotonic() - t_wait) * 1000.0
+            results.append((s.label, bool(ok), reason, dt_ms, "ok" if ok else "fail"))
+            logger.debug(
+                "[slot %s] /ban %r -> %s (await %.1fms)",
+                s.label, target_user, "sent" if ok else "FAILED", dt_ms,
+            )
+    else:
+        for i, s in enumerate(active):
+            if not _can_ban(s):
+                logger.warning(
+                    "Ban round: slot %s — upstream gone before send (position %d/%d, ~%.2fs into round). "
+                    "Tip: set BOT_BAN_BURST_MODE=true (default) to avoid long stagger gaps, or lower "
+                    "BOT_BAN_DELAY_*.",
+                    s.label, i + 1, len(active), time.monotonic() - t_round,
+                )
+                results.append(
+                    (s.label, False, "upstream lost before send (stagger)", 0.0, "fail")
+                )
+                continue
+            ok, reason, dt_ms = _do_one_slot(s)
+            results.append((s.label, bool(ok), reason, dt_ms, "ok" if ok else "fail"))
+            if i < len(active) - 1:
+                time.sleep(random.uniform(dmin, dmax))
 
     for s in skipped_no_conn:
         results.append((s.label, False, "no upstream (skipped)", 0.0, "skip"))

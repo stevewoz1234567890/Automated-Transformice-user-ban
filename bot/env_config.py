@@ -161,6 +161,10 @@ def load_config_from_env(repo_root: Path) -> object:
 
     F("BAN_DELAY_MIN_SEC", "BOT_BAN_DELAY_MIN_SEC", 1.0)
     F("BAN_DELAY_MAX_SEC", "BOT_BAN_DELAY_MAX_SEC", 2.0)
+    # When true (default): with 2+ live slots, schedule every /ban immediately (one run_coroutine_threadsafe
+    # per slot back-to-back), then await futures. Avoids losing later slots when MAIN drops during long
+    # stagger sleeps. Set false to restore old random delay between each send (BOT_BAN_DELAY_*).
+    B("BAN_BURST_MODE", "BOT_BAN_BURST_MODE", True)
     F("ROOM_STAGGER_SEC", "BOT_ROOM_STAGGER_SEC", 0.15)
     F("FLASH_SLOT_LOGIN_TIMEOUT_SEC", "BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC", 900.0)
     B("PROXY_VERBOSE_LOGIN_FLOW", "BOT_PROXY_VERBOSE_LOGIN_FLOW", True)
