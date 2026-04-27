@@ -184,6 +184,10 @@ def load_config_from_env(repo_root: Path) -> object:
         ns.ROOM_LIST_MAX_SLOT_ATTEMPTS = 3
     ns.ROOM_LIST_MAX_SLOT_ATTEMPTS = max(1, min(32, int(ns.ROOM_LIST_MAX_SLOT_ATTEMPTS)))
     F("PLAYER_LIST_COLLECT_TIMEOUT_SEC", "BOT_PLAYER_LIST_COLLECT_TIMEOUT_SEC", 25.0)
+    # When every slot is PARTL (no MAIN/sat write path) after the room list / interactive prompts,
+    # poll for this many seconds for any slot to recover before failing room list, player list, or /ban.
+    # 0 = do not wait (old behavior).
+    F("UPSTREAM_WAIT_SEC", "BOT_UPSTREAM_WAIT_SEC", 20.0)
     # If true (default), only the first live slot runs JoinRoom for the name list. Sending
     # JoinRoom to all slots at once (with tiny stagger) overloads server satellite migration
     # and drops most MAIN links — see pre-ban join below.

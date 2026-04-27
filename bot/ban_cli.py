@@ -1029,12 +1029,79 @@ def _env_bool(name: str, *, default: bool) -> bool:
     return default
 
 
+def _live_write_slots(states: list[SlotState]) -> list[SlotState]:
+    """Slots whose proxy has a usable upstream writer (``BanBotProxy._main_write_conn()``: MAIN or satellite)."""
+    return [s for s in states if s.proxy and s.proxy._main_write_conn() is not None]
+
+
+def _upstream_wait_sec(cfg: object | None) -> float:
+    """``BOT_UPSTREAM_WAIT_SEC`` / :attr:`UPSTREAM_WAIT_SEC` — clamped; 0 disables waiting."""
+    if cfg is not None:
+        try:
+            v = float(getattr(cfg, "UPSTREAM_WAIT_SEC", 20.0) or 20.0)
+        except (TypeError, ValueError):
+            v = 20.0
+        return max(0.0, min(300.0, v))
+    raw = (os.environ.get("BOT_UPSTREAM_WAIT_SEC") or "").strip()
+    if raw:
+        try:
+            return max(0.0, min(300.0, float(raw)))
+        except ValueError:
+            pass
+    return 20.0
+
+
+def _wait_for_upstream_slots(
+    states: list[SlotState],
+    *,
+    max_wait_sec: float,
+    purpose: str,
+) -> list[SlotState]:
+    """
+    Return slots with a live write path, optionally blocking until at least one appears or *max_wait_sec* elapses.
+    """
+    live = _live_write_slots(states)
+    if live or max_wait_sec <= 0:
+        return live
+    deadline = time.monotonic() + max_wait_sec
+    t0 = time.monotonic()
+    next_log = t0 + 2.0
+    while time.monotonic() < deadline:
+        time.sleep(0.4)
+        live = _live_write_slots(states)
+        if live:
+            logger.info(
+                "Upstream wait (%.1fs): %d slot(s) have a write path (MAIN or satellite) — %s",
+                time.monotonic() - t0,
+                len(live),
+                purpose,
+            )
+            return live
+        now = time.monotonic()
+        if now >= next_log:
+            logger.info(
+                "Upstream wait: 0/%d slots with write path (%.0fs / %.0fs) — %s",
+                len(states),
+                now - t0,
+                max_wait_sec,
+                purpose,
+            )
+            next_log = now + 2.0
+    logger.warning(
+        "Upstream wait: after %.0fs still no slot with MAIN/sat write path — %s",
+        max_wait_sec,
+        purpose,
+    )
+    return _live_write_slots(states)
+
+
 def fetch_room_list(
     states: list[SlotState],
     *,
     game_modes: tuple[int, ...] = (1, 2, 3, 5, 9),
     timeout_sec: float = 6.0,
     max_slot_attempts: int = 3,
+    upstream_wait_sec: float = 0.0,
 ) -> list[tuple[str, int]]:
     """
     Request room lists for *game_modes* from one or more live slots and return
@@ -1045,9 +1112,13 @@ def fetch_room_list(
 
     Game mode ints: 1=Transformice, 2=Bootcamp, 3=Vanilla, 5=Racing, 9=Module.
     """
-    live = [s for s in states if s.proxy and s.proxy._main_write_conn() is not None]
+    live = _wait_for_upstream_slots(
+        states,
+        max_wait_sec=upstream_wait_sec,
+        purpose="room list request",
+    )
     if not live:
-        logger.warning("No live slot available to fetch room list.")
+        logger.warning("No live slot available to fetch room list (no MAIN/sat write path).")
         return []
 
     attempts = min(len(live), max(1, int(max_slot_attempts)))
@@ -1220,6 +1291,7 @@ def _pick_room(states: list[SlotState], cfg: object) -> str:
         states,
         timeout_sec=float(getattr(cfg, "ROOM_LIST_TIMEOUT_SEC", 10.0) or 10.0),
         max_slot_attempts=int(getattr(cfg, "ROOM_LIST_MAX_SLOT_ATTEMPTS", 3) or 3),
+        upstream_wait_sec=_upstream_wait_sec(cfg),
     )
 
     if rooms:
@@ -1269,6 +1341,7 @@ def _collect_player_list_via_join(
     timeout_sec: float = 12.0,
     stagger_sec: float = 0.15,
     leader_only: bool = True,
+    upstream_wait_sec: float = 0.0,
 ) -> tuple[list[str], str | None]:
     """
     Join *room* to receive ``SetPlayerListPacket`` and return player names.
@@ -1287,11 +1360,16 @@ def _collect_player_list_via_join(
     ``_pre_ban_stagger_join_others`` so other slots are joined in a second phase
     with a larger stagger before /ban.
     """
-    live = [s for s in states if s.proxy and s.proxy._main_write_conn() is not None]
+    live = _wait_for_upstream_slots(
+        states,
+        max_wait_sec=upstream_wait_sec,
+        purpose="player list / JoinRoom",
+    )
     if not live:
         logger.warning(
-            "Player list: no slot has a live MAIN write path (all PARTL or down) — "
-            "cannot join %r to collect names. Fix upstream disconnects or wait for healthy slots.",
+            "Player list: no slot has a live upstream write path (MAIN or satellite; all PARTL or down) — "
+            "cannot join %r to collect names. Fix upstream disconnects, increase "
+            "BOT_UPSTREAM_WAIT_SEC, or relaunch Flash.",
             room,
         )
         return [], None
@@ -1433,6 +1511,7 @@ def _show_and_pick_player(states: list[SlotState], room: str, cfg: object | None
         timeout_sec=pl_to,
         stagger_sec=room_stagger,
         leader_only=leader_only,
+        upstream_wait_sec=_upstream_wait_sec(cfg) if cfg is not None else _upstream_wait_sec(None),
     )
 
     if players:
@@ -1500,7 +1579,14 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
     def _can_ban(s: SlotState) -> bool:
         return bool(s.proxy and s.proxy._main_write_conn() is not None)
 
-    active = [s for s in states if _can_ban(s)]
+    wait_sec = _upstream_wait_sec(cfg)
+    active = _live_write_slots(states)
+    if not active and wait_sec > 0:
+        active = _wait_for_upstream_slots(
+            states,
+            max_wait_sec=wait_sec,
+            purpose="ban round",
+        )
     skipped_no_conn = [s for s in states if s.proxy is not None and not _can_ban(s)]
     inactive = [s for s in states if s.proxy is None]
 
@@ -1513,7 +1599,7 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
         ntot = len(states)
         if ntot >= 4 and len(skipped_no_conn) * 2 >= ntot and len(active) < max(2, ntot // 4):
             logger.warning(
-                "Ban round: most slots are PARTL (no live MAIN) — /ban is degraded. "
+                "Ban round: most slots are PARTL (no live upstream) — /ban is degraded. "
                 "Mitigate login overlap: set BOT_UI_FLASH_LAUNCH_STAGGER_SEC high enough (see startup "
                 "auto floor for 8+ slots), fix ActionScript/loader; after login, use leader-only + "
                 "BOT_PRE_BAN_ROOM_JOIN_STAGGER_SEC for room join, not the root cause of early PARTL.",

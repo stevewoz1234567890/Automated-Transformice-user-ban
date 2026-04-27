@@ -1202,7 +1202,10 @@ class BanBotProxy(Proxy):
         """
         main_conn = self._main_write_conn()
         if main_conn is None:
-            logger.warning("Slot %s: join_room — no main connection", self.slot_label)
+            logger.warning(
+                "Slot %s: join_room — no upstream write path (MAIN or satellite)",
+                self.slot_label,
+            )
             return False
         name = room_name.strip()
         jm = time.monotonic()
