@@ -1719,7 +1719,7 @@ def main(argv: list[str] | None = None) -> None:
             ).start()
             logger.info(
                 "ActionScript error dismiss: background poll every %.2fs during login only "
-                "(stops with focus-pump after all slots log in; set "
+                "(stops when the initial login batch finishes, before PARTL retry; set "
                 "FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC=0 to disable).",
                 _pd_early,
             )
@@ -2049,6 +2049,23 @@ def main(argv: list[str] | None = None) -> None:
 
     print_slot_status(states, title="SLOT STATUS AFTER LOGIN PHASE")
 
+    # Focus pump + dismiss poller must stop as soon as the *initial* sequential login
+    # batch finishes — not after PARTL retry or the post-login sweep. Retry can run for
+    # many minutes (per-slot relaunch + BOT_RETRY_LOGIN_TIMEOUT_SEC); if the pump keeps
+    # cycling SetForegroundWindow across all Flash HWNDs, the console never receives
+    # keyboard input and Ctrl+C appears broken.
+    if focus_pump_stop is not None:
+        focus_pump_stop.set()
+        logger.info(
+            "Flash focus-pump stopped after login phase — console input and other windows work normally.",
+        )
+    if flash_dismiss_poll_stop is not None:
+        flash_dismiss_poll_stop.set()
+        logger.info(
+            "ActionScript error dismiss: background poll stopped after login phase — you can use "
+            "the room list and type the room name without the bot scanning Flash windows every few seconds.",
+        )
+
     # Try to revive PARTL slots: relaunch each failed Flash tab (optionally with a
     # different bind_ip from the slot's pool / BOT_SPARE_BIND_IPS) before we ask
     # the user to pick a room. Only runs when Flash was auto-launched — without
@@ -2066,25 +2083,10 @@ def main(argv: list[str] | None = None) -> None:
             logger.exception("PARTL retry pass raised; continuing with current slot states.")
 
     # Late #2044/#2048 boxes (commonly the last 3 Flash clients) often appear *after* the
-    # "logged in" line but before the next poll; run a multi-pass dismiss before we stop
-    # the background poller.
+    # "logged in" line but before the next poll; run a multi-pass dismiss (poller is
+    # already off — see block above) to catch stragglers.
     if auto_flash and sys.platform == "win32":
         post_login_actionscript_error_sweep(states)
-
-    # Focus pump exists so minimized/tiled Flash still gets occasional foreground during
-    # login (Anticheat / event loop). If it keeps running, SetForegroundWindow hammers
-    # every slot ~forever — the user cannot type in this console or use other apps.
-    if focus_pump_stop is not None:
-        focus_pump_stop.set()
-        logger.info(
-            "Flash focus-pump stopped after login phase — console input and other windows work normally.",
-        )
-    if flash_dismiss_poll_stop is not None:
-        flash_dismiss_poll_stop.set()
-        logger.info(
-            "ActionScript error dismiss: background poll stopped after login phase — you can use "
-            "the room list and type the room name without the bot scanning Flash windows every few seconds.",
-        )
 
     # Wrap the ban loop in try/finally so every Flash projector window the bot
     # launched gets closed on the way out — normal exit ("n" to the prompt),
