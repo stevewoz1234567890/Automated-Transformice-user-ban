@@ -40,6 +40,13 @@ def _packet_diag_label(packet: object) -> str:
     return tn
 
 
+def _diag_label_looks_change_sat(name: str) -> bool:
+    """Ring-buffer names may be ``...ChangeSatellite...`` or generic (26, 41) sat redirect codes."""
+    if "ChangeSatellite" in name or "ChangeSat" in name:
+        return True
+    return "(26, 41)" in name or "(26,41)" in name
+
+
 def _safe_print(msg: str) -> None:
     with _print_lock:
         print(msg, flush=True)
@@ -326,11 +333,15 @@ class BanBotProxy(Proxy):
         self._main_recent_from_client: list[tuple[float, str]] = []
         self._MAIN_RECENT_LIMIT = 8
         # Per MAIN-TCP session (cleared in ``new_main_connection``): join and sat
-        # migration, used in MAIN close diagnostics.
-        self._main_session_join_mono: float | None = None
-        self._main_session_join_name: str = ""
+        # migration, used in MAIN close diagnostics. ChangeSat count/mono are
+        # *post-login* only — the first ChangeSatelliteServerPacket on MAIN is the
+        # normal login redirect; counting it made every long session look like
+        # "ChangeSat#1@60s_ago" and hid real join/migration events.
+        self._main_session_login_change_sat_seen: bool = False
         self._main_session_change_sat_count: int = 0
         self._main_session_last_change_sat_mono: float | None = None
+        self._main_session_join_mono: float | None = None
+        self._main_session_join_name: str = ""
         # Last close summary for slot-status / grep (set in new_main_connection finally).
         self._main_last_close_diag: str | None = None
         # Cumulative (optional): last join seen on this proxy process.
@@ -467,8 +478,11 @@ class BanBotProxy(Proxy):
             return self.FORWARD_PACKET
 
         if not getattr(source, "is_satellite", False):
-            self._main_session_change_sat_count += 1
-            self._main_session_last_change_sat_mono = time.monotonic()
+            if not self._main_session_login_change_sat_seen:
+                self._main_session_login_change_sat_seen = True
+            else:
+                self._main_session_change_sat_count += 1
+                self._main_session_last_change_sat_mono = time.monotonic()
 
         self._satellite_packets.append((packet, source.destination))
 
@@ -903,14 +917,14 @@ class BanBotProxy(Proxy):
 
         csm = self._main_session_last_change_sat_mono
         ncs = self._main_session_change_sat_count
-        if csm is not None:
+        if csm is not None and ncs > 0:
             parts.append("ChangeSat#%d@%.1fs_ago" % (ncs, now_mono - csm))
 
-        srv_j = " ".join(srv[-4:])
         cli_j = " ".join(cli[-4:])
-        if "ChangeSatelliteServerPacket" in srv_j and jm is not None and (now_mono - jm) < 45.0:
+        any_change_sat_in_srv4 = any(_diag_label_looks_change_sat(x) for x in srv[-4:])
+        if any_change_sat_in_srv4 and jm is not None and (now_mono - jm) < 45.0:
             parts.append("pattern=ChangeSat_%.1fs_after_JoinRoom" % (now_mono - jm))
-        if "JoinRoomPacket" in cli_j and "ChangeSatelliteServerPacket" in srv_j:
+        if "JoinRoom" in cli_j and any_change_sat_in_srv4:
             parts.append("pattern=JoinRoomChain_then_ChangeSat")
 
         if close_reason != "clean-eof":
@@ -1000,10 +1014,11 @@ class BanBotProxy(Proxy):
         # (avoids mis-attributing the previous Flash session's packets in diagnostics).
         self._main_recent_from_server.clear()
         self._main_recent_from_client.clear()
-        self._main_session_join_mono = None
-        self._main_session_join_name = ""
+        self._main_session_login_change_sat_seen = False
         self._main_session_change_sat_count = 0
         self._main_session_last_change_sat_mono = None
+        self._main_session_join_mono = None
+        self._main_session_join_name = ""
         close_reason = "clean-eof"
         close_exc: BaseException | None = None
         try:
