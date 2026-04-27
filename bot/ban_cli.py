@@ -1258,13 +1258,24 @@ def _collect_player_list_via_join(
     *,
     timeout_sec: float = 12.0,
     stagger_sec: float = 0.15,
-) -> list[str]:
+    leader_only: bool = True,
+) -> tuple[list[str], str | None]:
     """
-    Send ``JoinRoomPacket`` to **all** live slots (staggered) so every bot
-    moves to *room*.  Wait for at least one slot's ``SetPlayerListPacket``
-    (version bump), then aggregate player names from all slots that responded.
+    Join *room* to receive ``SetPlayerListPacket`` and return player names.
 
-    Returns a sorted list of unique usernames.
+    **leader_only (default):** only the first live slot sends ``JoinRoomPacket``.
+    Simultaneous joins on every slot trigger parallel ``ChangeSatelliteServerPacket`` /
+    sat migrations; the game server often drops most MAIN sessions (clean-eof within
+    ~1s). The full room list still arrives on that one connection.
+
+    **leader_only false:** legacy behavior — join all live slots (staggered by
+    *stagger_sec*), merge names from any slot that got a list version bump.
+
+    Returns ``(player_names, lead_slot_label)``. *lead_slot_label* is the label of
+    the slot that already joined when *leader_only* is true; otherwise ``None`` (all
+    joined here). The caller should pass *lead_slot_label* to
+    ``_pre_ban_stagger_join_others`` so other slots are joined in a second phase
+    with a larger stagger before /ban.
     """
     live = [s for s in states if s.proxy and s.proxy._main_write_conn() is not None]
     if not live:
@@ -1273,7 +1284,37 @@ def _collect_player_list_via_join(
             "cannot join %r to collect names. Fix upstream disconnects or wait for healthy slots.",
             room,
         )
-        return []
+        return [], None
+
+    if leader_only:
+        leader = live[0]
+        vb = leader.proxy._player_list_version
+        try:
+            _run_coro_on_slot(leader, leader.proxy.join_room(room))
+        except Exception as exc:
+            logger.debug("join_room leader slot %s failed: %s", leader.label, exc)
+        logger.info(
+            "Player list: using leader slot %s only for JoinRoom %r (others join before /ban with stagger).",
+            leader.label,
+            room,
+        )
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if leader.proxy._player_list_version != vb:
+                time.sleep(0.8)  # let UpdatePlayerListPackets accumulate
+                break
+            time.sleep(0.2)
+        names = list(leader.proxy.known_players.keys())
+        if not names:
+            logger.warning(
+                "Player list: no SetPlayerListPacket within %.1fs for %r (leader slot %s) — "
+                "room name wrong, or MAIN died during join. Try BOT_PLAYER_LIST_COLLECT_TIMEOUT_SEC, "
+                "or set BOT_PLAYER_LIST_JOIN_LEADER_ONLY=false (may drop connections).",
+                timeout_sec,
+                room,
+                leader.label,
+            )
+        return sorted(names, key=str.lower), leader.label
 
     versions_before = {id(s.proxy): s.proxy._player_list_version for s in live}
 
@@ -1304,13 +1345,55 @@ def _collect_player_list_via_join(
             room,
             len(live),
         )
-    return sorted(all_players, key=str.lower)
+    return sorted(all_players, key=str.lower), None
+
+
+def _pre_ban_stagger_join_others(
+    states: list[SlotState],
+    room: str,
+    cfg: object,
+    leader_label: str | None,
+) -> None:
+    """
+    Move every *other* live slot into *room* with ``PRE_BAN_ROOM_JOIN_STAGGER_SEC`` between
+    ``JoinRoomPacket`` calls. The leader (see ``_collect_player_list_via_join``) already
+    joined for the name list; this avoids a thundering herd during list collection.
+    If *leader_label* is None (multi-join list mode), this is a no-op — everyone
+    already joined in that phase.
+    """
+    if not leader_label:
+        return
+    live = [s for s in states if s.proxy and s.proxy._main_write_conn() is not None]
+    rest = [s for s in live if s.label != leader_label]
+    if not rest:
+        return
+    delay = float(getattr(cfg, "PRE_BAN_ROOM_JOIN_STAGGER_SEC", 1.5) or 0.0)
+    delay = max(0.0, min(60.0, delay))
+    logger.info(
+        "Pre-ban room sync: %d other slot(s) will JoinRoom %r with %.1fs between each (leader=%s).",
+        len(rest),
+        room,
+        delay,
+        leader_label,
+    )
+    for i, s in enumerate(rest):
+        if i and delay > 0:
+            time.sleep(delay)
+        try:
+            _run_coro_on_slot(s, s.proxy.join_room(room))
+        except Exception as exc:
+            logger.warning(
+                "Pre-ban: JoinRoom on slot %s failed: %s",
+                s.label,
+                exc,
+            )
 
 
 def _show_and_pick_player(states: list[SlotState], room: str, cfg: object | None = None) -> str:
     """
-    Use ``JoinRoomPacket`` to join *room* with the first slot, show the player
-    list, and let the user pick a target by number or type a nickname directly.
+    Join *room* (leader slot by default, or all slots if configured), show the player
+    list, then after you choose a target, move other slots into the room with a safe
+    stagger before /ban.
     """
     _flush_log_handlers()
     logger.info("Collecting player list for %r...", room)
@@ -1318,11 +1401,25 @@ def _show_and_pick_player(states: list[SlotState], room: str, cfg: object | None
 
     if cfg is not None:
         pl_to = float(getattr(cfg, "PLAYER_LIST_COLLECT_TIMEOUT_SEC", 25.0) or 25.0)
+        leader_only = bool(getattr(cfg, "PLAYER_LIST_JOIN_LEADER_ONLY", True))
+        room_stagger = float(getattr(cfg, "ROOM_STAGGER_SEC", 0.15) or 0.15)
     else:
         _r = (os.environ.get("BOT_PLAYER_LIST_COLLECT_TIMEOUT_SEC") or "").strip()
         pl_to = float(_r) if _r else 25.0
+        _lo = (os.environ.get("BOT_PLAYER_LIST_JOIN_LEADER_ONLY") or "").strip().lower()
+        leader_only = _lo not in ("0", "false", "no", "off") if _lo else True
+        _rs = (os.environ.get("BOT_ROOM_STAGGER_SEC") or "").strip()
+        room_stagger = float(_rs) if _rs else 0.15
     pl_to = max(3.0, min(120.0, pl_to))
-    players = _collect_player_list_via_join(states, room, timeout_sec=pl_to)
+    room_stagger = max(0.0, min(10.0, room_stagger))
+
+    players, lead_label = _collect_player_list_via_join(
+        states,
+        room,
+        timeout_sec=pl_to,
+        stagger_sec=room_stagger,
+        leader_only=leader_only,
+    )
 
     if players:
         print(f"\nPlayers in {room!r} ({len(players)} total):", flush=True)
@@ -1345,8 +1442,12 @@ def _show_and_pick_player(states: list[SlotState], room: str, cfg: object | None
             if 0 <= idx < len(players):
                 chosen = players[idx]
                 logger.info("Player selected by number %s: %r", choice, chosen)
+                if cfg is not None:
+                    _pre_ban_stagger_join_others(states, room, cfg, lead_label)
                 return chosen
         logger.info("Player entered directly: %r", choice)
+        if cfg is not None:
+            _pre_ban_stagger_join_others(states, room, cfg, lead_label)
         return choice
     else:
         logger.info("No player list received — enter nickname manually.")
@@ -1357,10 +1458,13 @@ def _show_and_pick_player(states: list[SlotState], room: str, cfg: object | None
             "---\n",
             flush=True,
         )
-        return _input_nonempty(
+        target = _input_nonempty(
             "Target user (nickname#tag, e.g. Zizao#0000): ",
             what="the nickname#tag",
         )
+        if cfg is not None:
+            _pre_ban_stagger_join_others(states, room, cfg, lead_label)
+        return target
 
 
 def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:

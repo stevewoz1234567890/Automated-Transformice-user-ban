@@ -180,6 +180,13 @@ def load_config_from_env(repo_root: Path) -> object:
         ns.ROOM_LIST_MAX_SLOT_ATTEMPTS = 3
     ns.ROOM_LIST_MAX_SLOT_ATTEMPTS = max(1, min(32, int(ns.ROOM_LIST_MAX_SLOT_ATTEMPTS)))
     F("PLAYER_LIST_COLLECT_TIMEOUT_SEC", "BOT_PLAYER_LIST_COLLECT_TIMEOUT_SEC", 25.0)
+    # If true (default), only the first live slot runs JoinRoom for the name list. Sending
+    # JoinRoom to all slots at once (with tiny stagger) overloads server satellite migration
+    # and drops most MAIN links — see pre-ban join below.
+    B("PLAYER_LIST_JOIN_LEADER_ONLY", "BOT_PLAYER_LIST_JOIN_LEADER_ONLY", True)
+    # After you pick a target, remaining slots are moved into the room with this delay
+    # between each JoinRoom (seconds). 0 = no delay (not recommended with many slots).
+    F("PRE_BAN_ROOM_JOIN_STAGGER_SEC", "BOT_PRE_BAN_ROOM_JOIN_STAGGER_SEC", 1.5)
     B("BAN_PRE_ROUND_DISMISS_FLASH", "BOT_BAN_PRE_ROUND_DISMISS_FLASH", True)
     room = (os.environ.get("BOT_PACKET_LOGIN_START_ROOM") or "").strip()
     ns.PACKET_LOGIN_START_ROOM = room
