@@ -473,10 +473,18 @@ def _slot_status_label(s: SlotState) -> tuple[str, str]:
         reason = getattr(s.proxy, "_main_last_close_reason", None)
         since_login = getattr(s.proxy, "_main_last_close_since_login_sec", None)
         if reason and since_login is not None:
-            return ("PARTL", f"upstream closed: {reason}@{since_login:.1f}s after login")
-        if reason:
-            return ("PARTL", f"upstream closed: {reason}")
-        return ("PARTL", "login ok but upstream closed")
+            base = f"upstream closed: {reason}@{since_login:.1f}s after login"
+        elif reason:
+            base = f"upstream closed: {reason}"
+        else:
+            base = "login ok but upstream closed"
+        diag = getattr(s.proxy, "_main_last_close_diag", None) or ""
+        ds = str(diag).strip()
+        if ds and ds != "no_extra_pattern":
+            if len(ds) > 100:
+                ds = ds[:97] + "..."
+            return ("PARTL", f"{base} | {ds}")
+        return ("PARTL", base)
     return ("OK   ", "ready")
 
 
@@ -768,6 +776,7 @@ def _reset_slot_state_for_retry(st: SlotState) -> None:
         proxy._main_last_close_reason = None
         proxy._main_last_close_alive_sec = None
         proxy._main_last_close_since_login_sec = None
+        proxy._main_last_close_diag = None
         proxy._sat_redirect_logged = False
         proxy._main_recent_from_server.clear()
         proxy._main_recent_from_client.clear()

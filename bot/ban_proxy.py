@@ -24,6 +24,22 @@ logger = logging.getLogger(__name__)
 _print_lock = threading.Lock()
 
 
+def _packet_diag_label(packet: object) -> str:
+    """
+    Type name for ring buffers, with GenericPacket code tuple when available
+    (easier to correlate with TFM / caseus enum dumps than a bare 'Generic' name).
+    """
+    tn = type(packet).__name__
+    try:
+        if isinstance(packet, pak.GenericPacket):
+            c = getattr(packet, "code", None)
+            if c is not None:
+                return f"{tn}{c!r}"
+    except Exception:
+        return tn
+    return tn
+
+
 def _safe_print(msg: str) -> None:
     with _print_lock:
         print(msg, flush=True)
@@ -308,7 +324,18 @@ class BanBotProxy(Proxy):
         # packet before EOF (server kicked vs Flash walked away).
         self._main_recent_from_server: list[tuple[float, str]] = []
         self._main_recent_from_client: list[tuple[float, str]] = []
-        self._MAIN_RECENT_LIMIT = 6
+        self._MAIN_RECENT_LIMIT = 8
+        # Per MAIN-TCP session (cleared in ``new_main_connection``): join and sat
+        # migration, used in MAIN close diagnostics.
+        self._main_session_join_mono: float | None = None
+        self._main_session_join_name: str = ""
+        self._main_session_change_sat_count: int = 0
+        self._main_session_last_change_sat_mono: float | None = None
+        # Last close summary for slot-status / grep (set in new_main_connection finally).
+        self._main_last_close_diag: str | None = None
+        # Cumulative (optional): last join seen on this proxy process.
+        self._main_last_join_room_mono: float | None = None
+        self._main_last_join_room_name: str = ""
         self.register_packet_listener(self._track_main_packet, Packet)
         # Room list collected from RoomListPacket responses; key = room name, value = player count.
         self.known_rooms: dict[str, int] = {}
@@ -439,6 +466,10 @@ class BanBotProxy(Proxy):
         if packet.should_ignore:
             return self.FORWARD_PACKET
 
+        if not getattr(source, "is_satellite", False):
+            self._main_session_change_sat_count += 1
+            self._main_session_last_change_sat_mono = time.monotonic()
+
         self._satellite_packets.append((packet, source.destination))
 
         addr = self._satellite_client_address()
@@ -568,7 +599,7 @@ class BanBotProxy(Proxy):
         """Remember the last few packet types on each MAIN direction for diagnostics."""
         if getattr(source, "is_satellite", False):
             return
-        tn = type(packet).__name__
+        label = _packet_diag_label(packet)
         now = time.monotonic()
         # Servers send clientbound packets; caseus delivers them via the
         # ServerConnection source. ClientConnections deliver serverbound.
@@ -576,7 +607,7 @@ class BanBotProxy(Proxy):
             buf = self._main_recent_from_client
         else:
             buf = self._main_recent_from_server
-        buf.append((now, tn))
+        buf.append((now, label))
         if len(buf) > self._MAIN_RECENT_LIMIT:
             del buf[: len(buf) - self._MAIN_RECENT_LIMIT]
 
@@ -847,6 +878,58 @@ class BanBotProxy(Proxy):
         # Allow FLASH main_tcp UI hook to run again on the next first MAIN (non-packet path).
         self._first_main_hook_done = False
 
+    def _format_main_close_diagnostic(
+        self,
+        *,
+        close_reason: str,
+        alive_sec: float,
+        since_login: float | None,
+        now_mono: float,
+    ) -> str:
+        """
+        Grep-friendly single line to narrow *why* MAIN dropped (heuristic, not proof).
+
+        Uses per-session ring buffers and join / ChangeSatellite counters; buffers are
+        cleared on each new MAIN TCP in ``new_main_connection``.
+        """
+        parts: list[str] = []
+        srv = [n for _, n in self._main_recent_from_server]
+        cli = [n for _, n in self._main_recent_from_client]
+
+        jm = self._main_session_join_mono
+        jn = (self._main_session_join_name or "").strip()
+        if jm is not None and jn:
+            parts.append("join_%.1fs_ago->%r" % (now_mono - jm, jn[:40]))
+
+        csm = self._main_session_last_change_sat_mono
+        ncs = self._main_session_change_sat_count
+        if csm is not None:
+            parts.append("ChangeSat#%d@%.1fs_ago" % (ncs, now_mono - csm))
+
+        srv_j = " ".join(srv[-4:])
+        cli_j = " ".join(cli[-4:])
+        if "ChangeSatelliteServerPacket" in srv_j and jm is not None and (now_mono - jm) < 45.0:
+            parts.append("pattern=ChangeSat_%.1fs_after_JoinRoom" % (now_mono - jm))
+        if "JoinRoomPacket" in cli_j and "ChangeSatelliteServerPacket" in srv_j:
+            parts.append("pattern=JoinRoomChain_then_ChangeSat")
+
+        if close_reason != "clean-eof":
+            parts.append("close=%s" % close_reason)
+        if (
+            self._auto_pong_sent_main == 0
+            and since_login is not None
+            and since_login > 3.0
+            and any("PingPacket" in x for x in srv[-2:])
+        ):
+            parts.append("suspect=no_proxy_pong_on_MAIN(check_BOT_AUTO_PONG)")
+
+        if alive_sec < 12.0 and since_login is not None and since_login < 20.0:
+            parts.append("short_post_login_life=%.1fs" % alive_sec)
+
+        if not parts:
+            return "no_extra_pattern"
+        return " | ".join(parts)
+
     async def new_main_connection(self, client_reader, client_writer):
         peer = None
         try:
@@ -913,6 +996,14 @@ class BanBotProxy(Proxy):
         #   • Server-side close -> ConnectionResetError/EOF from the upstream socket first;
         #     caseus propagates via destination.close(), so the client task also ends.
         tcp_accept_mono = time.monotonic()
+        # Isolate ring buffers and join / ChangeSatellite counters to this MAIN TCP only
+        # (avoids mis-attributing the previous Flash session's packets in diagnostics).
+        self._main_recent_from_server.clear()
+        self._main_recent_from_client.clear()
+        self._main_session_join_mono = None
+        self._main_session_join_name = ""
+        self._main_session_change_sat_count = 0
+        self._main_session_last_change_sat_mono = None
         close_reason = "clean-eof"
         close_exc: BaseException | None = None
         try:
@@ -969,6 +1060,38 @@ class BanBotProxy(Proxy):
                 _fmt_recent(self._main_recent_from_server),
                 _fmt_recent(self._main_recent_from_client),
             )
+            now_close = time.monotonic()
+            diag = self._format_main_close_diagnostic(
+                close_reason=close_reason,
+                alive_sec=alive_sec,
+                since_login=since_login,
+                now_mono=now_close,
+            )
+            self._main_last_close_diag = diag
+            _diag_off = os.environ.get("BOT_PROXY_MAIN_CLOSE_DIAG", "").strip().lower() in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+            if not _diag_off:
+                lvl(
+                    "Slot %s: MAIN close diagnostic: %s",
+                    self.slot_label,
+                    diag,
+                )
+            if os.environ.get("BOT_PROXY_MAIN_CLOSE_VERBOSE", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                logger.debug(
+                    "Slot %s: MAIN close verbose srv_order=%s cli_order=%s",
+                    self.slot_label,
+                    [n for _, n in self._main_recent_from_server],
+                    [n for _, n in self._main_recent_from_client],
+                )
 
     async def new_satellite_connection(self, client_reader, client_writer):
         peer = None
@@ -1061,6 +1184,11 @@ class BanBotProxy(Proxy):
             logger.warning("Slot %s: join_room — no main connection", self.slot_label)
             return False
         name = room_name.strip()
+        jm = time.monotonic()
+        self._main_last_join_room_mono = jm
+        self._main_last_join_room_name = name
+        self._main_session_join_mono = jm
+        self._main_session_join_name = name
         await main_conn.write_packet_instance(
             serverbound.JoinRoomPacket(
                 community=community,
