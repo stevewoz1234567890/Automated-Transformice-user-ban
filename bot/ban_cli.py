@@ -519,6 +519,14 @@ def print_slot_status(states: list[SlotState], *, title: str = "SLOT STATUS") ->
     summary = " | ".join(f"{k.strip()}={v}" for k, v in counts.items() if v)
     lines.append(f"  Totals: {summary}  (of {len(states)} slot(s))")
     lines.append(banner)
+    nicks: list[str] = []
+    for s in states:
+        proxy = s.proxy
+        n = (getattr(proxy, "_own_username", None) or "").strip() if proxy else ""
+        if n:
+            nicks.append(f"slot{s.label}={n}")
+    if nicks:
+        lines.append("  (Quick ref) " + " | ".join(nicks))
     for line in lines:
         print(line, flush=True)
         logger.info(line)
@@ -1260,6 +1268,11 @@ def _collect_player_list_via_join(
     """
     live = [s for s in states if s.proxy and s.proxy._main_write_conn() is not None]
     if not live:
+        logger.warning(
+            "Player list: no slot has a live MAIN write path (all PARTL or down) — "
+            "cannot join %r to collect names. Fix upstream disconnects or wait for healthy slots.",
+            room,
+        )
         return []
 
     versions_before = {id(s.proxy): s.proxy._player_list_version for s in live}
@@ -1282,10 +1295,19 @@ def _collect_player_list_via_join(
     for s in live:
         if s.proxy._player_list_version != versions_before[id(s.proxy)]:
             all_players.update(s.proxy.known_players.keys())
+    if not all_players:
+        logger.warning(
+            "Player list: no SetPlayerListPacket within %.1fs for %r from %d live slot(s) — "
+            "MAIN may drop mid-join, or room name wrong. Try BOT_PLAYER_LIST_COLLECT_TIMEOUT_SEC, "
+            "or enter nickname manually.",
+            timeout_sec,
+            room,
+            len(live),
+        )
     return sorted(all_players, key=str.lower)
 
 
-def _show_and_pick_player(states: list[SlotState], room: str) -> str:
+def _show_and_pick_player(states: list[SlotState], room: str, cfg: object | None = None) -> str:
     """
     Use ``JoinRoomPacket`` to join *room* with the first slot, show the player
     list, and let the user pick a target by number or type a nickname directly.
@@ -1294,7 +1316,13 @@ def _show_and_pick_player(states: list[SlotState], room: str) -> str:
     logger.info("Collecting player list for %r...", room)
     _flush_log_handlers()
 
-    players = _collect_player_list_via_join(states, room)
+    if cfg is not None:
+        pl_to = float(getattr(cfg, "PLAYER_LIST_COLLECT_TIMEOUT_SEC", 25.0) or 25.0)
+    else:
+        _r = (os.environ.get("BOT_PLAYER_LIST_COLLECT_TIMEOUT_SEC") or "").strip()
+        pl_to = float(_r) if _r else 25.0
+    pl_to = max(3.0, min(120.0, pl_to))
+    players = _collect_player_list_via_join(states, room, timeout_sec=pl_to)
 
     if players:
         print(f"\nPlayers in {room!r} ({len(players)} total):", flush=True)
@@ -1693,6 +1721,9 @@ def main(argv: list[str] | None = None) -> None:
             flash_accounts.append(d)
         login_timeout = float(getattr(cfg, "FLASH_SLOT_LOGIN_TIMEOUT_SEC", 900.0))
         stagger_after = float(getattr(cfg, "FLASH_STAGGER_AFTER_LOGIN_SEC", 0.5))
+
+        if sys.platform == "win32":
+            logger.info(flash_launch.flash_error_dismiss_policy_log_line())
 
         # Start global dismiss poller BEFORE launching any Flash windows so
         # error dialogs are caught from the very first slot onwards.
@@ -2127,7 +2158,7 @@ def main(argv: list[str] | None = None) -> None:
                 logger.info("Empty room; try again.")
                 continue
 
-            target = _show_and_pick_player(states, room)
+            target = _show_and_pick_player(states, room, cfg)
             logger.info("Target user: %r", target)
             if not target:
                 logger.info("Empty user; try again.")

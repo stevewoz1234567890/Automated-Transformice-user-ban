@@ -179,6 +179,7 @@ def load_config_from_env(repo_root: Path) -> object:
     except ValueError:
         ns.ROOM_LIST_MAX_SLOT_ATTEMPTS = 3
     ns.ROOM_LIST_MAX_SLOT_ATTEMPTS = max(1, min(32, int(ns.ROOM_LIST_MAX_SLOT_ATTEMPTS)))
+    F("PLAYER_LIST_COLLECT_TIMEOUT_SEC", "BOT_PLAYER_LIST_COLLECT_TIMEOUT_SEC", 25.0)
     B("BAN_PRE_ROUND_DISMISS_FLASH", "BOT_BAN_PRE_ROUND_DISMISS_FLASH", True)
     room = (os.environ.get("BOT_PACKET_LOGIN_START_ROOM") or "").strip()
     ns.PACKET_LOGIN_START_ROOM = room

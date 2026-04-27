@@ -1216,14 +1216,48 @@ def _flash_error_dismiss_button_rank(label_norm: str) -> int | None:
     return None
 
 
+def _env_flag_false_by_default(name: str) -> bool:
+    """
+    Intentionally ``False`` by default: unset / empty → False.
+
+    ``FLASH_ERROR_DISMISS_ALLOW_CONTINUE`` and ``FLASH_ERROR_DISMISS_USE_WMCLOSE`` use this
+    so the historical accident (auto-clicking *Continuar* and posting ``WM_CLOSE``) is off
+    unless the operator enables it.
+    """
+    v = (os.environ.get(name) or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return False
+
+
+def flash_error_dismiss_policy_log_line() -> str:
+    """One line for logs: proves FLASH_ERROR_DISMISS_* env (which build/flags are active)."""
+    ac = _env_flag_false_by_default("FLASH_ERROR_DISMISS_ALLOW_CONTINUE")
+    wm = _env_flag_false_by_default("FLASH_ERROR_DISMISS_USE_WMCLOSE")
+    return (
+        "ActionScript error dismiss: policy "
+        f"FLASH_ERROR_DISMISS_ALLOW_CONTINUE={ac} "
+        f"FLASH_ERROR_DISMISS_USE_WMCLOSE={wm} "
+        "— Continuar/Continue is only auto-clicked when ALLOW_CONTINUE is true."
+    )
+
+
 def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     """
     Dismiss Flash ActionScript/security error dialogs for *pid* **without moving
     the mouse cursor**.  Finds top-level windows owned by the process (small
     popups, or **large** \"Adobe Flash Player\" ActionScript error windows),
     enumerates child Button controls, and sends ``BM_CLICK`` to the best match
-    (prefers *Dismiss All*).  Falls back to Escape or ``WM_CLOSE`` on the
-    dialog.      The previous 120_000 px² cap skipped typical #2044/#2048 error
+    (prefers *Dismiss All*).  Falls back to Escape or, only if
+    ``FLASH_ERROR_DISMISS_USE_WMCLOSE`` is set, ``WM_CLOSE`` on the dialog.
+
+    **Continue / Continuar (default: do not auto-click).**  On many TFM+Flash setups,
+    the only button on a generic #2044/#2048 error is *Continuar*; ``BM_CLICK`` on it
+    ends the ActionScript VM and the game drops MAIN (``clean-eof``) — the same as a
+    manual click \"closes everything\" for that client.  Set
+    ``FLASH_ERROR_DISMISS_ALLOW_CONTINUE=true`` only if you accept that.
+
+    The previous 120_000 px² cap skipped typical #2044/#2048 error
     windows with a large text area; those are handled by title heuristics.
 
     The standalone projector window is titled e.g. ``Adobe Flash Player 32`` and has no
@@ -1240,19 +1274,21 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     WM_KEYDOWN = 0x0100
     WM_KEYUP = 0x0101
     VK_ESCAPE = 0x1B
+    allow_continue = _env_flag_false_by_default("FLASH_ERROR_DISMISS_ALLOW_CONTINUE")
+    use_wmclose = _env_flag_false_by_default("FLASH_ERROR_DISMISS_USE_WMCLOSE")
     # English + common Spanish (Flash / Windows locale) — used for simple exact-set fallback
     DISMISS_LABELS = {
         "dismiss all",
         "dismiss",
         "ok",
-        "continue",
-        "continuar",
         "aceptar",
         "sí",
         "si",
         "close",
         "yes",
     }
+    if allow_continue:
+        DISMISS_LABELS |= {"continue", "continuar"}
     # ActionScript / securityError dialogs from Flash Player (large client area is normal).
     _MAX_SMALL_POPUP_AREA = 120_000
     _MAX_ADOBE_ERR_AREA = 2_500_000
@@ -1440,6 +1476,11 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
             user32.GetWindowTextW(btn, txt, 256)
             label_norm = _win_button_label_normalize(txt.value)
             r = _flash_error_dismiss_button_rank(label_norm)
+            if r is not None and not allow_continue and r >= 3:
+                # Rank 3=Continuar, 4=continue — these often end the AS session and drop MAIN
+                # (same as the operator clicking "Continuar" manually).  Only auto-click if
+                # FLASH_ERROR_DISMISS_ALLOW_CONTINUE is true; prefer Dismiss/OK/escape otherwise.
+                r = None
             if r is not None and r < best_rank:
                 best_rank = r
                 best_btn = btn
@@ -1492,7 +1533,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
         else:
             if adobe_err or area < _MAX_SMALL_POPUP_AREA:
                 _try_escape_on_dialog(top)
-                if adobe_err:
+                if adobe_err and use_wmclose:
                     user32.PostMessageW(top, WM_CLOSE, 0, 0)
                     logger.info(
                         "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (buttons present "
@@ -1500,6 +1541,14 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                         slot_label, pid, top, area,
                     )
                     clicked += 1
+                elif adobe_err and not use_wmclose:
+                    logger.warning(
+                        "ActionScript error dismiss: slot=%s pid=%s hwnd=%s — no safe button "
+                        "(Continuar/Continue is skipped unless FLASH_ERROR_DISMISS_ALLOW_CONTINUE=true). "
+                        "Escape sent only; clear the dialog in Flash or fix the root AS error. area=%d "
+                        "title=%r",
+                        slot_label, pid, top, area, (title or "")[:80],
+                    )
                 else:
                     logger.debug(
                         "ActionScript error dismiss: no matching button label; Escape only "
