@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from .bot_env_defaults import apply_process_env_defaults
+
 logger = logging.getLogger(__name__)
 
 _NEW_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -141,69 +143,6 @@ def _raw_bot_accounts_json_from_dotenv(dot: Path) -> str | None:
     return None
 
 
-# Non-secret bot knobs: merged into ``.env`` when the key is missing or has an empty value.
-# Game secrets use ``TFM_SECRETS_*`` from ``.env.example`` (filled by the user).
-_ENV_DEFAULTS: dict[str, str] = {
-    "BOT_ACCOUNTS_JSON": (
-        '[{"label":"1","proxy_port":38291,"bind_ip":"127.0.0.1","username":"","password":""}]'
-    ),
-    "BOT_BAN_DELAY_MIN_SEC": "1.0",
-    "BOT_BAN_DELAY_MAX_SEC": "2.0",
-    "BOT_ROOM_STAGGER_SEC": "0.15",
-    "BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC": "7200",
-    "BOT_PROXY_VERBOSE_LOGIN_FLOW": "false",
-    "BOT_PROXY_LOG_ALL_MAIN_PACKETS": "false",
-    "BOT_PROXY_LOGIN_DIAGNOSTICS": "true",
-    "BOT_PACKET_LOGIN_DELAY_SEC": "0.35",
-    "BOT_PACKET_LOGIN_START_ROOM": "",
-    "BOT_PROXY_UPSTREAM_CONNECT_DIAG": "true",
-    "BOT_UPSTREAM_CONNECT_SHUFFLE_PORTS": "false",
-    "BOT_PROXY_BIND_HOST": "",
-    "BOT_PROXY_LISTEN_USE_ACCOUNT_BIND_IP": "false",
-    "BOT_SHARED_FLASH_SOCKET_POLICY_PORT": "10801",
-    # Server PingPacket handling. Default "both": proxy ponges immediately AND forwards the
-    # ping to Flash (Flash's own pong, if any, also reaches the server). Required when
-    # BOT_PACKET_AUTO_LOGIN=true because Flash never enters the post-login state and so
-    # never pongs on its own — without the proxy pong every slot gets clean-eof'd. Other
-    # values: "flash"/"0" forward only (Flash must pong; only viable with the UI login
-    # flow); "swallow" proxy-pongs and never forwards.
-    "BOT_AUTO_PONG": "both",
-    "BOT_HEADLESS_AUTO_LOGIN": "false",
-    "BOT_HEADLESS_SECRETS_DOTENV_PATH": ".env",
-    "BOT_HEADLESS_SECRETS_SEED_DOTENV_FROM_EXAMPLE": "true",
-    "BOT_HEADLESS_SECRETS_ENV_PREFIX": "TFM_SECRETS_",
-    "BOT_HEADLESS_SECRETS_INLINE_JSON": "",
-    "BOT_HEADLESS_SECRETS_DUMPER": "",
-    "BOT_HEADLESS_SECRETS_AUTO_DUMPER": "true",
-    "BOT_HEADLESS_SECRETS_AUTO_LEAKER_SWF": "true",
-    "BOT_HEADLESS_SECRETS_AUTO_PIP_BEFORE_DUMPER": "true",
-    "BOT_HEADLESS_SECRETS_PERSIST_DUMP_TO_DOTENV": "true",
-    "BOT_HEADLESS_SECRETS_DUMPER_TIMEOUT_SEC": "120",
-    "BOT_HEADLESS_SECRETS_ALWAYS_REFRESH": "true",
-    "BOT_UPSTREAM_AUTO_SYNC_FROM_SECRETS": "true",
-    "BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY": "false",
-    "BOT_UPSTREAM_PORTS_MATCH_DUMP_ORDER": "true",
-    "BOT_UPSTREAM_STRICT_MATCH_SECRETS_DUMP": "false",
-    "BOT_UPSTREAM_ALLOW_ADDRESS_MISMATCH": "false",
-    "BOT_UPSTREAM_SERVER_ADDRESS": "",
-    "BOT_UPSTREAM_SERVER_PORTS": "",
-    "BOT_UPSTREAM_MAIN_GAME_PORT_TRY_FIRST": "11801",
-    "BOT_UPSTREAM_TCP_PROBE_BEFORE_HEADLESS": "true",
-    "BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED": "true",
-    "BOT_UPSTREAM_PROBE_TIMEOUT_SEC": "6",
-    "BOT_HEADLESS_CONNECT_TO_SATELLITE": "true",
-    "BOT_HEADLESS_EXIT_AFTER_LOGIN_SUCCESS": "true",
-    "BOT_HEADLESS_LOGIN_STAGGER_SEC": "6",
-    "BOT_HEADLESS_STOP_AFTER_CONSECUTIVE_LOGIN_FAILURES": "3",
-    "BOT_HEADLESS_STAGGER_WIN121_EXTRA_SEC": "4",
-    "BOT_HEADLESS_STAGGER_MAX_SEC": "15",
-    "BOT_PIP_INSTALL_CASEUS_GIT_UPGRADE": "false",
-    "BOT_CASEUS_GIT_PIP_SPEC": "caseus @ git+https://github.com/friedkeenan/caseus.git",
-    "BOT_PIP_INSTALL_TFM_SECRETS_CLI": "false",
-    "BOT_TFM_SECRETS_PIP_INSTALL_SPEC": "",
-}
-
-
 def repo_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -236,38 +175,6 @@ def load_dotenv_file(path: Path) -> None:
             val = val[1:-1]
         if key not in os.environ:
             os.environ[key] = val
-
-
-def _defined_env_keys(text: str) -> set[str]:
-    """Keys that already appear in an assignment (even ``KEY=``), so we should not append a duplicate."""
-    keys: set[str] = set()
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.lower().startswith("export "):
-            line = line[7:].strip()
-        if "=" not in line:
-            continue
-        key = line.partition("=")[0].strip()
-        if key:
-            keys.add(key)
-    return keys
-
-
-def merge_defaults_into_dotenv(path: Path, defaults: dict[str, str]) -> None:
-    """Append ``KEY=value`` for defaults whose key is not present in the file at all."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = path.read_text(encoding="utf-8") if path.is_file() else ""
-    have = _defined_env_keys(text)
-    extra: list[str] = []
-    for k, v in defaults.items():
-        if k not in have:
-            extra.append(f"{k}={v}")
-    if not extra:
-        return
-    sep = "" if not text or text.endswith("\n") else "\n"
-    path.write_text(text + sep + "\n".join(extra) + "\n", encoding="utf-8")
 
 
 def format_dotenv_value(val: str) -> str:
@@ -349,7 +256,7 @@ def require_source_runtime_imports() -> None:
 
 
 def prepare_runtime_environment() -> None:
-    """Copy ``.env.example`` → ``.env`` when missing, merge ``BOT_*`` defaults, load into the process env."""
+    """Copy ``.env.example`` → ``.env`` when missing, load the file, then apply code-side defaults in ``os.environ``."""
     root = repo_root()
     seed = os.environ.get("BOT_HEADLESS_SECRETS_SEED_DOTENV_FROM_EXAMPLE", "true").strip().lower() not in (
         "0",
@@ -365,8 +272,8 @@ def prepare_runtime_environment() -> None:
             logger.info("Created %s from .env.example", dot)
         except OSError as e:
             logger.warning("Could not copy .env.example to %s: %s", dot, e)
-    merge_defaults_into_dotenv(dot, _ENV_DEFAULTS)
     load_dotenv_file(dot)
+    apply_process_env_defaults()
 
 
 def _truthy(key: str, default: bool = False) -> bool:

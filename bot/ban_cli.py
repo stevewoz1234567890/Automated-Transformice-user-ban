@@ -896,6 +896,17 @@ def _retry_partl_slots(
     except ValueError:
         retry_login_timeout = 120.0
     retry_login_timeout = max(15.0, min(retry_login_timeout, 600.0))
+    try:
+        between_slot = float(getattr(cfg, "RETRY_BETWEEN_SLOT_SEC", 2.0) or 0.0)
+    except (TypeError, ValueError):
+        between_slot = 2.0
+    between_slot = max(0.0, min(30.0, between_slot))
+    if between_slot > 0:
+        logger.info(
+            "Retry: %.1fs between each PARTL relaunch in a round (BOT_RETRY_BETWEEN_SLOT_SEC) — "
+            "reduces Flash/CPU stampede on slots that are still OK.",
+            between_slot,
+        )
 
     # Map slot label -> raw account row so we can rebuild flash_row each attempt.
     row_by_label: dict[str, dict] = {}
@@ -933,7 +944,7 @@ def _retry_partl_slots(
             f" (global spares left: {len(spares)})" if spares else "",
         )
 
-        for st in eligible:
+        for ei, st in enumerate(eligible):
             row = row_by_label.get(st.label)
             if row is None:
                 logger.warning(
@@ -1015,6 +1026,8 @@ def _retry_partl_slots(
                 # Close the Flash window we just opened so the next round (or
                 # the caller's eventual cleanup) starts from a clean slate.
                 _close_flash_for_slot_retry(st, cfg)
+            if between_slot > 0 and ei + 1 < len(eligible):
+                time.sleep(between_slot)
 
     print_slot_status(states, title="SLOT STATUS AFTER RETRY")
 
@@ -1197,12 +1210,13 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
     After all slots report login, #2044 / #2048 popups can still appear a few seconds late
     on the last-opened clients. The background poller may stop before those HWNDs exist;
     this runs several passes with short delays so **Dismiss All** is applied to stragglers.
+    Default pass count (when env unset) is 3; increase via BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_PASSES if needed.
     """
     if sys.platform != "win32":
         return
     raw = (os.environ.get("BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_PASSES") or "").strip()
     try:
-        n_passes = int(raw) if raw else 6
+        n_passes = int(raw) if raw else 3
     except ValueError:
         n_passes = 6
     n_passes = max(1, min(20, n_passes))
@@ -1570,6 +1584,10 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
 
     Set ``BOT_BAN_BURST_MODE=false`` to restore staggered sends (``BOT_BAN_DELAY_MIN/MAX_SEC``).
 
+    ``BOT_BAN_PRESEND_STABILIZE_SEC`` (default 0.35s): optional sleep after the initial live-upstream
+    snapshot, then re-snapshots so /ban uses connections that finished sat migration after /room.
+    Set to 0 to disable.
+
     Slots with no connection at snapshot time are skipped (not counted as send failures).
     """
     dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
@@ -1587,6 +1605,22 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
             max_wait_sec=wait_sec,
             purpose="ban round",
         )
+    try:
+        stabilize = float(getattr(cfg, "BAN_PRESEND_STABILIZE_SEC", 0.35) or 0.0)
+    except (TypeError, ValueError):
+        stabilize = 0.35
+    stabilize = max(0.0, min(5.0, stabilize))
+    if stabilize > 0 and active:
+        n_before = len(active)
+        time.sleep(stabilize)
+        active = _live_write_slots(states)
+        n_after = len(active)
+        if n_after != n_before:
+            logger.info(
+                "Ban round: pre-send stabilize %.2fs — live slot count %d → %d (MAIN/sat write path).",
+                stabilize, n_before, n_after,
+            )
+
     skipped_no_conn = [s for s in states if s.proxy is not None and not _can_ban(s)]
     inactive = [s for s in states if s.proxy is None]
 
@@ -2008,8 +2042,11 @@ def main(argv: list[str] | None = None) -> None:
         # (op_hint in logs often fires during this phase — PRE_BAN/leader is for the room phase).
         stagger_after = _stagger_from_env
         if n_flash_slots >= 8:
-            _auto = min(3.0, 0.22 * max(0, n_flash_slots - 1))
+            # Old cap (3.0) and 0.22* (n-1) were too low for 12–14 clients on one host (mass PARTL).
+            _auto = min(6.5, 0.30 * max(0, n_flash_slots - 1))
             stagger_after = max(stagger_after, _auto)
+        if n_flash_slots >= 12:
+            stagger_after = max(stagger_after, 3.5)
         if n_flash_slots >= 8 and stagger_after > _stagger_from_env + 0.01:
             logger.info(
                 "Flash launch: %d slots — post-login delay before opening the next client is %.1fs "

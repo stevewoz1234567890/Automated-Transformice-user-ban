@@ -1,8 +1,10 @@
 """
-Load ban-bot settings from ``.env`` in the repository root (or next to ``ban_bot.exe`` when frozen).
+Load ban-bot settings from process environment after ``env_setup.prepare_runtime_environment()``
+(which fills defaults from :mod:`bot.bot_env_defaults` and the repo root ``.env``).
 
-``BOT_ACCOUNTS_JSON`` may span multiple lines. Non-breaking spaces (e.g. from some editors) are
-normalized so ``json`` can parse the array.
+The repo root ``.env`` is expected to list only ``BOT_ACCOUNTS_JSON``; other values come from
+``bot/bot_env_defaults.py``. The array may span multiple lines. Non-breaking spaces (e.g. from
+some editors) are normalized so ``json`` can parse the array.
 """
 from __future__ import annotations
 
@@ -165,6 +167,9 @@ def load_config_from_env(repo_root: Path) -> object:
     # per slot back-to-back), then await futures. Avoids losing later slots when MAIN drops during long
     # stagger sleeps. Set false to restore old random delay between each send (BOT_BAN_DELAY_*).
     B("BAN_BURST_MODE", "BOT_BAN_BURST_MODE", True)
+    # Brief pause before computing the live-upstream set for /ban (after pre-ban join / prompts).
+    # Lets MAIN settle after room migration; 0 disables.
+    F("BAN_PRESEND_STABILIZE_SEC", "BOT_BAN_PRESEND_STABILIZE_SEC", 0.35)
     F("ROOM_STAGGER_SEC", "BOT_ROOM_STAGGER_SEC", 0.15)
     F("FLASH_SLOT_LOGIN_TIMEOUT_SEC", "BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC", 900.0)
     B("PROXY_VERBOSE_LOGIN_FLOW", "BOT_PROXY_VERBOSE_LOGIN_FLOW", True)
@@ -239,6 +244,8 @@ def load_config_from_env(repo_root: Path) -> object:
 
     # BOT_UI_FLASH_LAUNCH_STAGGER_SEC: delay between opening successive Flash windows.
     F("FLASH_STAGGER_AFTER_LOGIN_SEC", "BOT_UI_FLASH_LAUNCH_STAGGER_SEC", 0.5)
+    # Space between *different* PARTL relaunches in one retry round (reduces relaunch stampede on OK slots).
+    F("RETRY_BETWEEN_SLOT_SEC", "BOT_RETRY_BETWEEN_SLOT_SEC", 2.0)
 
     # BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC: per-slot login wait when doing sequential launch.
     # Overrides BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC when explicitly set.
@@ -262,5 +269,10 @@ def load_config_from_env(repo_root: Path) -> object:
     close_fail = _bool_from_env(os.environ.get("BOT_FLASH_CLOSE_ON_LOGIN_FAIL"))
     ns.FLASH_CLOSE_ON_LOGIN_FAIL = True if close_fail is None else close_fail
     F("FLASH_CLOSE_GRACE_SEC", "BOT_FLASH_CLOSE_GRACE_SEC", 2.0)
+
+    try:
+        os.environ["BOT_ACCOUNTS_JSON"] = json.dumps(accounts, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        pass
 
     return ns
