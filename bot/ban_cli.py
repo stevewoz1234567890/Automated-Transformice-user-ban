@@ -1503,6 +1503,14 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
             len(skipped_no_conn),
             len(active),
         )
+        ntot = len(states)
+        if ntot >= 4 and len(skipped_no_conn) * 2 >= ntot and len(active) < max(2, ntot // 4):
+            logger.warning(
+                "Ban round: most slots are PARTL (no live MAIN) — /ban is degraded. "
+                "Mitigate login overlap: set BOT_UI_FLASH_LAUNCH_STAGGER_SEC high enough (see startup "
+                "auto floor for 8+ slots), fix ActionScript/loader; after login, use leader-only + "
+                "BOT_PRE_BAN_ROOM_JOIN_STAGGER_SEC for room join, not the root cause of early PARTL.",
+            )
     else:
         logger.info("Ban round: sending from %d slot(s) with live upstream.", len(active))
 
@@ -1837,7 +1845,30 @@ def main(argv: list[str] | None = None) -> None:
             d["_flash_connect_host"] = st.proxy_bind_host if st.proxy_bind_host else "127.0.0.1"
             flash_accounts.append(d)
         login_timeout = float(getattr(cfg, "FLASH_SLOT_LOGIN_TIMEOUT_SEC", 900.0))
-        stagger_after = float(getattr(cfg, "FLASH_STAGGER_AFTER_LOGIN_SEC", 0.5))
+        n_flash_slots = len(flash_accounts)
+        _stagger_from_env = float(getattr(cfg, "FLASH_STAGGER_AFTER_LOGIN_SEC", 0.5))
+        # Opening many projectors in quick succession backs up the CPU and TFM; overlapping
+        # logins + sat migrations is the primary driver of "early slot PARTL" in large farms
+        # (op_hint in logs often fires during this phase — PRE_BAN/leader is for the room phase).
+        stagger_after = _stagger_from_env
+        if n_flash_slots >= 8:
+            _auto = min(3.0, 0.22 * max(0, n_flash_slots - 1))
+            stagger_after = max(stagger_after, _auto)
+        if n_flash_slots >= 8 and stagger_after > _stagger_from_env + 0.01:
+            logger.info(
+                "Flash launch: %d slots — post-login delay before opening the next client is %.1fs "
+                "(env BOT_UI_FLASH_LAUNCH_STAGGER_SEC was %.1fs; added automatic minimum for 8+ slots "
+                "to reduce PARTL from overlapping MAIN/flash load; override by raising env above %.1f).",
+                n_flash_slots,
+                stagger_after,
+                _stagger_from_env,
+                stagger_after,
+            )
+        elif n_flash_slots > 1:
+            logger.info(
+                "Flash launch: post-login delay before next client = %.1fs (BOT_UI_FLASH_LAUNCH_STAGGER_SEC).",
+                stagger_after,
+            )
 
         if sys.platform == "win32":
             logger.info(flash_launch.flash_error_dismiss_policy_log_line())
@@ -1850,7 +1881,9 @@ def main(argv: list[str] | None = None) -> None:
                 "BOT_PRE_BAN_ROOM_JOIN_STAGGER_SEC=%.1fs — keep both to limit simultaneous sat "
                 "migrations (mass clean-eof). Server kicks, idle, and other causes can still end MAIN. "
                 "Sole-Continuar auto-dismiss (FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION) can end a bad "
-                "AS error like a human click; that is still usually better than a stuck dialog.",
+                "AS error like a human click; that is still usually better than a stuck dialog. "
+                "Recurring ActionScript on many slots: fix SWF/loader; mass PARTL at login: raise "
+                "BOT_UI_FLASH_LAUNCH_STAGGER_SEC (auto floor applies for 8+ slots).",
                 _lo,
                 _pb,
             )
@@ -2235,6 +2268,17 @@ def main(argv: list[str] | None = None) -> None:
     _wait_for_game_clients(states, auto_flash_launched=auto_flash)
 
     print_slot_status(states, title="SLOT STATUS AFTER LOGIN PHASE")
+
+    if auto_flash and len(states) >= 4:
+        _partl = sum(1 for s in states if _slot_status_label(s)[0] == "PARTL")
+        if _partl * 2 >= len(states) and _partl > 0:
+            logger.warning(
+                "Login phase: %d/%d PARTL — overlapping Flash/TCP load and ActionScript errors are the usual cause. "
+                "BOT_PRE_BAN + leader-only only affect room join later; raise BOT_UI_FLASH_LAUNCH_STAGGER_SEC or reduce slot count. "
+                "Recurring 'Error de ActionScript' in logs: check loader/SWF and game version.",
+                _partl,
+                len(states),
+            )
 
     # Focus pump + dismiss poller must stop as soon as the *initial* sequential login
     # batch finishes — not after PARTL retry or the post-login sweep. Retry can run for

@@ -905,8 +905,8 @@ class BanBotProxy(Proxy):
 
         Uses per-session ring buffers and join / ChangeSatellite counters; buffers are
         cleared on each new MAIN TCP in ``new_main_connection``.  ``clean-eof`` appends
-        a stable ``op_hint=`` with JoinRoom env mitigation tokens for log searches.
-        """
+        a short ``note=`` line: login batch vs room-phase tuning (``PRE_BAN`` is for room
+        join, not sequential Flash opens)."""
         parts: list[str] = []
         srv = [n for _, n in self._main_recent_from_server]
         cli = [n for _, n in self._main_recent_from_client]
@@ -943,8 +943,7 @@ class BanBotProxy(Proxy):
 
         if close_reason == "clean-eof":
             parts.append(
-                "op_hint=if_mass_MAIN_drops_check_BOT_PRE_BAN_ROOM_JOIN_STAGGER_SEC+"
-                "BOT_PLAYER_LIST_JOIN_LEADER_ONLY;clean_eof_also_server_kick/idle/AS"
+                "note=clean_eof:login_often=FLASH_STAGGER+AS;room_often=PRE_BAN+leader_not_for_login_batch"
             )
 
         if not parts:
