@@ -725,6 +725,32 @@ def _reset_slot_state_for_retry(st: SlotState) -> None:
     proxy = st.proxy
     if proxy is None:
         return
+    # Reset proxy-side per-MAIN-session flags on the asyncio loop (thread-safe). Required
+    # for PACKET_AUTO_LOGIN (_packet_login_sent) and for FLASH main_tcp UI hook
+    # (_first_main_hook_done) so a relaunched Flash session is not treated as a duplicate.
+    loop = st.loop
+    if loop is not None:
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                proxy.reset_packet_auto_login_for_reconnect(), loop
+            )
+            fut.result(timeout=5.0)
+        except Exception:
+            logger.debug(
+                "Slot %s: reset_packet_auto_login_for_reconnect failed (falling back to in-place clear)",
+                st.label, exc_info=True,
+            )
+            try:
+                t = getattr(proxy, "_packet_login_task", None)
+                if t is not None and not t.done():
+                    t.cancel()
+                proxy._packet_login_task = None
+                proxy._packet_login_sent = False
+                proxy._handshake_auth_token = None
+                proxy._main_handshake_mono = None
+                proxy._first_main_hook_done = False
+            except Exception:
+                pass
     # Session-level fields populated by ``new_main_connection``'s finally
     # block. Clearing them means the post-retry status table won't display
     # the previous session's close reason once a fresh MAIN session opens.

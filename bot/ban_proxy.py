@@ -824,6 +824,29 @@ class BanBotProxy(Proxy):
             _describe(self.satellite_srv),
         )
 
+    async def reset_packet_auto_login_for_reconnect(self) -> None:
+        """
+        Clear per-MAIN-session PACKET_AUTO_LOGIN state before relaunching Flash (PARTL retry).
+
+        After a successful auto-login, ``_packet_login_sent`` stays True. A new Flash
+        process reconnects to the same proxy port; without resetting, the post-sysinfo
+        job sees the flag and skips :class:`serverbound.LoginPacket` — the operator
+        then gets MAIN TCP + ``flash_main_tcp_seen`` but no LoginSuccess until timeout.
+        """
+        t = self._packet_login_task
+        if t is not None and not t.done():
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        self._packet_login_task = None
+        self._packet_login_sent = False
+        self._handshake_auth_token = None
+        self._main_handshake_mono = None
+        # Allow FLASH main_tcp UI hook to run again on the next first MAIN (non-packet path).
+        self._first_main_hook_done = False
+
     async def new_main_connection(self, client_reader, client_writer):
         peer = None
         try:
