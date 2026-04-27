@@ -1303,7 +1303,9 @@ def _collect_player_list_via_join(
         except Exception as exc:
             logger.debug("join_room leader slot %s failed: %s", leader.label, exc)
         logger.info(
-            "Player list: using leader slot %s only for JoinRoom %r (others join before /ban with stagger).",
+            "Player list: leader-only JoinRoom for name list (BOT_PLAYER_LIST_JOIN_LEADER_ONLY) — "
+            "slot %s JoinRoom %r; other live slots will join in the pre-ban stagger pass so "
+            "we do not hit the server with parallel sat migrations during list build.",
             leader.label,
             room,
         )
@@ -1379,7 +1381,9 @@ def _pre_ban_stagger_join_others(
     delay = float(getattr(cfg, "PRE_BAN_ROOM_JOIN_STAGGER_SEC", 1.5) or 0.0)
     delay = max(0.0, min(60.0, delay))
     logger.info(
-        "Pre-ban room sync: %d other slot(s) will JoinRoom %r with %.1fs between each (leader=%s).",
+        "Pre-ban room sync: %d other slot(s) will JoinRoom %r with %.1fs between each (leader=%s) "
+        "[BOT_PRE_BAN_ROOM_JOIN_STAGGER_SEC] — spaces JoinRoom to limit simultaneous sat migrations "
+        "before /ban; without spacing, many slots joining at once can still drop MAIN (clean-eof).",
         len(rest),
         room,
         delay,
@@ -1837,6 +1841,19 @@ def main(argv: list[str] | None = None) -> None:
 
         if sys.platform == "win32":
             logger.info(flash_launch.flash_error_dismiss_policy_log_line())
+            # Visible contract for operators grepping log.txt: parallel JoinRoom to many
+            # slots can overload sat migration and drop MAIN; defaults mitigate that.
+            _lo = bool(getattr(cfg, "PLAYER_LIST_JOIN_LEADER_ONLY", True))
+            _pb = float(getattr(cfg, "PRE_BAN_ROOM_JOIN_STAGGER_SEC", 1.5) or 0.0)
+            logger.info(
+                "MAIN / JoinRoom stability: default BOT_PLAYER_LIST_JOIN_LEADER_ONLY=%s and "
+                "BOT_PRE_BAN_ROOM_JOIN_STAGGER_SEC=%.1fs — keep both to limit simultaneous sat "
+                "migrations (mass clean-eof). Server kicks, idle, and other causes can still end MAIN. "
+                "Sole-Continuar auto-dismiss (FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION) can end a bad "
+                "AS error like a human click; that is still usually better than a stuck dialog.",
+                _lo,
+                _pb,
+            )
 
         # Start global dismiss poller BEFORE launching any Flash windows so
         # error dialogs are caught from the very first slot onwards.

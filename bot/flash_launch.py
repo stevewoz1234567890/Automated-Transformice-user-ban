@@ -1527,7 +1527,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                     logger.info(
                         "ActionScript error dismiss: slot=%s pid=%s hwnd=%s — only Continuar/Continue "
                         "(no Dismiss/OK); BM_CLICK (FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION) "
-                        "label=%r",
+                        "label=%r (same as a manual click can end the AS error; usually better than a stuck dialog).",
                         slot_label, pid, top, best_lbl,
                     )
 

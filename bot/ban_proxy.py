@@ -904,7 +904,8 @@ class BanBotProxy(Proxy):
         Grep-friendly single line to narrow *why* MAIN dropped (heuristic, not proof).
 
         Uses per-session ring buffers and join / ChangeSatellite counters; buffers are
-        cleared on each new MAIN TCP in ``new_main_connection``.
+        cleared on each new MAIN TCP in ``new_main_connection``.  ``clean-eof`` appends
+        a stable ``op_hint=`` with JoinRoom env mitigation tokens for log searches.
         """
         parts: list[str] = []
         srv = [n for _, n in self._main_recent_from_server]
@@ -939,6 +940,12 @@ class BanBotProxy(Proxy):
 
         if alive_sec < 12.0 and since_login is not None and since_login < 20.0:
             parts.append("short_post_login_life=%.1fs" % alive_sec)
+
+        if close_reason == "clean-eof":
+            parts.append(
+                "op_hint=if_mass_MAIN_drops_check_BOT_PRE_BAN_ROOM_JOIN_STAGGER_SEC+"
+                "BOT_PLAYER_LIST_JOIN_LEADER_ONLY;clean_eof_also_server_kick/idle/AS"
+            )
 
         if not parts:
             return "no_extra_pattern"
