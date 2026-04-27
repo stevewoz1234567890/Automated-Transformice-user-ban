@@ -1803,6 +1803,9 @@ def main(argv: list[str] | None = None) -> None:
                     pass
     _configure_logging()
     args = _parse_args(argv)
+    from .run_checklist import prompt_run_checklist
+
+    prompt_run_checklist()
     if not args.skip_net_check:
         from .net_preflight import run_network_preflight
 
