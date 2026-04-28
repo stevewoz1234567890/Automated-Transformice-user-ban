@@ -43,6 +43,14 @@ def _bool_env(name: str) -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def _warn_unverified_loader_embedding_enabled() -> bool:
+    """BOT_WARN_UNVERIFIED_LOADER_VERSION — default on; set 0 to silence."""
+    v = (os.environ.get("BOT_WARN_UNVERIFIED_LOADER_VERSION") or "").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
 def _swf_scan_payload(raw: bytes) -> tuple[str, bytes] | None:
     if len(raw) < 8:
         return None
@@ -175,6 +183,13 @@ def log_client_asset_alignment(repo_root: Path) -> None:
     else:
         lines_md.append("- **URL-style embedded version hints**: *(none found)*\n")
 
+    embedding_verifiable = bool(literal_substrings or bool(urlish))
+    lines_md.append(
+        f"- **Loader version embedding verifiable**: "
+        f"`{'yes' if embedding_verifiable else 'no'}` "
+        f"(no literal bytes and no URL hints → cannot prove SWF matches `TFM_SECRETS_GAME_VERSION`)\n"
+    )
+
     logger.info(
         "Client/asset alignment: game_version=%r swf=%s format=%s payload=%s bytes literal_match=%s "
         "url_hints=%s flash_exe=%s",
@@ -196,6 +211,7 @@ def log_client_asset_alignment(repo_root: Path) -> None:
         "literal_version_bytes_in_swf_payload": literal_substrings,
         "url_style_version_hints": list(urlish) if urlish else [],
         "url_hints_strict_mismatch_vs_config": mismatch_url,
+        "loader_version_embedding_verifiable": embedding_verifiable,
         "scanner_tag": tag,
         "payload_bytes": len(body),
     }
@@ -213,6 +229,19 @@ def log_client_asset_alignment(repo_root: Path) -> None:
             logger.error("BOT_STRICT_LOADER_VERSION_CHECK=1 — exiting after loader/version mismatch.")
             sys.exit(1)
         return
+
+    if (
+        cfg_gvi is not None
+        and not embedding_verifiable
+        and _warn_unverified_loader_embedding_enabled()
+    ):
+        logger.warning(
+            "Client/asset alignment: cannot verify TFM_SECRETS_GAME_VERSION=%s against this loader SWF "
+            "(no literal version substring and no swf=r… / gameversion… hints in decompressed payload). "
+            "Persistent ActionScript errors often mean TFM_PROXY_SWF is stale vs the live web client — "
+            "re-dump the loader from current Transformice or align secrets.",
+            cfg_gvi,
+        )
 
     if cfg_gvi is not None and urlish and cfg_gvi in urlish:
         logger.info(

@@ -17,6 +17,7 @@ Each account can use a different ``proxy_port`` and local ``bind_ip``: the loade
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -40,6 +41,8 @@ _flash_ui_locks_mutex = threading.Lock()
 # BM_CLICK / WM_CLOSE paths in :func:`dismiss_flash_error_dialogs_no_mouse` (session totals for log.txt + reports).
 _as_dismiss_closed_total = 0
 _as_dismiss_incorrect_version_total = 0
+_as_dismiss_unique_fp_total = 0
+_as_dismiss_seen_fp: set[str] = set()
 _as_dismiss_stats_lock = threading.Lock()
 
 
@@ -57,7 +60,88 @@ def as_error_dismiss_session_snapshot() -> dict[str, int]:
         return {
             "actionscript_error_dialogs_closed": _as_dismiss_closed_total,
             "incorrect_version_dialogs": _as_dismiss_incorrect_version_total,
+            "actionscript_error_unique_fingerprints": _as_dismiss_unique_fp_total,
         }
+
+
+def _flash_dialog_aggregate_body_text(top_hwnd: int, user32: object) -> str:
+    """
+    Adobe Flash Player ActionScript error dialogs often put the stack trace in an ``Edit`` or
+    ``RichEdit20W`` child; older code only read ``Static``, so logs showed ``body='Error de ActionScript:'``
+    without the actual fault line — useless for root-cause analysis.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    WM_GETTEXT = 0x000D
+    WM_GETTEXTLENGTH = 0x000E
+    parts: list[str] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_child(ch, _lp):
+        cls_buf = ctypes.create_unicode_buffer(96)
+        user32.GetClassNameW(ch, cls_buf, 96)
+        cls = cls_buf.value.lower()
+        piece = ""
+        if cls == "static":
+            tb = ctypes.create_unicode_buffer(8192)
+            user32.GetWindowTextW(ch, tb, 8192)
+            piece = (tb.value or "").strip()
+        elif cls == "edit" or cls.startswith("richedit"):
+            try:
+                ln = int(user32.SendMessageW(ch, WM_GETTEXTLENGTH, 0, 0))
+            except (TypeError, ValueError, OSError):
+                ln = 0
+            ln = max(0, min(int(ln), 32767))
+            if ln <= 0:
+                tb = ctypes.create_unicode_buffer(8192)
+                user32.GetWindowTextW(ch, tb, 8192)
+                piece = (tb.value or "").strip()
+            else:
+                buf = ctypes.create_unicode_buffer(ln + 4)
+                user32.SendMessageW(ch, WM_GETTEXT, ln + 1, ctypes.addressof(buf))
+                piece = (buf.value or "").strip()
+        if piece:
+            parts.append(piece)
+        return True
+
+    user32.EnumChildWindows(top_hwnd, _enum_child, 0)
+    merged = " | ".join(parts)
+    return merged.strip()
+
+
+def _as_error_normalize_for_fp(text: str) -> str:
+    s = " ".join((text or "").split())
+    return s[:12000]
+
+
+def _maybe_log_first_seen_as_fingerprint(
+    *,
+    body_text: str,
+    slot_label: str,
+    pid: int,
+    hwnd: int,
+) -> None:
+    """Once per distinct dialog body (session): WARNING with enough text to identify AS fault lines."""
+    global _as_dismiss_unique_fp_total
+    norm = _as_error_normalize_for_fp(body_text)
+    if len(norm) < 12:
+        return
+    fp = hashlib.sha256(norm.encode("utf-8", errors="replace")).hexdigest()[:16]
+    with _as_dismiss_stats_lock:
+        if fp in _as_dismiss_seen_fp:
+            return
+        _as_dismiss_seen_fp.add(fp)
+        _as_dismiss_unique_fp_total = len(_as_dismiss_seen_fp)
+    preview = norm[:1400].replace("\r", " ").replace("\n", " │ ")
+    logger.warning(
+        "ActionScript error fingerprint=%s slot=%s pid=%s hwnd=%s (first time this session) — %s",
+        fp,
+        slot_label,
+        pid,
+        hwnd,
+        preview,
+    )
 
 
 def _flash_error_dismiss_verbose_info_cap() -> int:
@@ -1460,38 +1544,27 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
             area,
             (title or "")[:120],
         )
-        # Enumerate child controls and click buttons matching dismiss labels.
-        # Also capture Static-control body text so the operator (and log.txt) can
-        # see *which* error fired — e.g. the "incorrect version" / rate-limit
-        # screen that the TFM server throws back at rapid-fire logins. The
-        # dialog title is always plain "Adobe Flash Player", so without the
-        # body text the dismiss line says nothing useful.
+        # Enumerate child Button controls; body text via Static + Edit/RichEdit (stack traces live there).
         buttons: list[int] = []
-        statics: list[int] = []
 
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-        def _enum_child(ch, _lp):
+        def _enum_child_btn(ch, _lp):
             cls_buf = ctypes.create_unicode_buffer(64)
             user32.GetClassNameW(ch, cls_buf, 64)
             cls = cls_buf.value.lower()
             if cls == "button":
                 buttons.append(int(ch))
-            elif cls == "static":
-                statics.append(int(ch))
             return True
 
-        user32.EnumChildWindows(top, _enum_child, 0)
+        user32.EnumChildWindows(top, _enum_child_btn, 0)
 
-        body_text = ""
-        if statics:
-            parts: list[str] = []
-            for st in statics:
-                tb = ctypes.create_unicode_buffer(2048)
-                user32.GetWindowTextW(st, tb, 2048)
-                t = (tb.value or "").strip()
-                if t:
-                    parts.append(t)
-            body_text = " | ".join(parts)
+        body_text = _flash_dialog_aggregate_body_text(top, user32)
+        _maybe_log_first_seen_as_fingerprint(
+            body_text=body_text,
+            slot_label=slot_label,
+            pid=pid,
+            hwnd=top,
+        )
         body_norm = body_text.lower()
         looks_like_incorrect_version = (
             "incorrect version" in body_norm
@@ -1598,7 +1671,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                     best_rank,
                     area,
                     (title or "")[:80],
-                    (body_text or "")[:240],
+                    (body_text or "")[:720],
                     sess_tot,
                     sess_bad,
                 ),
@@ -1611,7 +1684,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                     "client). incorrect_version_total_this_session=%d Body: %r",
                     slot_label,
                     sess_bad,
-                    (body_text or "")[:240],
+                    (body_text or "")[:720],
                 )
             clicked += 1
             continue
@@ -1639,7 +1712,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                         top,
                         txt.value.strip(),
                         area,
-                        (body_text or "")[:240],
+                        (body_text or "")[:720],
                         sess_tot,
                         sess_bad,
                     ),
@@ -1651,7 +1724,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                         "incorrect_version_total_this_session=%d Body: %r",
                         slot_label,
                         sess_bad,
-                        (body_text or "")[:240],
+                        (body_text or "")[:720],
                     )
                 clicked += 1
                 break

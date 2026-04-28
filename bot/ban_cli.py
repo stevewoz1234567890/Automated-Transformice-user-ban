@@ -529,6 +529,9 @@ def _log_login_phase_diagnostics(
     al_bits: list[str] = []
     if al:
         al_bits.append(f"literal_version_in_swf={al.get('literal_version_bytes_in_swf_payload')}")
+        ver = al.get("loader_version_embedding_verifiable")
+        if ver is not None:
+            al_bits.append(f"loader_embed_verifiable={ver}")
         uh = al.get("url_style_version_hints")
         if uh:
             al_bits.append(f"url_hints={uh!r}")
@@ -541,7 +544,7 @@ def _log_login_phase_diagnostics(
     logger.info(
         "Login phase diagnostics [%s]: n_slots=%d OK=%d PARTL=%d | stagger_effective=%.1fs "
         "(BOT_UI_FLASH_LAUNCH_STAGGER_SEC=%.1fs; auto min for 8+ slots may apply) | "
-        "AS_dialogs_closed=%d incorrect_version_dialogs=%d | %s",
+        "AS_dialogs_closed=%d AS_unique_fp=%d incorrect_version_dialogs=%d | %s",
         phase,
         n_slots,
         ok_n,
@@ -549,6 +552,7 @@ def _log_login_phase_diagnostics(
         stagger_effective,
         stagger_from_env,
         snap.get("actionscript_error_dialogs_closed", 0),
+        snap.get("actionscript_error_unique_fingerprints", 0),
         snap.get("incorrect_version_dialogs", 0),
         extra,
     )
@@ -676,6 +680,9 @@ def _write_session_report_markdown(
     _as_snap = flash_launch.as_error_dismiss_session_snapshot()
     lines.append("## ActionScript error dismiss (session totals)\n\n")
     lines.append(f"- **Dialogs closed (tracked)**: `{_as_snap['actionscript_error_dialogs_closed']}`\n")
+    lines.append(
+        f"- **Distinct ActionScript dialog bodies (fingerprints)**: `{_as_snap.get('actionscript_error_unique_fingerprints', 0)}`\n"
+    )
     lines.append(
         f"- **Incorrect-version dialog bodies (tracked)**: `{_as_snap['incorrect_version_dialogs']}`\n\n"
     )
