@@ -243,9 +243,10 @@ def load_config_from_env(repo_root: Path) -> object:
         ns.FLASH_PLAYER_EXE = fp
 
     # BOT_UI_FLASH_LAUNCH_STAGGER_SEC: delay between opening successive Flash windows.
-    F("FLASH_STAGGER_AFTER_LOGIN_SEC", "BOT_UI_FLASH_LAUNCH_STAGGER_SEC", 0.5)
+    # Default 1.5s — slightly spreads load vs 1.0s (fewer PARTL); override lower only if CPU keeps up.
+    F("FLASH_STAGGER_AFTER_LOGIN_SEC", "BOT_UI_FLASH_LAUNCH_STAGGER_SEC", 1.5)
     # Space between *different* PARTL relaunches in one retry round (reduces relaunch stampede on OK slots).
-    F("RETRY_BETWEEN_SLOT_SEC", "BOT_RETRY_BETWEEN_SLOT_SEC", 2.0)
+    F("RETRY_BETWEEN_SLOT_SEC", "BOT_RETRY_BETWEEN_SLOT_SEC", 1.0)
 
     # BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC: per-slot login wait when doing sequential launch.
     # Overrides BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC when explicitly set.

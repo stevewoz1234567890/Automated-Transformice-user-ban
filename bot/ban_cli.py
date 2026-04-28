@@ -104,6 +104,9 @@ class SlotState:
     policy_port: int | None = None
     proxy_bind_host: str | None = None
     login_success_event: threading.Event = field(default_factory=threading.Event)
+    # Set by BanBotProxy when a MAIN TCP session ends without LoginSuccess (handshake killed).
+    # Lets login waits exit promptly instead of sleeping until BOT_RETRY_LOGIN_TIMEOUT_SEC.
+    login_aborted_event: threading.Event = field(default_factory=threading.Event)
     proxy: BanBotProxy | None = None
     loop: asyncio.AbstractEventLoop | None = None
     thread: threading.Thread | None = None
@@ -305,6 +308,7 @@ def _run_slot_async(
                 host_socket_policy_port=state.policy_port,
                 slot_label=state.label,
                 login_success_event=state.login_success_event,
+                login_aborted_event=state.login_aborted_event,
                 on_first_main_connection=hook,
                 on_main_tcp_accepted=_on_main_tcp,
                 verbose_login_flow=bool(
@@ -736,6 +740,7 @@ def _reset_slot_state_for_retry(st: SlotState) -> None:
     instead of being interpreted as a reconnect.
     """
     st.login_success_event.clear()
+    st.login_aborted_event.clear()
     st.flash_main_tcp_seen = False
     st.flash_loader_ready_event.clear()
     st.error = None
@@ -848,12 +853,22 @@ def _wait_for_login_simple(st: SlotState, login_timeout: float) -> bool:
         # Wait in small slices so the periodic-log clock stays accurate.
         if st.login_success_event.wait(timeout=1.0):
             return True
+        if st.login_aborted_event.is_set():
+            logger.info(
+                "Retry: slot %s — MAIN session ended before LoginSuccess; stopping wait "
+                "(see MAIN session ended WARNING above).",
+                st.label,
+            )
+            return False
         now = time.monotonic()
         if now >= next_log:
             left = max(0.0, deadline - now)
             logger.info(
-                "Retry: slot %s still waiting for login (~%.0fs left, MAIN_TCP=%s)",
-                st.label, left, "yes" if st.flash_main_tcp_seen else "no",
+                "Retry: slot %s still waiting for login (~%.0fs left, MAIN_seen=%s, aborted=%s)",
+                st.label,
+                left,
+                "yes" if st.flash_main_tcp_seen else "no",
+                "yes" if st.login_aborted_event.is_set() else "no",
             )
             next_log = now + 15.0
     return False
@@ -2167,6 +2182,7 @@ def main(argv: list[str] | None = None) -> None:
 
         for idx, (flash_row, st) in enumerate(zip(flash_accounts, states), start=1):
             st.login_success_event.clear()
+            st.login_aborted_event.clear()
             st.flash_main_tcp_seen = False
             st.flash_loader_ready_event.clear()
             logger.info(
@@ -2384,6 +2400,13 @@ def main(argv: list[str] | None = None) -> None:
                         else:
                             flash_launch.minimize_flash_window(st.flash_pid, st.label)
                     break
+                if st.login_aborted_event.is_set():
+                    logger.info(
+                        "Slot %s: MAIN session closed before LoginSuccess — "
+                        "(clean-eof during handshake is common with stagger overload or unstable links).",
+                        st.label,
+                    )
+                    break
                 if st.flash_main_tcp_seen:
                     extra_verbose = (
                         " With PROXY_VERBOSE_LOGIN_FLOW: expect a [MAIN→srv] LoginPacket after you submit; "
@@ -2440,11 +2463,19 @@ def main(argv: list[str] | None = None) -> None:
                             st.flash_pid, st.label, frac_x=frac_x, frac_y=frac_y
                         )
             if not got_login:
-                logger.warning(
-                    "Slot %s: no login success within %ss — finish manually or fix loader/proxy; continuing.",
-                    st.label,
-                    login_timeout,
-                )
+                if st.login_aborted_event.is_set():
+                    logger.warning(
+                        "Slot %s: no LoginSuccess — MAIN closed during handshake (see WARNING above). "
+                        "Not a full %ss idle wait; continuing to next slot.",
+                        st.label,
+                        login_timeout,
+                    )
+                else:
+                    logger.warning(
+                        "Slot %s: no login success within %ss — finish manually or fix loader/proxy; continuing.",
+                        st.label,
+                        login_timeout,
+                    )
                 if (
                     bool(getattr(cfg, "FLASH_CLOSE_ON_LOGIN_FAIL", True))
                     and st.flash_pid

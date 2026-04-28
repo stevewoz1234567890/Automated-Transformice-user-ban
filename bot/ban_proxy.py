@@ -262,6 +262,7 @@ class BanBotProxy(Proxy):
         *,
         slot_label: str = "",
         login_success_event: threading.Event | None = None,
+        login_aborted_event: threading.Event | None = None,
         on_first_main_connection: object | None = None,
         on_main_tcp_accepted: object | None = None,
         verbose_login_flow: bool = False,
@@ -282,6 +283,7 @@ class BanBotProxy(Proxy):
         super().__init__(**kwargs)
         self.slot_label = slot_label
         self._login_success_event = login_success_event
+        self._login_aborted_event = login_aborted_event
         self._on_first_main_connection = on_first_main_connection
         self._on_main_tcp_accepted = on_main_tcp_accepted
         self._first_main_hook_done = False
@@ -1016,6 +1018,9 @@ class BanBotProxy(Proxy):
         #   • Server-side close -> ConnectionResetError/EOF from the upstream socket first;
         #     caseus propagates via destination.close(), so the client task also ends.
         tcp_accept_mono = time.monotonic()
+        ab = self._login_aborted_event
+        if ab is not None:
+            ab.clear()
         # Isolate ring buffers and join / ChangeSatellite counters to this MAIN TCP only
         # (avoids mis-attributing the previous Flash session's packets in diagnostics).
         self._main_recent_from_server.clear()
@@ -1089,6 +1094,10 @@ class BanBotProxy(Proxy):
                 now_mono=now_close,
             )
             self._main_last_close_diag = diag
+            ev = self._login_success_event
+            ab_ev = self._login_aborted_event
+            if ev is not None and ab_ev is not None and not ev.is_set():
+                ab_ev.set()
             _diag_off = os.environ.get("BOT_PROXY_MAIN_CLOSE_DIAG", "").strip().lower() in (
                 "0",
                 "false",
