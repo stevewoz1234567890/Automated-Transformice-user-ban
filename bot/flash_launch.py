@@ -46,6 +46,27 @@ _as_dismiss_seen_fp: set[str] = set()
 _as_dismiss_stats_lock = threading.Lock()
 # Same AS error body dismissed again (session): milestone logs for root-cause persistence.
 _as_fp_repeat_in_session: dict[str, int] = {}
+# Monotonic time of last successful AS/Adobe error dismiss per slot — correlated with MAIN
+# clean-eof in ban_proxy when ``BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE`` is enabled.
+_last_as_dismiss_mono_by_slot: dict[str, float] = {}
+_as_dismiss_mono_lock = threading.Lock()
+
+
+def record_as_dismiss_monotonic_for_slot(slot_label: str) -> None:
+    """Record dismiss time for correlation with proxy MAIN teardown (not proof of causation)."""
+    lab = (slot_label or "").strip()
+    if not lab:
+        return
+    with _as_dismiss_mono_lock:
+        _last_as_dismiss_mono_by_slot[lab] = time.monotonic()
+
+
+def last_as_dismiss_monotonic_for_slot(slot_label: str) -> float | None:
+    lab = (slot_label or "").strip()
+    if not lab:
+        return None
+    with _as_dismiss_mono_lock:
+        return _last_as_dismiss_mono_by_slot.get(lab)
 
 
 def _record_as_dismiss_close(*, incorrect_version: bool) -> tuple[int, int]:
@@ -149,7 +170,12 @@ def _maybe_log_first_seen_as_fingerprint(
             return
         _as_dismiss_seen_fp.add(fp)
         _as_dismiss_unique_fp_total = len(_as_dismiss_seen_fp)
-    preview = norm[:1400].replace("\r", " ").replace("\n", " │ ")
+    try:
+        prev_cap = int((os.environ.get("FLASH_ERROR_FIRST_FP_PREVIEW_CHARS") or "1400").strip())
+    except ValueError:
+        prev_cap = 1400
+    prev_cap = max(200, min(12000, prev_cap))
+    preview = norm[:prev_cap].replace("\r", " ").replace("\n", " │ ")
     logger.warning(
         "ActionScript error fingerprint=%s slot=%s pid=%s hwnd=%s (first time this session) — %s",
         fp,
@@ -158,6 +184,16 @@ def _maybe_log_first_seen_as_fingerprint(
         hwnd,
         preview,
     )
+    if (os.environ.get("FLASH_ERROR_LOG_FULL_BODY_FIRST_FP") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ) and len(norm) > prev_cap:
+        more = norm[prev_cap:].replace("\r", " ").replace("\n", " │ ")
+        more_cap = min(10000, len(more))
+        logger.warning(
+            "ActionScript error fingerprint=%s (continuation, FLASH_ERROR_LOG_FULL_BODY_FIRST_FP) — %s",
+            fp,
+            more[:more_cap] + ("…" if len(more) > more_cap else ""),
+        )
 
 
 def _flash_error_dismiss_verbose_info_cap() -> int:
@@ -170,6 +206,15 @@ def _flash_error_dismiss_verbose_info_cap() -> int:
     if cap <= 0:
         return 0
     return max(3, min(250, cap))
+
+
+def _flash_dismiss_body_log_chars() -> int:
+    """Max chars of AS dialog body in dismiss log lines (raise for root-cause hunting; default 720)."""
+    try:
+        n = int((os.environ.get("FLASH_ERROR_DISMISS_BODY_LOG_CHARS") or "720").strip())
+    except ValueError:
+        n = 720
+    return max(120, min(8000, n))
 
 
 def _as_dismiss_log_closed(
@@ -1687,7 +1732,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                     best_rank,
                     area,
                     (title or "")[:80],
-                    (body_text or "")[:720],
+                    (body_text or "")[: _flash_dismiss_body_log_chars()],
                     sess_tot,
                     sess_bad,
                 ),
@@ -1700,9 +1745,10 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                     "client). incorrect_version_total_this_session=%d Body: %r",
                     slot_label,
                     sess_bad,
-                    (body_text or "")[:720],
+                    (body_text or "")[: _flash_dismiss_body_log_chars()],
                 )
             clicked += 1
+            record_as_dismiss_monotonic_for_slot(slot_label)
             continue
 
         for btn in buttons:
@@ -1728,7 +1774,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                         top,
                         txt.value.strip(),
                         area,
-                        (body_text or "")[:720],
+                        (body_text or "")[: _flash_dismiss_body_log_chars()],
                         sess_tot,
                         sess_bad,
                     ),
@@ -1740,9 +1786,10 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                         "incorrect_version_total_this_session=%d Body: %r",
                         slot_label,
                         sess_bad,
-                        (body_text or "")[:720],
+                        (body_text or "")[: _flash_dismiss_body_log_chars()],
                     )
                 clicked += 1
+                record_as_dismiss_monotonic_for_slot(slot_label)
                 break
         else:
             if adobe_err or area < _MAX_SMALL_POPUP_AREA:
@@ -1763,6 +1810,7 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                         args=(slot_label, pid, top, area, sess_tot, sess_bad),
                     )
                     clicked += 1
+                    record_as_dismiss_monotonic_for_slot(slot_label)
                 elif adobe_err and not use_wmclose:
                     logger.warning(
                         "ActionScript error dismiss: slot=%s pid=%s hwnd=%s — no safe button; "

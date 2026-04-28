@@ -143,6 +143,16 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_PROXY_MAIN_CLOSE_VERBOSE": "false",
     # Extra tcp_side_guess + sess_counts on MAIN close (set false to shorten lines).
     "BOT_PROXY_MAIN_RC_HINT": "true",
+    # Deep clean-eof hunt: WARNING ROOT_CAUSE_MAIN_CLOSE on every MAIN end (Flash TCP, rings, AS-dismiss delta).
+    "BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE": "false",
+    # Last N packet labels per direction on MAIN (raise during ROOT_CAUSE runs; default 8).
+    "BOT_PROXY_MAIN_PACKET_RING": "8",
+    # Longer AS dialog text in logs (default 720; max 8000).
+    "FLASH_ERROR_DISMISS_BODY_LOG_CHARS": "720",
+    # First-seen fingerprint preview length (default 1400; max 12000).
+    "FLASH_ERROR_FIRST_FP_PREVIEW_CHARS": "1400",
+    # Log a second WARNING line with remaining body after preview (same first fingerprint only).
+    "FLASH_ERROR_LOG_FULL_BODY_FIRST_FP": "false",
 }
 
 

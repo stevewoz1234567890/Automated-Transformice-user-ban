@@ -2598,6 +2598,19 @@ def main(argv: list[str] | None = None) -> None:
                 _lo,
                 _pb,
             )
+            if (os.environ.get("BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                logger.info(
+                    "ROOT_CAUSE logging: BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE=true — each MAIN end logs "
+                    "ROOT_CAUSE_MAIN_CLOSE (Flash→proxy TCP snapshot, srv/cli packet rings, errno/winerror, "
+                    "sec_since_as_dismiss). For longer AS traces set FLASH_ERROR_FIRST_FP_PREVIEW_CHARS, "
+                    "FLASH_ERROR_LOG_FULL_BODY_FIRST_FP, FLASH_ERROR_DISMISS_BODY_LOG_CHARS, "
+                    "BOT_PROXY_MAIN_PACKET_RING."
+                )
 
         # Start global dismiss poller BEFORE launching any Flash windows so
         # error dialogs are caught from the very first slot onwards.

@@ -271,6 +271,66 @@ def _proxy_heartbeat_log_every() -> int:
     return n
 
 
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _main_packet_ring_limit() -> int:
+    """Ring buffer of last MAIN packet labels per direction (raise when hunting clean-eof)."""
+    try:
+        n = int((os.environ.get("BOT_PROXY_MAIN_PACKET_RING") or "8").strip())
+    except ValueError:
+        n = 8
+    return max(4, min(64, n))
+
+
+def _root_cause_exc_fields(exc: BaseException | None) -> str:
+    if exc is None:
+        return "exc=(none)"
+    parts: list[str] = [f"type={type(exc).__name__}", f"msg={exc!s}"]
+    for attr in ("errno", "winerror"):
+        if hasattr(exc, attr):
+            try:
+                parts.append(f"{attr}={getattr(exc, attr)!r}")
+            except Exception:
+                pass
+    return ";".join(parts)
+
+
+def _root_cause_flash_tcp_snapshot(client_writer: object | None) -> str:
+    """Best-effort Flash→proxy StreamWriter / transport state at MAIN teardown (not upstream)."""
+    chunks: list[str] = []
+    try:
+        if client_writer is None:
+            return "Flash_tcp=writer_none"
+        ic = getattr(client_writer, "is_closing", None)
+        chunks.append(f"writer_closing={ic() if callable(ic) else ic}")
+        tr = getattr(client_writer, "transport", None)
+        if tr is None:
+            chunks.append("transport=None")
+            return "Flash_tcp=" + ";".join(chunks)
+        chunks.append(f"tr_is_closing={tr.is_closing()}")
+        try:
+            chunks.append(f"peer={tr.get_extra_info('peername')!r}")
+        except Exception:
+            chunks.append("peer=?")
+        try:
+            chunks.append(f"sockname={tr.get_extra_info('sockname')!r}")
+        except Exception:
+            chunks.append("sockname=?")
+    except Exception as e:
+        chunks.append(f"snapshot_err={e!r}")
+    return "Flash_tcp=" + ";".join(chunks)
+
+
+def _main_ring_timeline(buf: list[tuple[float, str]], *, now_mono: float, tag: str) -> str:
+    if not buf:
+        return f"{tag}=(empty)"
+    return f"{tag}=" + ";".join(
+        f"{now_mono - ts:.3f}sAgo:{name}" for ts, name in buf
+    )
+
+
 class BanBotProxy(Proxy):
     """One proxy port ↔ one game instance; sends slash-commands as CommandPacket (no leading /)."""
 
@@ -350,7 +410,7 @@ class BanBotProxy(Proxy):
         # packet before EOF (server kicked vs Flash walked away).
         self._main_recent_from_server: list[tuple[float, str]] = []
         self._main_recent_from_client: list[tuple[float, str]] = []
-        self._MAIN_RECENT_LIMIT = 8
+        self._MAIN_RECENT_LIMIT = _main_packet_ring_limit()
         # Per MAIN-TCP session (cleared in ``new_main_connection``): join and sat
         # migration, used in MAIN close diagnostics. ChangeSat count/mono are
         # *post-login* only — the first ChangeSatelliteServerPacket on MAIN is the
@@ -1216,6 +1276,34 @@ class BanBotProxy(Proxy):
                     "Slot %s: MAIN close diagnostic: %s",
                     self.slot_label,
                     diag,
+                )
+            if _env_truthy("BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE"):
+                from .flash_launch import last_as_dismiss_monotonic_for_slot
+
+                now_p = time.monotonic()
+                adm = last_as_dismiss_monotonic_for_slot(self.slot_label)
+                as_part = (
+                    f"sec_since_as_dismiss={now_p - adm:.4f}"
+                    if adm is not None
+                    else "as_dismiss_never_this_slot"
+                )
+                logger.warning(
+                    "ROOT_CAUSE_MAIN_CLOSE slot=%s main_tcp#=%s phase=%s reason=%s login_age=%s %s | "
+                    "%s | %s | %s",
+                    self.slot_label,
+                    getattr(self, "_main_tcp_generation", 0),
+                    get_operator_phase(),
+                    close_reason,
+                    f"{since_login:.3f}s" if since_login is not None else "n/a",
+                    _root_cause_exc_fields(close_exc),
+                    _root_cause_flash_tcp_snapshot(client_writer),
+                    _main_ring_timeline(
+                        self._main_recent_from_server, now_mono=now_p, tag="srv_ring"
+                    ),
+                    _main_ring_timeline(
+                        self._main_recent_from_client, now_mono=now_p, tag="cli_ring"
+                    ),
+                    as_part,
                 )
             if os.environ.get("BOT_PROXY_MAIN_CLOSE_VERBOSE", "").strip().lower() in (
                 "1",
