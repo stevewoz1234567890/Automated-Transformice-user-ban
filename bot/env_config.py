@@ -163,6 +163,14 @@ def load_config_from_env(repo_root: Path) -> object:
 
     F("BAN_DELAY_MIN_SEC", "BOT_BAN_DELAY_MIN_SEC", 1.0)
     F("BAN_DELAY_MAX_SEC", "BOT_BAN_DELAY_MAX_SEC", 2.0)
+    # In-room ban mechanic: typical number of distinct /ban reports required (Transformice quorum).
+    # Used for warnings only — see docs/BAN_QUORUM_TRANSFORMICE.md
+    _bqr = (os.environ.get("BOT_BAN_QUORUM_REPORTS") or "").strip()
+    try:
+        ns.BAN_QUORUM_REPORTS = int(_bqr, 10) if _bqr else 11
+    except ValueError:
+        ns.BAN_QUORUM_REPORTS = 11
+    ns.BAN_QUORUM_REPORTS = max(1, min(64, int(ns.BAN_QUORUM_REPORTS)))
     # When true (default): with 2+ live slots, schedule every /ban immediately (one run_coroutine_threadsafe
     # per slot back-to-back), then await futures. Avoids losing later slots when MAIN drops during long
     # stagger sleeps. Set false to restore old random delay between each send (BOT_BAN_DELAY_*).
@@ -243,10 +251,10 @@ def load_config_from_env(repo_root: Path) -> object:
         ns.FLASH_PLAYER_EXE = fp
 
     # BOT_UI_FLASH_LAUNCH_STAGGER_SEC: delay between opening successive Flash windows.
-    # Default 1.5s — slightly spreads load vs 1.0s (fewer PARTL); override lower only if CPU keeps up.
-    F("FLASH_STAGGER_AFTER_LOGIN_SEC", "BOT_UI_FLASH_LAUNCH_STAGGER_SEC", 1.5)
+    # Default 2.5s — pairs with auto floor for 8+ slots (see _effective_flash_stagger_sec); lower only if CPU keeps up.
+    F("FLASH_STAGGER_AFTER_LOGIN_SEC", "BOT_UI_FLASH_LAUNCH_STAGGER_SEC", 2.5)
     # Space between *different* PARTL relaunches in one retry round (reduces relaunch stampede on OK slots).
-    F("RETRY_BETWEEN_SLOT_SEC", "BOT_RETRY_BETWEEN_SLOT_SEC", 1.0)
+    F("RETRY_BETWEEN_SLOT_SEC", "BOT_RETRY_BETWEEN_SLOT_SEC", 2.0)
 
     # BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC: per-slot login wait when doing sequential launch.
     # Overrides BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC when explicitly set.

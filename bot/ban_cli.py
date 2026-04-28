@@ -497,6 +497,63 @@ def _slot_status_label(s: SlotState) -> tuple[str, str]:
     return ("OK   ", "ready")
 
 
+def _effective_flash_stagger_sec(n_slots: int, stagger_from_env: float) -> float:
+    """POST-login delay before opening the *next* Flash client (sequential farm launch)."""
+    stagger_after = float(stagger_from_env)
+    if n_slots >= 8:
+        _auto = min(7.0, 0.38 * max(0, n_slots - 1))
+        stagger_after = max(stagger_after, _auto)
+    if n_slots >= 12:
+        stagger_after = max(stagger_after, 4.25)
+    if n_slots >= 14:
+        stagger_after = max(stagger_after, 5.0)
+    return stagger_after
+
+
+def _log_login_phase_diagnostics(
+    states: list[SlotState],
+    *,
+    n_slots: int,
+    stagger_effective: float,
+    stagger_from_env: float,
+    phase: str = "after_login_phase",
+) -> None:
+    """
+    Single INFO line after the slot table: PARTL/OK counts, effective stagger, loader snapshot,
+    ActionScript dismiss counters (helps explain mass PARTL without scrolling WARNINGs).
+    """
+    partl_n = sum(1 for s in states if _slot_status_label(s)[0] == "PARTL")
+    ok_n = sum(1 for s in states if _slot_status_label(s)[0] == "OK   ")
+    snap = flash_launch.as_error_dismiss_session_snapshot()
+    al = tfm_loader_alignment.get_last_alignment_summary()
+    al_bits: list[str] = []
+    if al:
+        al_bits.append(f"literal_version_in_swf={al.get('literal_version_bytes_in_swf_payload')}")
+        uh = al.get("url_style_version_hints")
+        if uh:
+            al_bits.append(f"url_hints={uh!r}")
+        if al.get("url_hints_strict_mismatch_vs_config"):
+            al_bits.append("url_hint_mismatch_vs_TFM_SECRETS=yes")
+        gv = al.get("tfm_secrets_game_version")
+        if gv:
+            al_bits.append(f"cfg_game_version={gv!r}")
+    extra = " ".join(al_bits) if al_bits else "alignment=not_logged_yet"
+    logger.info(
+        "Login phase diagnostics [%s]: n_slots=%d OK=%d PARTL=%d | stagger_effective=%.1fs "
+        "(BOT_UI_FLASH_LAUNCH_STAGGER_SEC=%.1fs; auto min for 8+ slots may apply) | "
+        "AS_dialogs_closed=%d incorrect_version_dialogs=%d | %s",
+        phase,
+        n_slots,
+        ok_n,
+        partl_n,
+        stagger_effective,
+        stagger_from_env,
+        snap.get("actionscript_error_dialogs_closed", 0),
+        snap.get("incorrect_version_dialogs", 0),
+        extra,
+    )
+
+
 def _slot_status_lines(states: list[SlotState], *, title: str = "SLOT STATUS") -> list[str]:
     """Build the same table text as :func:`print_slot_status` (no I/O)."""
     banner = "=" * 110
@@ -600,6 +657,7 @@ def _write_session_report_markdown(
         "PLAYER_LIST_JOIN_LEADER_ONLY",
         "PRE_BAN_ROOM_JOIN_STAGGER_SEC",
         "FLASH_STAGGER_AFTER_LOGIN_SEC",
+        "BAN_QUORUM_REPORTS",
     ):
         try:
             lines.append(f"- **{key}**: `{getattr(cfg, key, '—')}`\n")
@@ -626,15 +684,18 @@ def _write_session_report_markdown(
         lines.append("*(no ban rounds completed this session)*\n\n")
     else:
         lines.append(
-            "| # | Target | OK | Send failed | Skipped | Live @ send | Round s |\n"
-            "|---|--------|----|-------------|---------|-------------|---------|\n"
+            "| # | Target | OK | Send failed | Skipped | Live @ send | Round s | Quorum |\n"
+            "|---|--------|----|-------------|---------|-------------|---------|--------|\n"
         )
         for i, br in enumerate(ban_rounds, 1):
+            q_rep = br.get("quorum_reports", 11)
+            q_ok = br.get("quorum_met", False)
+            q_cell = f"{'met' if q_ok else 'not met'} ({q_rep} typical)"
             lines.append(
                 f"| {i} | `{br.get('target_user', '')}` | {br.get('ok_count', '')} | "
                 f"{br.get('fail_send', '')} | {br.get('skip_count', '')} | "
                 f"{br.get('live_slots_at_send', '')} | "
-                f"{float(br.get('round_seconds', 0) or 0):.1f} |\n"
+                f"{float(br.get('round_seconds', 0) or 0):.1f} | {q_cell} |\n"
             )
         lines.append("\n")
     lines.append("## Final slot status\n\n")
@@ -1168,6 +1229,17 @@ def _retry_partl_slots(
         set_operator_phase("idle")
 
     print_slot_status(states, title="SLOT STATUS AFTER RETRY")
+    try:
+        _sf_retry = float(getattr(cfg, "FLASH_STAGGER_AFTER_LOGIN_SEC", 0.5))
+        _log_login_phase_diagnostics(
+            states,
+            n_slots=len(states),
+            stagger_effective=_effective_flash_stagger_sec(len(states), _sf_retry),
+            stagger_from_env=_sf_retry,
+            phase="after_partl_retry",
+        )
+    except Exception:
+        logger.debug("PARTL retry diagnostics log failed", exc_info=True)
 
 
 def _env_bool(name: str, *, default: bool) -> bool:
@@ -1799,6 +1871,10 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
     """
     /ban on every slot with a **live upstream write path** (MAIN or satellite).
 
+    Transformice normally requires **several distinct /ban reports** in the room (default **11**;
+    configurable via ``BOT_BAN_QUORUM_REPORTS`` — see ``docs/BAN_QUORUM_TRANSFORMICE.md``). The bot
+    warns when live slots or successful sends fall below that threshold.
+
     Default **burst** mode (``BOT_BAN_BURST_MODE``): with 2+ live slots, each ``send_ban_command``
     is scheduled immediately (no long sleeps between), then we await results. That prevents
     later slots from losing MAIN during the old random 1–2s inter-send delay.
@@ -1854,6 +1930,8 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
 
     skipped_no_conn = [s for s in states if s.proxy is not None and not _can_ban(s)]
     inactive = [s for s in states if s.proxy is None]
+    quorum = int(getattr(cfg, "BAN_QUORUM_REPORTS", 11) or 11)
+    quorum = max(1, min(64, quorum))
 
     if skipped_no_conn:
         logger.info(
@@ -1871,6 +1949,15 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
             )
     else:
         logger.info("Ban round: sending from %d slot(s) with live upstream.", len(active))
+
+    if active and len(active) < quorum:
+        logger.warning(
+            "Ban quorum: only %d live slot(s) can send /ban; typical in-room requirement is %d distinct "
+            "reports (BOT_BAN_QUORUM_REPORTS). Target may remain unbanned until more mice /ban — see "
+            "docs/BAN_QUORUM_TRANSFORMICE.md.",
+            len(active),
+            quorum,
+        )
 
     if active:
         order_h = ", ".join(s.label for s in active)
@@ -1969,6 +2056,9 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
         banner,
         f"  BAN RESULTS for {target_user!r}   (OK: {ok_count}  /  send failed: {fail_send}  /  "
         f"skipped: {skip_count}  of {len(results)}; round {total_dt:.1f}s)",
+        f"  Quorum: typical in-room reports needed = {quorum} (BOT_BAN_QUORUM_REPORTS); "
+        f"this round OK sends = {ok_count} — {'meets' if ok_count >= quorum else 'below'} threshold — "
+        f"see docs/BAN_QUORUM_TRANSFORMICE.md",
         banner,
     ]
     for label, ok, reason, dt_ms, kind in results:
@@ -1983,6 +2073,20 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
         print(line, flush=True)
         logger.info(line)
     _flush_log_handlers()
+    quorum_met = ok_count >= quorum
+    if ok_count > 0 and not quorum_met:
+        logger.warning(
+            "Ban quorum: only %d successful /ban send(s); typical in-room requirement is %d (BOT_BAN_QUORUM_REPORTS). "
+            "The sanction may still be pending until enough distinct mice contribute — docs/BAN_QUORUM_TRANSFORMICE.md.",
+            ok_count,
+            quorum,
+        )
+    elif quorum_met:
+        logger.info(
+            "Ban quorum: OK sends (%d) >= configured quorum (%d) — meets typical distinct-report expectation.",
+            ok_count,
+            quorum,
+        )
     logger.info(
         "Ban round complete: target=%r ok=%d send_fail=%d skipped=%d elapsed=%.1fs",
         target_user, ok_count, fail_send, skip_count, total_dt,
@@ -1996,6 +2100,8 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
         "round_seconds": total_dt,
         "burst_mode": burst,
         "live_slots_at_send": live_at_send,
+        "quorum_reports": quorum,
+        "quorum_met": quorum_met,
     }
 
 
@@ -2301,18 +2407,12 @@ def main(argv: list[str] | None = None) -> None:
         # Opening many projectors in quick succession backs up the CPU and TFM; overlapping
         # logins + sat migrations is the primary driver of "early slot PARTL" in large farms
         # (op_hint in logs often fires during this phase — PRE_BAN/leader is for the room phase).
-        stagger_after = _stagger_from_env
-        if n_flash_slots >= 8:
-            # Old cap (3.0) and 0.22* (n-1) were too low for 12–14 clients on one host (mass PARTL).
-            _auto = min(6.5, 0.30 * max(0, n_flash_slots - 1))
-            stagger_after = max(stagger_after, _auto)
-        if n_flash_slots >= 12:
-            stagger_after = max(stagger_after, 3.5)
+        stagger_after = _effective_flash_stagger_sec(n_flash_slots, _stagger_from_env)
         if n_flash_slots >= 8 and stagger_after > _stagger_from_env + 0.01:
             logger.info(
                 "Flash launch: %d slots — post-login delay before opening the next client is %.1fs "
                 "(env BOT_UI_FLASH_LAUNCH_STAGGER_SEC was %.1fs; added automatic minimum for 8+ slots "
-                "to reduce PARTL from overlapping MAIN/flash load; override by raising env above %.1f).",
+                "(0.38*(n-1) capped at 7s, floors 4.25s@12+ and 5s@14+); override by raising env above %.1f).",
                 n_flash_slots,
                 stagger_after,
                 _stagger_from_env,
@@ -2739,13 +2839,26 @@ def main(argv: list[str] | None = None) -> None:
 
     print_slot_status(states, title="SLOT STATUS AFTER LOGIN PHASE")
 
+    if auto_flash:
+        try:
+            _log_login_phase_diagnostics(
+                states,
+                n_slots=n_flash_slots,
+                stagger_effective=stagger_after,
+                stagger_from_env=_stagger_from_env,
+            )
+        except Exception:
+            logger.debug("Login phase diagnostics failed", exc_info=True)
+
     if auto_flash and len(states) >= 4:
         _partl = sum(1 for s in states if _slot_status_label(s)[0] == "PARTL")
         if _partl * 2 >= len(states) and _partl > 0:
             logger.warning(
-                "Login phase: %d/%d PARTL — overlapping Flash/TCP load and ActionScript errors are the usual cause. "
-                "BOT_PRE_BAN + leader-only only affect room join later; raise BOT_UI_FLASH_LAUNCH_STAGGER_SEC or reduce slot count. "
-                "Recurring 'Error de ActionScript' in logs: check loader/SWF and game version.",
+                "Login phase: %d/%d PARTL — primary drivers: (1) many Flash instances + MAIN/sat overlap "
+                "(raise BOT_UI_FLASH_LAUNCH_STAGGER_SEC above the auto floor; see stagger_effective in "
+                "`Login phase diagnostics`); (2) recurring ActionScript / loader-runtime errors "
+                "(fix TFM_PROXY_SWF + TFM_SECRETS_GAME_VERSION; check literal_version_in_swf in diagnostics). "
+                "BOT_PRE_BAN / leader-only apply to room join, not early PARTL.",
                 _partl,
                 len(states),
             )

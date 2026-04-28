@@ -23,10 +23,19 @@ logger = logging.getLogger(__name__)
 
 # Filled by :func:`log_client_asset_alignment` for session reports.
 _last_alignment_md_lines: list[str] = []
+# Compact facts for PARTL / session diagnostics (see :func:`get_last_alignment_summary`).
+_last_alignment_summary: dict[str, object] | None = None
 
 
 def get_last_alignment_report_md() -> list[str]:
     return list(_last_alignment_md_lines)
+
+
+def get_last_alignment_summary() -> dict[str, object] | None:
+    """Return a copy of the last loader scan summary, or ``None`` if alignment was not logged."""
+    if _last_alignment_summary is None:
+        return None
+    return dict(_last_alignment_summary)
 
 
 def _bool_env(name: str) -> bool:
@@ -97,7 +106,7 @@ def log_client_asset_alignment(repo_root: Path) -> None:
     Log Flash exe + loader SWF paths, SWF format, and whether ``TFM_SECRETS_GAME_VERSION`` matches
     embedded loader hints. Populates :data:`_last_alignment_md_lines` for session reports.
     """
-    global _last_alignment_md_lines
+    global _last_alignment_md_lines, _last_alignment_summary
     flash, swf = resolve_flash_paths(repo_root)
     gv_raw = (os.environ.get("TFM_SECRETS_GAME_VERSION") or "").strip()
     cfg_gvi = _config_game_version_int(gv_raw)
@@ -121,6 +130,11 @@ def log_client_asset_alignment(repo_root: Path) -> None:
         )
         lines_md.append("- **scan**: loader file missing\n\n")
         _last_alignment_md_lines = lines_md
+        _last_alignment_summary = {
+            "loader_present": False,
+            "swf_path": str(swf),
+            "tfm_secrets_game_version": gv_raw or None,
+        }
         return
 
     try:
@@ -129,6 +143,12 @@ def log_client_asset_alignment(repo_root: Path) -> None:
         logger.error("Client/asset alignment: cannot read %s (%s)", swf, e)
         lines_md.append(f"- **scan**: read error `{e}`\n\n")
         _last_alignment_md_lines = lines_md
+        _last_alignment_summary = {
+            "loader_present": True,
+            "read_error": str(e),
+            "swf_path": str(swf),
+            "tfm_secrets_game_version": gv_raw or None,
+        }
         return
 
     scanned = _swf_scan_payload(raw)
@@ -167,7 +187,20 @@ def log_client_asset_alignment(repo_root: Path) -> None:
         flash.name if flash.is_file() else str(flash),
     )
 
-    if cfg_gvi is not None and urlish and _strict_mismatch(cfg_gv=cfg_gvi, urlish=urlish):
+    mismatch_url = bool(cfg_gvi is not None and urlish and _strict_mismatch(cfg_gv=cfg_gvi, urlish=urlish))
+    _last_alignment_summary = {
+        "loader_present": True,
+        "swf_name": swf.name,
+        "tfm_secrets_game_version": gv_raw or None,
+        "tfm_secrets_game_version_int": cfg_gvi,
+        "literal_version_bytes_in_swf_payload": literal_substrings,
+        "url_style_version_hints": list(urlish) if urlish else [],
+        "url_hints_strict_mismatch_vs_config": mismatch_url,
+        "scanner_tag": tag,
+        "payload_bytes": len(body),
+    }
+
+    if mismatch_url:
         msg = (
             f"Client/asset alignment MISMATCH: TFM_SECRETS_GAME_VERSION={cfg_gvi} but loader embeds "
             f"{urlish} (swf=r / gameversion-style strings). Update the loader SWF and/or re-dump secrets "
@@ -194,3 +227,4 @@ def log_client_asset_alignment(repo_root: Path) -> None:
 
     lines_md.append("\n")
     _last_alignment_md_lines = lines_md
+

@@ -60,6 +60,30 @@ def as_error_dismiss_session_snapshot() -> dict[str, int]:
         }
 
 
+def _flash_error_dismiss_verbose_info_cap() -> int:
+    """First N closes per session at INFO; later duplicates at DEBUG (set 0 → always DEBUG except incorrect-version)."""
+    try:
+        raw = (os.environ.get("FLASH_ERROR_DISMISS_VERBOSE_INFO_CAP") or "").strip()
+        cap = int(raw or "12")
+    except ValueError:
+        cap = 12
+    if cap <= 0:
+        return 0
+    return max(3, min(250, cap))
+
+
+def _as_dismiss_log_closed(
+    *,
+    incorrect_version: bool,
+    sess_tot: int,
+    fmt: str,
+    args: tuple[object, ...],
+) -> None:
+    cap = _flash_error_dismiss_verbose_info_cap()
+    verbose = incorrect_version or (cap > 0 and sess_tot <= cap)
+    (logger.info if verbose else logger.debug)(fmt, *args)
+
+
 def _flash_ui_lock(pid: int) -> threading.Lock:
     with _flash_ui_locks_mutex:
         if pid not in _flash_ui_locks:
@@ -1558,13 +1582,26 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
             sess_tot, sess_bad = _record_as_dismiss_close(
                 incorrect_version=looks_like_incorrect_version,
             )
-            logger.info(
-                "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (method=BM_CLICK "
-                "ranked button %r rank=%s) area=%d title=%r body=%r "
-                "| session_total=%d incorrect_version_total=%d",
-                slot_label, pid, top, best_lbl, best_rank, area,
-                (title or "")[:80], (body_text or "")[:240],
-                sess_tot, sess_bad,
+            _as_dismiss_log_closed(
+                incorrect_version=looks_like_incorrect_version,
+                sess_tot=sess_tot,
+                fmt=(
+                    "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (method=BM_CLICK "
+                    "ranked button %r rank=%s) area=%d title=%r body=%r "
+                    "| session_total=%d incorrect_version_total=%d"
+                ),
+                args=(
+                    slot_label,
+                    pid,
+                    top,
+                    best_lbl,
+                    best_rank,
+                    area,
+                    (title or "")[:80],
+                    (body_text or "")[:240],
+                    sess_tot,
+                    sess_bad,
+                ),
             )
             if looks_like_incorrect_version:
                 logger.warning(
@@ -1588,13 +1625,24 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                 sess_tot, sess_bad = _record_as_dismiss_close(
                     incorrect_version=looks_like_incorrect_version,
                 )
-                logger.info(
-                    "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (method=BM_CLICK "
-                    "exact label %r) area=%d body=%r "
-                    "| session_total=%d incorrect_version_total=%d",
-                    slot_label, pid, top, txt.value.strip(), area,
-                    (body_text or "")[:240],
-                    sess_tot, sess_bad,
+                _as_dismiss_log_closed(
+                    incorrect_version=looks_like_incorrect_version,
+                    sess_tot=sess_tot,
+                    fmt=(
+                        "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (method=BM_CLICK "
+                        "exact label %r) area=%d body=%r "
+                        "| session_total=%d incorrect_version_total=%d"
+                    ),
+                    args=(
+                        slot_label,
+                        pid,
+                        top,
+                        txt.value.strip(),
+                        area,
+                        (body_text or "")[:240],
+                        sess_tot,
+                        sess_bad,
+                    ),
                 )
                 if looks_like_incorrect_version:
                     logger.warning(
@@ -1615,12 +1663,15 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                     sess_tot, sess_bad = _record_as_dismiss_close(
                         incorrect_version=looks_like_incorrect_version,
                     )
-                    logger.info(
-                        "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (buttons present "
-                        "but no match; method=Escape + WM_CLOSE) area=%d "
-                        "| session_total=%d incorrect_version_total=%d",
-                        slot_label, pid, top, area,
-                        sess_tot, sess_bad,
+                    _as_dismiss_log_closed(
+                        incorrect_version=looks_like_incorrect_version,
+                        sess_tot=sess_tot,
+                        fmt=(
+                            "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (buttons present "
+                            "but no match; method=Escape + WM_CLOSE) area=%d "
+                            "| session_total=%d incorrect_version_total=%d"
+                        ),
+                        args=(slot_label, pid, top, area, sess_tot, sess_bad),
                     )
                     clicked += 1
                 elif adobe_err and not use_wmclose:

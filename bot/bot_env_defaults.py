@@ -103,19 +103,21 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_CASEUS_GIT_PIP_SPEC": "caseus @ git+https://github.com/friedkeenan/caseus.git",
     "BOT_PIP_INSTALL_TFM_SECRETS_CLI": "false",
     "BOT_TFM_SECRETS_PIP_INSTALL_SPEC": "",
+    # Typical in-game quorum for a room ban (distinct reports); warn when live sends drop below — docs/BAN_QUORUM_TRANSFORMICE.md
+    "BOT_BAN_QUORUM_REPORTS": "11",
     "BOT_RETRY_FAILED_SLOTS": "true",
     "BOT_RETRY_MAX_ATTEMPTS": "3",
     # Shorter waits = snappier PARTL recovery (was 3.0 / 2.0; raise slightly if retries stampede OK slots).
     "BOT_RETRY_DELAY_SEC": "1.25",
     "BOT_RETRY_LOGIN_TIMEOUT_SEC": "120.0",
-    "BOT_RETRY_BETWEEN_SLOT_SEC": "1.0",
+    "BOT_RETRY_BETWEEN_SLOT_SEC": "2.0",
     "BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_PASSES": "3",
     "BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_DELAY_SEC": "0.4",
     "BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_LEAD_SEC": "1.0",
     "BOT_UI_AUTO_LAUNCH_FLASH": "true",
     "BOT_UI_FLASH_PLAYER_PATH": "",
     # Slightly higher default spreads Flash/CPU load (fewer PARTL → less time in retry). Override down if you accept more failures.
-    "BOT_UI_FLASH_LAUNCH_STAGGER_SEC": "1.5",
+    "BOT_UI_FLASH_LAUNCH_STAGGER_SEC": "2.5",
     "BOT_UI_SEQUENTIAL_LOGIN": "false",
     "BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC": "120",
     "BOT_FLASH_AUTO_LOGIN_UI": "false",
