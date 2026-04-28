@@ -141,6 +141,8 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_PROXY_LOG_BIND_DETAIL": "false",
     "BOT_PROXY_MAIN_CLOSE_DIAG": "true",
     "BOT_PROXY_MAIN_CLOSE_VERBOSE": "false",
+    # Extra tcp_side_guess + sess_counts on MAIN close (set false to shorten lines).
+    "BOT_PROXY_MAIN_RC_HINT": "true",
 }
 
 

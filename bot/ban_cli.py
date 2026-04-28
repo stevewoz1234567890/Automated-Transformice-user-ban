@@ -490,8 +490,8 @@ def _slot_status_label(s: SlotState) -> tuple[str, str]:
         diag = getattr(s.proxy, "_main_last_close_diag", None) or ""
         ds = str(diag).strip()
         if ds and ds != "no_extra_pattern":
-            if len(ds) > 100:
-                ds = ds[:97] + "..."
+            if len(ds) > 240:
+                ds = ds[:237] + "..."
             return ("PARTL", f"{base} | {ds}")
         return ("PARTL", base)
     return ("OK   ", "ready")

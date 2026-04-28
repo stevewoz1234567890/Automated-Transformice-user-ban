@@ -44,6 +44,8 @@ _as_dismiss_incorrect_version_total = 0
 _as_dismiss_unique_fp_total = 0
 _as_dismiss_seen_fp: set[str] = set()
 _as_dismiss_stats_lock = threading.Lock()
+# Same AS error body dismissed again (session): milestone logs for root-cause persistence.
+_as_fp_repeat_in_session: dict[str, int] = {}
 
 
 def _record_as_dismiss_close(*, incorrect_version: bool) -> tuple[int, int]:
@@ -130,6 +132,20 @@ def _maybe_log_first_seen_as_fingerprint(
     fp = hashlib.sha256(norm.encode("utf-8", errors="replace")).hexdigest()[:16]
     with _as_dismiss_stats_lock:
         if fp in _as_dismiss_seen_fp:
+            _as_fp_repeat_in_session[fp] = _as_fp_repeat_in_session.get(fp, 0) + 1
+            rpt = _as_fp_repeat_in_session[fp]
+            # Same underlying ActionScript fault still firing — dismiss spam will not fix it.
+            if rpt in (5, 15, 40, 100, 200, 500):
+                logger.warning(
+                    "ActionScript error duplicate #%d fingerprint=%s slot=%s pid=%s hwnd=%s — "
+                    "same dialog body repeating; prioritize TFM_PROXY_SWF / game version alignment, "
+                    "not higher dismiss cadence",
+                    rpt,
+                    fp,
+                    slot_label,
+                    pid,
+                    hwnd,
+                )
             return
         _as_dismiss_seen_fp.add(fp)
         _as_dismiss_unique_fp_total = len(_as_dismiss_seen_fp)

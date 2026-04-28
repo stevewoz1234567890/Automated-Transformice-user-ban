@@ -361,6 +361,12 @@ class BanBotProxy(Proxy):
         self._main_session_last_change_sat_mono: float | None = None
         self._main_session_join_mono: float | None = None
         self._main_session_join_name: str = ""
+        # Monotonic per Flash↔proxy MAIN TCP accept (each reconnect increments). Grep ``main_tcp#7``.
+        self._main_tcp_generation: int = 0
+        # Per MAIN session (reset on each new_main_connection): counts for root-cause hints.
+        self._main_sess_ping_srv: int = 0
+        self._main_sess_pong_cli: int = 0
+        self._main_sess_anticheat_cli: int = 0
         # Last close summary for slot-status / grep (set in new_main_connection finally).
         self._main_last_close_diag: str | None = None
         # Cumulative (optional): last join seen on this proxy process.
@@ -638,8 +644,15 @@ class BanBotProxy(Proxy):
         # ServerConnection source. ClientConnections deliver serverbound.
         if isinstance(packet, ServerboundPacket):
             buf = self._main_recent_from_client
+            tn = type(packet).__name__
+            if tn == "PongPacket":
+                self._main_sess_pong_cli += 1
+            elif "Anticheat" in tn:
+                self._main_sess_anticheat_cli += 1
         else:
             buf = self._main_recent_from_server
+            if type(packet).__name__ == "PingPacket":
+                self._main_sess_ping_srv += 1
         buf.append((now, label))
         if len(buf) > self._MAIN_RECENT_LIMIT:
             del buf[: len(buf) - self._MAIN_RECENT_LIMIT]
@@ -911,6 +924,26 @@ class BanBotProxy(Proxy):
         # Allow FLASH main_tcp UI hook to run again on the next first MAIN (non-packet path).
         self._first_main_hook_done = False
 
+    def _tcp_close_side_guess(self) -> str:
+        """
+        Heuristic label for *which side likely initiated TCP teardown* (not proof).
+        Pairs with ``last_io=`` on the same diagnostic line.
+        """
+        li = self._last_main_io_hint()
+        if "server_newest" in li:
+            return "server_last_packet_newest_infer_server_closed_or_idle_kick"
+        if "client_newest" in li:
+            return "client_last_packet_newest_infer_flash_closed_or_AS_crash"
+        if "server_only" in li:
+            return "only_server_samples_unusual"
+        if "client_only" in li:
+            return "only_client_samples_unusual"
+        if "tie" in li:
+            return "timestamps_tie_use_srv_cli_buffers"
+        if "unknown" in li:
+            return "no_packet_samples"
+        return "ambiguous"
+
     def _last_main_io_hint(self) -> str:
         """Which direction saw the newest MAIN packet before close (heuristic for who went quiet last)."""
         srv = self._main_recent_from_server
@@ -945,6 +978,7 @@ class BanBotProxy(Proxy):
         a short ``note=`` line: login batch vs room-phase tuning (``PRE_BAN`` is for room
         join, not sequential Flash opens)."""
         parts: list[str] = []
+        parts.append("main_tcp#=%d" % getattr(self, "_main_tcp_generation", 0))
         parts.append("phase=%s" % get_operator_phase())
         parts.append(self._last_main_io_hint())
         srv = [n for _, n in self._main_recent_from_server]
@@ -985,6 +1019,36 @@ class BanBotProxy(Proxy):
                 "note=clean_eof:login_often=FLASH_STAGGER+AS;room_often=PRE_BAN+leader_not_for_login_batch"
             )
 
+        rc_on = (
+            os.environ.get("BOT_PROXY_MAIN_RC_HINT", "1").strip().lower()
+            not in ("0", "false", "no", "off", "")
+        )
+        if rc_on:
+            parts.append("tcp_side_guess=%s" % self._tcp_close_side_guess())
+            parts.append(
+                "sess_counts=srv_ping:%d cli_pong:%d cli_anticheat_like:%d "
+                "proxy_pong_SENT_main:%d keepalive_SENT_main:%d"
+                % (
+                    getattr(self, "_main_sess_ping_srv", 0),
+                    getattr(self, "_main_sess_pong_cli", 0),
+                    getattr(self, "_main_sess_anticheat_cli", 0),
+                    getattr(self, "_auto_pong_sent_main", 0),
+                    getattr(self, "_keepalive_sent_main", 0),
+                ),
+            )
+            if (
+                getattr(self, "_packet_auto_login", False)
+                and since_login is not None
+                and since_login >= 5.0
+                and getattr(self, "_main_sess_ping_srv", 0) >= 2
+                and getattr(self, "_auto_pong_sent_main", 0) == 0
+            ):
+                parts.append(
+                    "rc_CRITICAL=packets_auto_login_but_zero_proxy_PONG_check_BOT_AUTO_PONG_MAIN"
+                )
+            if getattr(self, "_main_sess_anticheat_cli", 0) > 120 and alive_sec < 180:
+                parts.append("rc_note=heavy_anticheat_traffic_seen_in_other_logs_to_match_AC_kicks")
+
         return " | ".join(parts)
 
     async def new_main_connection(self, client_reader, client_writer):
@@ -1000,11 +1064,13 @@ class BanBotProxy(Proxy):
             time.monotonic() - self._startup_mono if self._startup_mono is not None else None
         )
         logger.info(
-            "Slot %s: MAIN TCP accept from %r (proxy port %s, +%.2fs after listen) — game/loader reached this slot",
+            "Slot %s: MAIN TCP accept from %r (proxy port %s, +%.2fs after listen) "
+            "main_tcp#=%d — game/loader reached this slot",
             self.slot_label,
             peer,
             self.host_main_port,
             since_startup if since_startup is not None else 0.0,
+            getattr(self, "_main_tcp_generation", 0),
         )
         if self._on_main_tcp_accepted is not None:
             try:
@@ -1065,6 +1131,10 @@ class BanBotProxy(Proxy):
         self._main_session_last_change_sat_mono = None
         self._main_session_join_mono = None
         self._main_session_join_name = ""
+        self._main_tcp_generation += 1
+        self._main_sess_ping_srv = 0
+        self._main_sess_pong_cli = 0
+        self._main_sess_anticheat_cli = 0
         close_reason = "clean-eof"
         close_exc: BaseException | None = None
         try:
@@ -1105,13 +1175,14 @@ class BanBotProxy(Proxy):
                 return ",".join(f"-{now_local - ts:.1f}s:{name}" for ts, name in buf)
 
             lvl(
-                "Slot %s: MAIN session ended alive=%.1fs login+%ss reason=%s "
+                "Slot %s: MAIN session ended alive=%.1fs login+%ss reason=%s main_tcp#=%d "
                 "(pongs_main=%d pongs_sat=%d ka=%d main_clients_now=%d sat_clients_now=%d)%s "
                 "operator_phase=%s srv→last=[%s] cli→last=[%s]",
                 self.slot_label,
                 alive_sec,
                 f"{since_login:.1f}" if since_login is not None else "n/a",
                 close_reason,
+                getattr(self, "_main_tcp_generation", 0),
                 self._auto_pong_sent_main,
                 self._auto_pong_sent_satellite,
                 self._keepalive_sent_main,
