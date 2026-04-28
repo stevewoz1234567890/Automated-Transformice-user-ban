@@ -164,7 +164,7 @@ TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE=aabbccdd...
 .\venv\Scripts\python.exe build_exe.py
 ```
 
-Writes `ban_bot.exe` to the repo root. Run it from that folder so `.env` is next to the exe. Logs go to `log.txt` in the same folder.
+Writes `ban_bot.exe` to the repo root. Run it from that folder so `.env` is next to the exe. Session logs append to `log.txt` in the same folder.
 
 ---
 
@@ -182,7 +182,9 @@ Writes `ban_bot.exe` to the repo root. Run it from that folder so `.env` is next
 | `TFMProxyLoader.swf` | Patched loader SWF that connects Flash to the local proxy |
 | `ban_bot.spec`, `build_exe.py` | Build config for `ban_bot.exe` |
 | `requirements.txt` | Python dependencies |
-| `log.txt` | Session log (appended on each run) |
+| `log.txt` | Session log (append each run; repo root next to `.env`) |
+| `logs/` | Markdown **reports** only (`yyyy-mm-dd-HH-mm_HH-mm.md`; session `log.txt` stays in repo root) |
+| `logs/2026-04-28-11-08_11-25.md` | Example log report (filename = **yyyy-mm-dd-HH-mm** start → **_HH-mm** end) |
 
 ---
 

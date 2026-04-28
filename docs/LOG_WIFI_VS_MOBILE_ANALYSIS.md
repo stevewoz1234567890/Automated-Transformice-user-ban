@@ -31,3 +31,5 @@ Comparison of two runs with the same upstream preflight (`51.38.60.113:12801` OK
 ## Code fix (this repo)
 
 - **`login_aborted_event`** on each slot: set when a MAIN session ends while `LoginSuccess` has not fired, so initial login and PARTL **retry** waits exit quickly instead of misleading `MAIN_TCP=yes` spin until `BOT_RETRY_LOGIN_TIMEOUT_SEC`.
+
+Companion report (start/end time in filename `yyyy-mm-dd-HH-mm_HH-mm`): [`logs/2026-04-28-11-08_11-25.md`](../logs/2026-04-28-11-08_11-25.md).
