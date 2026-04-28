@@ -510,6 +510,82 @@ def _effective_flash_stagger_sec(n_slots: int, stagger_from_env: float) -> float
     return stagger_after
 
 
+def _extract_phase_from_main_diag(diag: str | None) -> str:
+    """Parse ``phase=`` from MAIN close diagnostic (grep-friendly aggregate)."""
+    if not diag:
+        return "?"
+    for part in diag.split("|"):
+        part_st = part.strip()
+        if part_st.startswith("phase="):
+            return part_st.split("=", 1)[1].strip() or "?"
+    return "?"
+
+
+def _fmt_counter_short(c: Counter, *, limit: int = 8) -> str:
+    if not c:
+        return "(none)"
+    return ";".join(f"{k}:{v}" for k, v in c.most_common(limit))
+
+
+def _partl_aggregate_line(states: list[SlotState]) -> str:
+    """
+    One-line histogram of **PARTL** rows: close reason × operator_phase at MAIN end.
+    Compare across ``Login phase diagnostics`` vs session reports under ``logs/``.
+    """
+    reasons: Counter[str] = Counter()
+    phases: Counter[str] = Counter()
+    n = 0
+    for s in states:
+        if _slot_status_label(s)[0] != "PARTL":
+            continue
+        n += 1
+        p = s.proxy
+        if p is None:
+            reasons["no_proxy"] += 1
+            continue
+        rr = getattr(p, "_main_last_close_reason", None)
+        reasons[str(rr) if rr is not None else "unknown_reason"] += 1
+        diag = getattr(p, "_main_last_close_diag", None) or ""
+        phases[_extract_phase_from_main_diag(diag)] += 1
+    if n <= 0:
+        return ""
+    return (
+        f"n_PARTL={n} close_reason[{_fmt_counter_short(reasons)}] "
+        f"phase_at_MAIN_end[{_fmt_counter_short(phases)}]"
+    )
+
+
+def _last_main_close_aggregate_line(states: list[SlotState]) -> str:
+    """
+    Histogram over **all** slots with a proxy — for upstream-dead snapshots when every
+    slot lost its writer (helps compare severity vs prior ``logs/*.md`` reports).
+    """
+    reasons: Counter[str] = Counter()
+    phases: Counter[str] = Counter()
+    missing = 0
+    for s in states:
+        p = s.proxy
+        if p is None:
+            missing += 1
+            continue
+        rr = getattr(p, "_main_last_close_reason", None)
+        if rr is None:
+            reasons["no_logged_close_yet"] += 1
+            continue
+        reasons[str(rr)] += 1
+        diag = getattr(p, "_main_last_close_diag", None) or ""
+        phases[_extract_phase_from_main_diag(diag)] += 1
+    bits: list[str] = [_fmt_counter_short(reasons), _fmt_counter_short(phases)]
+    if missing:
+        bits.append(f"no_proxy={missing}")
+    if not reasons and missing == len(states):
+        return "no proxy on any slot"
+    return (
+        "last_MAIN_close_reason[" + bits[0] + "] phase_at_MAIN_end[" + bits[1] + "]"
+        + ((" | " + bits[2]) if len(bits) > 2 else "")
+    )
+
+
 def _log_login_phase_diagnostics(
     states: list[SlotState],
     *,
@@ -556,6 +632,9 @@ def _log_login_phase_diagnostics(
         snap.get("incorrect_version_dialogs", 0),
         extra,
     )
+    agg = _partl_aggregate_line(states)
+    if partl_n > 0 and agg:
+        logger.info("Login phase PARTL aggregate [%s]: %s", phase, agg)
 
 
 def _slot_status_lines(states: list[SlotState], *, title: str = "SLOT STATUS") -> list[str]:
@@ -661,6 +740,7 @@ def _write_session_report_markdown(
         "PLAYER_LIST_JOIN_LEADER_ONLY",
         "PRE_BAN_ROOM_JOIN_STAGGER_SEC",
         "FLASH_STAGGER_AFTER_LOGIN_SEC",
+        "UPSTREAM_WAIT_SEC",
         "BAN_QUORUM_REPORTS",
     ):
         try:
@@ -686,6 +766,25 @@ def _write_session_report_markdown(
     lines.append(
         f"- **Incorrect-version dialog bodies (tracked)**: `{_as_snap['incorrect_version_dialogs']}`\n\n"
     )
+    agg_end = _partl_aggregate_line(states)
+    lines.append("## PARTL / MAIN close aggregate (report time)\n\n")
+    if agg_end:
+        lines.append(f"- **Histogram**: `{agg_end}`\n")
+        lines.append(
+            "- **`close_reason`**: last MAIN TCP teardown label from the proxy; dominant **`clean-eof`** matches "
+            "sessions in `logs/*` reports (stagger/AS/load).\n"
+        )
+        lines.append(
+            "- `phase_at_MAIN_end`: `get_operator_phase()` when MAIN closed (**`as_sweep`** correlates "
+            "with ActionScript dismiss pass in some sessions — compare `logs/` session reports).\n\n"
+        )
+    else:
+        lines.append("*No PARTL slots at report time.*\n\n")
+
+    snap_line = _last_main_close_aggregate_line(states)
+    if snap_line:
+        lines.append(f"## Last MAIN close — all slots (histogram)\n\n- `{snap_line}`\n\n")
+
     lines.append("\n## Ban rounds\n\n")
     if not ban_rounds:
         lines.append("*(no ban rounds completed this session)*\n\n")
@@ -1277,6 +1376,23 @@ def _log_upstream_dead_snapshot(states: list[SlotState], purpose: str) -> None:
         purpose,
         len(states),
     )
+    agg = _last_main_close_aggregate_line(states)
+    if agg:
+        logger.warning("Upstream dead snapshot aggregate (%s): %s", purpose, agg)
+        ce = sum(
+            1
+            for s in states
+            if s.proxy and getattr(s.proxy, "_main_last_close_reason", None) == "clean-eof"
+        )
+        if ce >= max(3, len(states) // 2):
+            logger.warning(
+                "Upstream hint (%s): %d/%s last closes are clean-eof — typical mix: stagger/AS/load "
+                "during login (**FIX_TFM_LOADER** / raise BOT_UI_FLASH_LAUNCH_STAGGER_SEC); "
+                "BOT_PRE_BAN_* only affects room phase.",
+                purpose,
+                ce,
+                len(states),
+            )
     for s in states:
         p = s.proxy
         if p is None:
@@ -1337,6 +1453,18 @@ def _wait_for_upstream_slots(
         if states:
             _log_upstream_dead_snapshot(states, purpose)
         return live
+    ok_tab = sum(1 for s in states if _slot_status_label(s)[0] == "OK   ")
+    partl_tab = sum(1 for s in states if _slot_status_label(s)[0] == "PARTL")
+    logger.info(
+        "Upstream wait: begin — purpose=%s | live_MAIN_or_sat_writes=0/%d "
+        "| table_OK=%d table_PARTL=%d | max_wait=%.0fs (**OK** slots can still lack a writer "
+        "if MAIN already closed).",
+        purpose,
+        len(states),
+        ok_tab,
+        partl_tab,
+        max_wait_sec,
+    )
     deadline = time.monotonic() + max_wait_sec
     t0 = time.monotonic()
     next_log = t0 + 2.0
@@ -1532,6 +1660,8 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
         delay,
         lead_sec,
     )
+    ok_before = sum(1 for s in states if _slot_status_label(s)[0] == "OK   ")
+    partl_before = sum(1 for s in states if _slot_status_label(s)[0] == "PARTL")
     if lead_sec:
         time.sleep(lead_sec)
     total = 0
@@ -1550,6 +1680,8 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
                 logger.debug("post-login sweep: slot %s failed", s.label, exc_info=True)
             finally:
                 flash_launch.release_flash_ui(pid)
+    ok_after = sum(1 for s in states if _slot_status_label(s)[0] == "OK   ")
+    partl_after = sum(1 for s in states if _slot_status_label(s)[0] == "PARTL")
     if total:
         logger.info(
             "ActionScript error dismiss: post-login sweep finished — closed or clicked %d "
@@ -1560,6 +1692,24 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
         logger.info(
             "ActionScript error dismiss: post-login sweep finished — no extra dialogs to close "
             "(already handled during login, or no ActionScript popups).",
+        )
+    logger.info(
+        "ActionScript sweep health: table OK %d -> %d | PARTL %d -> %d (dialogs closed=%d)",
+        ok_before,
+        ok_after,
+        partl_before,
+        partl_after,
+        total,
+    )
+    if ok_after < ok_before or partl_after > partl_before:
+        logger.warning(
+            "ActionScript sweep: slot health worsened after dismiss (OK %d -> %d, PARTL %d -> %d). "
+            "Check WARNINGs with operator_phase=as_sweep; prefer fixing TFM_PROXY_SWF / secrets "
+            "over relying on sweep alone.",
+            ok_before,
+            ok_after,
+            partl_before,
+            partl_after,
         )
 
 
