@@ -38,6 +38,8 @@ from colorama import init as colorama_init
 from .ban_proxy import (
     BanBotProxy,
     ensure_flash_trust_config,
+    get_operator_phase,
+    set_operator_phase,
     start_shared_flash_socket_policy_thread,
 )
 from . import flash_launch
@@ -923,126 +925,130 @@ def _retry_partl_slots(
             between_slot,
         )
 
-    # Map slot label -> raw account row so we can rebuild flash_row each attempt.
-    row_by_label: dict[str, dict] = {}
-    for row in raw_accounts:
-        lbl = str(row.get("label", "") or "").strip()
-        if lbl:
-            row_by_label[lbl] = row
+    set_operator_phase("partl_retry")
+    try:
+        # Map slot label -> raw account row so we can rebuild flash_row each attempt.
+        row_by_label: dict[str, dict] = {}
+        for row in raw_accounts:
+            lbl = str(row.get("label", "") or "").strip()
+            if lbl:
+                row_by_label[lbl] = row
 
-    spares = _load_global_spare_bind_ips()
-    used_ips_global: set[str] = {
-        s.current_bind_ip for s in states if s.current_bind_ip
-    }
-    # Track which spare IPs have been issued so the same one doesn't get
-    # handed to two failing slots in the same pass.
-    used_spares: set[str] = set()
+        spares = _load_global_spare_bind_ips()
+        used_ips_global: set[str] = {
+            s.current_bind_ip for s in states if s.current_bind_ip
+        }
+        # Track which spare IPs have been issued so the same one doesn't get
+        # handed to two failing slots in the same pass.
+        used_spares: set[str] = set()
 
-    for round_num in range(1, max_attempts + 1):
-        partl_slots = [s for s in states if _slot_status_label(s)[0] == "PARTL"]
-        if not partl_slots:
-            logger.info("Retry: no PARTL slot remaining — relaunch loop done.")
-            return
-        eligible = [s for s in partl_slots if s.attempts_used < max_attempts]
-        if not eligible:
+        for round_num in range(1, max_attempts + 1):
+            partl_slots = [s for s in states if _slot_status_label(s)[0] == "PARTL"]
+            if not partl_slots:
+                logger.info("Retry: no PARTL slot remaining — relaunch loop done.")
+                return
+            eligible = [s for s in partl_slots if s.attempts_used < max_attempts]
+            if not eligible:
+                logger.info(
+                    "Retry: round %d — %d PARTL slot(s) remain but all hit BOT_RETRY_MAX_ATTEMPTS=%d; giving up.",
+                    round_num, len(partl_slots), max_attempts,
+                )
+                break
             logger.info(
-                "Retry: round %d — %d PARTL slot(s) remain but all hit BOT_RETRY_MAX_ATTEMPTS=%d; giving up.",
-                round_num, len(partl_slots), max_attempts,
+                "Retry round %d/%d: relaunching %d PARTL slot(s) %s%s",
+                round_num,
+                max_attempts,
+                len(eligible),
+                [s.label for s in eligible],
+                f" (global spares left: {len(spares)})" if spares else "",
             )
-            break
-        logger.info(
-            "Retry round %d/%d: relaunching %d PARTL slot(s) %s%s",
-            round_num,
-            max_attempts,
-            len(eligible),
-            [s.label for s in eligible],
-            f" (global spares left: {len(spares)})" if spares else "",
-        )
 
-        for ei, st in enumerate(eligible):
-            row = row_by_label.get(st.label)
-            if row is None:
-                logger.warning(
-                    "Retry: slot %s has no matching account row — skipping.", st.label,
-                )
-                continue
+            for ei, st in enumerate(eligible):
+                row = row_by_label.get(st.label)
+                if row is None:
+                    logger.warning(
+                        "Retry: slot %s has no matching account row — skipping.", st.label,
+                    )
+                    continue
 
-            new_ip = _pick_next_bind_ip_for_retry(st, used_spares | used_ips_global)
-            if new_ip:
-                logger.info(
-                    "Retry: slot %s switching bind_ip %r -> %r (attempt %d/%d)",
-                    st.label, st.current_bind_ip or "(none)", new_ip,
-                    st.attempts_used + 1, max_attempts,
-                )
-                # Free the old IP so it can be reused by a later round; keep
-                # the new one out of the global eligible set for the rest of
-                # this pass.
-                used_ips_global.discard(st.current_bind_ip)
-                st.current_bind_ip = new_ip
-                used_ips_global.add(new_ip)
-            else:
-                logger.info(
-                    "Retry: slot %s no fresh bind_ip available — relaunching with current %r (attempt %d/%d)",
-                    st.label, st.current_bind_ip or "(none)",
-                    st.attempts_used + 1, max_attempts,
-                )
+                new_ip = _pick_next_bind_ip_for_retry(st, used_spares | used_ips_global)
+                if new_ip:
+                    logger.info(
+                        "Retry: slot %s switching bind_ip %r -> %r (attempt %d/%d)",
+                        st.label, st.current_bind_ip or "(none)", new_ip,
+                        st.attempts_used + 1, max_attempts,
+                    )
+                    # Free the old IP so it can be reused by a later round; keep
+                    # the new one out of the global eligible set for the rest of
+                    # this pass.
+                    used_ips_global.discard(st.current_bind_ip)
+                    st.current_bind_ip = new_ip
+                    used_ips_global.add(new_ip)
+                else:
+                    logger.info(
+                        "Retry: slot %s no fresh bind_ip available — relaunching with current %r (attempt %d/%d)",
+                        st.label, st.current_bind_ip or "(none)",
+                        st.attempts_used + 1, max_attempts,
+                    )
 
-            _close_flash_for_slot_retry(st, cfg)
-            _reset_slot_state_for_retry(st)
-            if retry_delay > 0:
-                time.sleep(retry_delay)
-
-            flash_row = _build_flash_row_for_retry(
-                raw_row=row, st=st,
-                shared_flash_policy_port=shared_flash_policy_port,
-            )
-            try:
-                proc = flash_launch.launch_one_flash_loader(
-                    flash_row,
-                    root=_repo_root(),
-                    click_transformice=not args.launch_flash_no_click,
-                    on_flash_pid=lambda pid, _st=st: setattr(_st, "flash_pid", pid),
-                    post_open_delay_sec=float(
-                        getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
-                    ),
-                )
-            except Exception:
-                logger.exception(
-                    "Retry: slot %s — launch_one_flash_loader raised; skipping this attempt.",
-                    st.label,
-                )
-                st.attempts_used += 1
-                continue
-
-            if proc is None:
-                logger.warning(
-                    "Retry: slot %s — Flash launcher returned no process; counting attempt and moving on.",
-                    st.label,
-                )
-                st.attempts_used += 1
-                continue
-
-            st.flash_loader_ready_event.set()
-            ok = _wait_for_login_simple(st, retry_login_timeout)
-            st.attempts_used += 1
-            if ok:
-                tag, _ = _slot_status_label(st)
-                logger.info(
-                    "Retry: slot %s — relaunch login %s (status=%s, attempt %d/%d)",
-                    st.label,
-                    "succeeded" if tag == "OK   " else "succeeded (still PARTL — server kicked again)",
-                    tag.strip(), st.attempts_used, max_attempts,
-                )
-            else:
-                logger.warning(
-                    "Retry: slot %s — no LoginSuccess within %.0fs (attempt %d/%d).",
-                    st.label, retry_login_timeout, st.attempts_used, max_attempts,
-                )
-                # Close the Flash window we just opened so the next round (or
-                # the caller's eventual cleanup) starts from a clean slate.
                 _close_flash_for_slot_retry(st, cfg)
-            if between_slot > 0 and ei + 1 < len(eligible):
-                time.sleep(between_slot)
+                _reset_slot_state_for_retry(st)
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
+
+                flash_row = _build_flash_row_for_retry(
+                    raw_row=row, st=st,
+                    shared_flash_policy_port=shared_flash_policy_port,
+                )
+                try:
+                    proc = flash_launch.launch_one_flash_loader(
+                        flash_row,
+                        root=_repo_root(),
+                        click_transformice=not args.launch_flash_no_click,
+                        on_flash_pid=lambda pid, _st=st: setattr(_st, "flash_pid", pid),
+                        post_open_delay_sec=float(
+                            getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Retry: slot %s — launch_one_flash_loader raised; skipping this attempt.",
+                        st.label,
+                    )
+                    st.attempts_used += 1
+                    continue
+
+                if proc is None:
+                    logger.warning(
+                        "Retry: slot %s — Flash launcher returned no process; counting attempt and moving on.",
+                        st.label,
+                    )
+                    st.attempts_used += 1
+                    continue
+
+                st.flash_loader_ready_event.set()
+                ok = _wait_for_login_simple(st, retry_login_timeout)
+                st.attempts_used += 1
+                if ok:
+                    tag, _ = _slot_status_label(st)
+                    logger.info(
+                        "Retry: slot %s — relaunch login %s (status=%s, attempt %d/%d)",
+                        st.label,
+                        "succeeded" if tag == "OK   " else "succeeded (still PARTL — server kicked again)",
+                        tag.strip(), st.attempts_used, max_attempts,
+                    )
+                else:
+                    logger.warning(
+                        "Retry: slot %s — no LoginSuccess within %.0fs (attempt %d/%d).",
+                        st.label, retry_login_timeout, st.attempts_used, max_attempts,
+                    )
+                    # Close the Flash window we just opened so the next round (or
+                    # the caller's eventual cleanup) starts from a clean slate.
+                    _close_flash_for_slot_retry(st, cfg)
+                if between_slot > 0 and ei + 1 < len(eligible):
+                    time.sleep(between_slot)
+    finally:
+        set_operator_phase("idle")
 
     print_slot_status(states, title="SLOT STATUS AFTER RETRY")
 
@@ -1060,6 +1066,46 @@ def _env_bool(name: str, *, default: bool) -> bool:
 def _live_write_slots(states: list[SlotState]) -> list[SlotState]:
     """Slots whose proxy has a usable upstream writer (``BanBotProxy._main_write_conn()``: MAIN or satellite)."""
     return [s for s in states if s.proxy and s.proxy._main_write_conn() is not None]
+
+
+def _log_upstream_dead_snapshot(states: list[SlotState], purpose: str) -> None:
+    """
+    When no slot has an upstream writer, log each proxy's last MAIN close (or missing proxy).
+
+    Makes ``0/%d slots with write path`` post-mortems self-contained in ``log.txt``.
+    """
+    if not states:
+        return
+    logger.warning(
+        "Upstream dead snapshot (%s) — %d slot(s); last-known MAIN state per slot:",
+        purpose,
+        len(states),
+    )
+    for s in states:
+        p = s.proxy
+        if p is None:
+            logger.warning("  slot %s: no proxy", s.label)
+            continue
+        wr = p._main_write_conn()
+        if wr is not None:
+            logger.warning("  slot %s: has write path (unexpected during dead snapshot)", s.label)
+            continue
+        reason = getattr(p, "_main_last_close_reason", None) or "?"
+        since = getattr(p, "_main_last_close_since_login_sec", None)
+        alive = getattr(p, "_main_last_close_alive_sec", None)
+        diag = getattr(p, "_main_last_close_diag", None) or ""
+        if len(diag) > 200:
+            diag = diag[:197] + "..."
+        post = f"since_login={since:.1f}s" if isinstance(since, (int, float)) else "since_login=n/a"
+        life = f"alive={alive:.1f}s" if isinstance(alive, (int, float)) else "alive=n/a"
+        logger.warning(
+            "  slot %s: reason=%s | %s | %s | diag=%s",
+            s.label,
+            reason,
+            post,
+            life,
+            diag,
+        )
 
 
 def _upstream_wait_sec(cfg: object | None) -> float:
@@ -1089,7 +1135,11 @@ def _wait_for_upstream_slots(
     Return slots with a live write path, optionally blocking until at least one appears or *max_wait_sec* elapses.
     """
     live = _live_write_slots(states)
-    if live or max_wait_sec <= 0:
+    if live:
+        return live
+    if max_wait_sec <= 0:
+        if states:
+            _log_upstream_dead_snapshot(states, purpose)
         return live
     deadline = time.monotonic() + max_wait_sec
     t0 = time.monotonic()
@@ -1120,7 +1170,10 @@ def _wait_for_upstream_slots(
         max_wait_sec,
         purpose,
     )
-    return _live_write_slots(states)
+    live = _live_write_slots(states)
+    if not live and states:
+        _log_upstream_dead_snapshot(states, purpose)
+    return live
 
 
 def fetch_room_list(
@@ -1150,6 +1203,15 @@ def fetch_room_list(
         return []
 
     attempts = min(len(live), max(1, int(max_slot_attempts)))
+    t0 = time.monotonic()
+    logger.info(
+        "Room list fetch: phase=%s try_slots=%s live_total=%d modes=%s timeout_per_round=%.1fs",
+        get_operator_phase(),
+        [s.label for s in live[:attempts]],
+        len(live),
+        game_modes,
+        timeout_sec,
+    )
     for bi in range(attempts):
         slot = live[bi]
         proxy = slot.proxy
@@ -1182,16 +1244,35 @@ def fetch_room_list(
                     slot.label,
                     bi,
                 )
-            return sorted(proxy.known_rooms.items(), key=lambda x: x[0].lower())
+            rooms = sorted(proxy.known_rooms.items(), key=lambda x: x[0].lower())
+            elapsed = time.monotonic() - t0
+            n_after = len(_live_write_slots(states))
+            logger.info(
+                "Room list fetch OK: rooms=%d elapsed=%.2fs live_slots_after=%d/%d source_slot=%s",
+                len(rooms),
+                elapsed,
+                n_after,
+                len(states),
+                slot.label,
+            )
+            return rooms
         if bi + 1 < attempts:
             logger.info(
                 "Room list: no rooms from slot %s — trying next live slot…",
                 slot.label,
             )
 
+    elapsed = time.monotonic() - t0
+    n_after = len(_live_write_slots(states))
     logger.warning(
         "Room list: still empty after %d slot attempt(s) — you can type a room name manually.",
         attempts,
+    )
+    logger.info(
+        "Room list fetch empty: elapsed=%.2fs live_slots_after=%d/%d",
+        elapsed,
+        n_after,
+        len(states),
     )
     return []
 
@@ -1312,55 +1393,59 @@ def _pick_room(states: list[SlotState], cfg: object) -> str:
     Fetch available rooms from the game server, print a numbered list, and let
     the user pick by number or type a name directly.
     """
-    _flush_log_handlers()
-    logger.info("Fetching room list from game server...")
-    _flush_log_handlers()
-
-    rooms = fetch_room_list(
-        states,
-        timeout_sec=float(getattr(cfg, "ROOM_LIST_TIMEOUT_SEC", 10.0) or 10.0),
-        max_slot_attempts=int(getattr(cfg, "ROOM_LIST_MAX_SLOT_ATTEMPTS", 3) or 3),
-        upstream_wait_sec=_upstream_wait_sec(cfg),
-    )
-
-    if rooms:
-        print(f"\nAvailable rooms ({len(rooms)} total):", flush=True)
-        for i, (name, players) in enumerate(rooms, 1):
-            print(f"  {i:3d}. {name:<30s}  [{players} players]", flush=True)
-        print(flush=True)
+    set_operator_phase("room_list")
+    try:
         _flush_log_handlers()
-        print(
-            "\n---\n"
-            ">>> Interactive step: enter room below. (Proxy logs are throttled; if the console is busy,\n"
-            "    look for the line `Enter room number` — or scroll to the end.)\n"
-            "---\n",
-            flush=True,
-        )
-        choice = _input_nonempty(
-            "Enter room number or room name (e.g. *Racing1): ",
-            what="a room number or name",
-        )
-        if choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(rooms):
-                chosen = rooms[idx][0]
-                logger.info("Room selected by number %s: %r", choice, chosen)
-                return chosen
-        logger.info("Room entered directly: %r", choice)
-        return choice
-    else:
-        logger.info("No room list received — enter room name manually.")
+        logger.info("Fetching room list from game server...")
         _flush_log_handlers()
-        print(
-            "\n---\n"
-            ">>> Interactive step: target room. Proxy heartbeats are logged infrequently; type below.\n"
-            "---\n",
-            flush=True,
+
+        rooms = fetch_room_list(
+            states,
+            timeout_sec=float(getattr(cfg, "ROOM_LIST_TIMEOUT_SEC", 10.0) or 10.0),
+            max_slot_attempts=int(getattr(cfg, "ROOM_LIST_MAX_SLOT_ATTEMPTS", 3) or 3),
+            upstream_wait_sec=_upstream_wait_sec(cfg),
         )
-        return _input_nonempty(
-            "Target room (text after /room, e.g. *Racing1): ",
-            what="the room name",
-        )
+
+        if rooms:
+            print(f"\nAvailable rooms ({len(rooms)} total):", flush=True)
+            for i, (name, players) in enumerate(rooms, 1):
+                print(f"  {i:3d}. {name:<30s}  [{players} players]", flush=True)
+            print(flush=True)
+            _flush_log_handlers()
+            print(
+                "\n---\n"
+                ">>> Interactive step: enter room below. (Proxy logs are throttled; if the console is busy,\n"
+                "    look for the line `Enter room number` — or scroll to the end.)\n"
+                "---\n",
+                flush=True,
+            )
+            choice = _input_nonempty(
+                "Enter room number or room name (e.g. *Racing1): ",
+                what="a room number or name",
+            )
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(rooms):
+                    chosen = rooms[idx][0]
+                    logger.info("Room selected by number %s: %r", choice, chosen)
+                    return chosen
+            logger.info("Room entered directly: %r", choice)
+            return choice
+        else:
+            logger.info("No room list received — enter room name manually.")
+            _flush_log_handlers()
+            print(
+                "\n---\n"
+                ">>> Interactive step: target room. Proxy heartbeats are logged infrequently; type below.\n"
+                "---\n",
+                flush=True,
+            )
+            return _input_nonempty(
+                "Target room (text after /room, e.g. *Racing1): ",
+                what="the room name",
+            )
+    finally:
+        set_operator_phase("idle")
 
 
 def _collect_player_list_via_join(
@@ -1516,77 +1601,81 @@ def _show_and_pick_player(states: list[SlotState], room: str, cfg: object | None
     list, then after you choose a target, move other slots into the room with a safe
     stagger before /ban.
     """
-    _flush_log_handlers()
-    logger.info("Collecting player list for %r...", room)
-    _flush_log_handlers()
-
-    if cfg is not None:
-        pl_to = float(getattr(cfg, "PLAYER_LIST_COLLECT_TIMEOUT_SEC", 25.0) or 25.0)
-        leader_only = bool(getattr(cfg, "PLAYER_LIST_JOIN_LEADER_ONLY", True))
-        room_stagger = float(getattr(cfg, "ROOM_STAGGER_SEC", 0.15) or 0.15)
-    else:
-        _r = (os.environ.get("BOT_PLAYER_LIST_COLLECT_TIMEOUT_SEC") or "").strip()
-        pl_to = float(_r) if _r else 25.0
-        _lo = (os.environ.get("BOT_PLAYER_LIST_JOIN_LEADER_ONLY") or "").strip().lower()
-        leader_only = _lo not in ("0", "false", "no", "off") if _lo else True
-        _rs = (os.environ.get("BOT_ROOM_STAGGER_SEC") or "").strip()
-        room_stagger = float(_rs) if _rs else 0.15
-    pl_to = max(3.0, min(120.0, pl_to))
-    room_stagger = max(0.0, min(10.0, room_stagger))
-
-    players, lead_label = _collect_player_list_via_join(
-        states,
-        room,
-        timeout_sec=pl_to,
-        stagger_sec=room_stagger,
-        leader_only=leader_only,
-        upstream_wait_sec=_upstream_wait_sec(cfg) if cfg is not None else _upstream_wait_sec(None),
-    )
-
-    if players:
-        print(f"\nPlayers in {room!r} ({len(players)} total):", flush=True)
-        for i, name in enumerate(players, 1):
-            print(f"  {i:3d}. {name}", flush=True)
-        print(flush=True)
+    set_operator_phase("player_list")
+    try:
         _flush_log_handlers()
-        print(
-            "\n---\n"
-            ">>> Interactive step: pick player — enter below. (You may need to scroll past proxy logs.)\n"
-            "---\n",
-            flush=True,
-        )
-        choice = _input_nonempty(
-            "Enter player number or nickname (e.g. Zizao#0000): ",
-            what="a player number or nickname",
-        )
-        if choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(players):
-                chosen = players[idx]
-                logger.info("Player selected by number %s: %r", choice, chosen)
-                if cfg is not None:
-                    _pre_ban_stagger_join_others(states, room, cfg, lead_label)
-                return chosen
-        logger.info("Player entered directly: %r", choice)
-        if cfg is not None:
-            _pre_ban_stagger_join_others(states, room, cfg, lead_label)
-        return choice
-    else:
-        logger.info("No player list received — enter nickname manually.")
+        logger.info("Collecting player list for %r...", room)
         _flush_log_handlers()
-        print(
-            "\n---\n"
-            ">>> Interactive step: target user — type nickname below.\n"
-            "---\n",
-            flush=True,
-        )
-        target = _input_nonempty(
-            "Target user (nickname#tag, e.g. Zizao#0000): ",
-            what="the nickname#tag",
-        )
+
         if cfg is not None:
-            _pre_ban_stagger_join_others(states, room, cfg, lead_label)
-        return target
+            pl_to = float(getattr(cfg, "PLAYER_LIST_COLLECT_TIMEOUT_SEC", 25.0) or 25.0)
+            leader_only = bool(getattr(cfg, "PLAYER_LIST_JOIN_LEADER_ONLY", True))
+            room_stagger = float(getattr(cfg, "ROOM_STAGGER_SEC", 0.15) or 0.15)
+        else:
+            _r = (os.environ.get("BOT_PLAYER_LIST_COLLECT_TIMEOUT_SEC") or "").strip()
+            pl_to = float(_r) if _r else 25.0
+            _lo = (os.environ.get("BOT_PLAYER_LIST_JOIN_LEADER_ONLY") or "").strip().lower()
+            leader_only = _lo not in ("0", "false", "no", "off") if _lo else True
+            _rs = (os.environ.get("BOT_ROOM_STAGGER_SEC") or "").strip()
+            room_stagger = float(_rs) if _rs else 0.15
+        pl_to = max(3.0, min(120.0, pl_to))
+        room_stagger = max(0.0, min(10.0, room_stagger))
+
+        players, lead_label = _collect_player_list_via_join(
+            states,
+            room,
+            timeout_sec=pl_to,
+            stagger_sec=room_stagger,
+            leader_only=leader_only,
+            upstream_wait_sec=_upstream_wait_sec(cfg) if cfg is not None else _upstream_wait_sec(None),
+        )
+
+        if players:
+            print(f"\nPlayers in {room!r} ({len(players)} total):", flush=True)
+            for i, name in enumerate(players, 1):
+                print(f"  {i:3d}. {name}", flush=True)
+            print(flush=True)
+            _flush_log_handlers()
+            print(
+                "\n---\n"
+                ">>> Interactive step: pick player — enter below. (You may need to scroll past proxy logs.)\n"
+                "---\n",
+                flush=True,
+            )
+            choice = _input_nonempty(
+                "Enter player number or nickname (e.g. Zizao#0000): ",
+                what="a player number or nickname",
+            )
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(players):
+                    chosen = players[idx]
+                    logger.info("Player selected by number %s: %r", choice, chosen)
+                    if cfg is not None:
+                        _pre_ban_stagger_join_others(states, room, cfg, lead_label)
+                    return chosen
+            logger.info("Player entered directly: %r", choice)
+            if cfg is not None:
+                _pre_ban_stagger_join_others(states, room, cfg, lead_label)
+            return choice
+        else:
+            logger.info("No player list received — enter nickname manually.")
+            _flush_log_handlers()
+            print(
+                "\n---\n"
+                ">>> Interactive step: target user — type nickname below.\n"
+                "---\n",
+                flush=True,
+            )
+            target = _input_nonempty(
+                "Target user (nickname#tag, e.g. Zizao#0000): ",
+                what="the nickname#tag",
+            )
+            if cfg is not None:
+                _pre_ban_stagger_join_others(states, room, cfg, lead_label)
+            return target
+    finally:
+        set_operator_phase("idle")
 
 
 def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
@@ -1605,6 +1694,14 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
 
     Slots with no connection at snapshot time are skipped (not counted as send failures).
     """
+    set_operator_phase("ban")
+    try:
+        _send_ban_to_all_body(states, target_user, cfg)
+    finally:
+        set_operator_phase("idle")
+
+
+def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> None:
     dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
     dmax = float(getattr(cfg, "BAN_DELAY_MAX_SEC", 2.0))
     burst = bool(getattr(cfg, "BAN_BURST_MODE", True))
@@ -2553,7 +2650,11 @@ def main(argv: list[str] | None = None) -> None:
     # "logged in" line but before the next poll; run a multi-pass dismiss (poller is
     # already off — see block above) to catch stragglers.
     if auto_flash and sys.platform == "win32":
-        post_login_actionscript_error_sweep(states)
+        set_operator_phase("as_sweep")
+        try:
+            post_login_actionscript_error_sweep(states)
+        finally:
+            set_operator_phase("idle")
 
     # Wrap the ban loop in try/finally so every Flash projector window the bot
     # launched gets closed on the way out — normal exit ("n" to the prompt),

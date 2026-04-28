@@ -23,6 +23,23 @@ logger = logging.getLogger(__name__)
 
 _print_lock = threading.Lock()
 
+# What the CLI is doing (room list, join, /ban, …). Logged on MAIN teardown so mass
+# ``clean-eof`` lines can be correlated with operator phase without guessing.
+_OPERATOR_PHASE_LOCK = threading.Lock()
+_OPERATOR_PHASE: str = "startup"
+
+
+def set_operator_phase(name: str) -> None:
+    """Set a short phase label (e.g. ``room_list``, ``ban``) for MAIN-close correlation."""
+    global _OPERATOR_PHASE
+    with _OPERATOR_PHASE_LOCK:
+        _OPERATOR_PHASE = (name or "startup").strip() or "startup"
+
+
+def get_operator_phase() -> str:
+    with _OPERATOR_PHASE_LOCK:
+        return _OPERATOR_PHASE
+
 
 def _packet_diag_label(packet: object) -> str:
     """
@@ -894,6 +911,24 @@ class BanBotProxy(Proxy):
         # Allow FLASH main_tcp UI hook to run again on the next first MAIN (non-packet path).
         self._first_main_hook_done = False
 
+    def _last_main_io_hint(self) -> str:
+        """Which direction saw the newest MAIN packet before close (heuristic for who went quiet last)."""
+        srv = self._main_recent_from_server
+        cli = self._main_recent_from_client
+        if not srv and not cli:
+            return "last_io=unknown(no_packets)"
+        ts_s = max((t for t, _ in srv), default=None)
+        ts_c = max((t for t, _ in cli), default=None)
+        if ts_s is None:
+            return "last_io=client_only"
+        if ts_c is None:
+            return "last_io=server_only"
+        if ts_s > ts_c:
+            return "last_io=server_newest(%.2fs_after_client)" % (ts_s - ts_c)
+        if ts_c > ts_s:
+            return "last_io=client_newest(%.2fs_after_server)" % (ts_c - ts_s)
+        return "last_io=tie"
+
     def _format_main_close_diagnostic(
         self,
         *,
@@ -910,6 +945,8 @@ class BanBotProxy(Proxy):
         a short ``note=`` line: login batch vs room-phase tuning (``PRE_BAN`` is for room
         join, not sequential Flash opens)."""
         parts: list[str] = []
+        parts.append("phase=%s" % get_operator_phase())
+        parts.append(self._last_main_io_hint())
         srv = [n for _, n in self._main_recent_from_server]
         cli = [n for _, n in self._main_recent_from_client]
 
@@ -948,8 +985,6 @@ class BanBotProxy(Proxy):
                 "note=clean_eof:login_often=FLASH_STAGGER+AS;room_often=PRE_BAN+leader_not_for_login_batch"
             )
 
-        if not parts:
-            return "no_extra_pattern"
         return " | ".join(parts)
 
     async def new_main_connection(self, client_reader, client_writer):
@@ -1072,7 +1107,7 @@ class BanBotProxy(Proxy):
             lvl(
                 "Slot %s: MAIN session ended alive=%.1fs login+%ss reason=%s "
                 "(pongs_main=%d pongs_sat=%d ka=%d main_clients_now=%d sat_clients_now=%d)%s "
-                "srv→last=[%s] cli→last=[%s]",
+                "operator_phase=%s srv→last=[%s] cli→last=[%s]",
                 self.slot_label,
                 alive_sec,
                 f"{since_login:.1f}" if since_login is not None else "n/a",
@@ -1083,6 +1118,7 @@ class BanBotProxy(Proxy):
                 len(self.main_clients or []),
                 len(getattr(self, "satellite_clients", None) or []),
                 f" exc={close_exc!r}" if close_exc is not None else "",
+                get_operator_phase(),
                 _fmt_recent(self._main_recent_from_server),
                 _fmt_recent(self._main_recent_from_client),
             )
@@ -1252,6 +1288,18 @@ class BanBotProxy(Proxy):
         await main_conn.write_packet_instance(
             serverbound.RoomListPacket(game_mode=gm)
         )
+        if os.environ.get("BOT_ROOM_LIST_TRACE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            logger.info(
+                "Slot %s: RoomListPacket sent (game_mode=%s) operator_phase=%s",
+                self.slot_label,
+                game_mode_int,
+                get_operator_phase(),
+            )
         return True
 
     async def send_ban_command(self, nickname: str) -> bool:
