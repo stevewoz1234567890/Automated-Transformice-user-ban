@@ -27,6 +27,7 @@ import logging
 import random
 import os
 import sys
+from datetime import datetime
 import threading
 import time
 from collections import Counter
@@ -43,6 +44,7 @@ from .ban_proxy import (
     start_shared_flash_socket_policy_thread,
 )
 from . import flash_launch
+from . import tfm_loader_alignment
 from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
 
 logger = logging.getLogger(__name__)
@@ -495,11 +497,8 @@ def _slot_status_label(s: SlotState) -> tuple[str, str]:
     return ("OK   ", "ready")
 
 
-def print_slot_status(states: list[SlotState], *, title: str = "SLOT STATUS") -> None:
-    """
-    Print a clearly-formatted per-slot status table to stdout *and* the log so
-    the user can immediately see which slots are not working.
-    """
+def _slot_status_lines(states: list[SlotState], *, title: str = "SLOT STATUS") -> list[str]:
+    """Build the same table text as :func:`print_slot_status` (no I/O)."""
     banner = "=" * 110
     lines = [banner, f"  {title}", banner]
     counts = {"OK   ": 0, "PARTL": 0, "NO_LG": 0, "NO_TCP": 0, "CRASH": 0, "DOWN ": 0}
@@ -542,6 +541,124 @@ def print_slot_status(states: list[SlotState], *, title: str = "SLOT STATUS") ->
             nicks.append(f"slot{s.label}={n}")
     if nicks:
         lines.append("  (Quick ref) " + " | ".join(nicks))
+    return lines
+
+
+def _session_report_enabled() -> bool:
+    v = (os.environ.get("BOT_SESSION_REPORT") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off", "")
+
+
+def _write_session_report_markdown(
+    *,
+    repo: Path,
+    states: list[SlotState],
+    cfg: object,
+    ban_rounds: list[dict[str, object]],
+    session_started_wall: float,
+    session_exit_reason: str,
+    flash_auto_launched: bool,
+    log_txt_path: Path,
+) -> Path | None:
+    """Append a timestamped session summary under ``logs/`` (markdown)."""
+    if not _session_report_enabled():
+        return None
+    logs_dir = repo / "logs"
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("Session report: cannot create logs directory %s (%s)", logs_dir, e)
+        return None
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = logs_dir / f"session_report_{ts}.md"
+    ended = time.time()
+    duration_s = max(0.0, ended - session_started_wall)
+    start_str = datetime.fromtimestamp(session_started_wall).strftime("%Y-%m-%d %H:%M:%S")
+    end_str = datetime.fromtimestamp(ended).strftime("%Y-%m-%d %H:%M:%S")
+    ok_now = sum(1 for s in states if _slot_status_label(s)[0] == "OK   ")
+    partl_now = sum(1 for s in states if _slot_status_label(s)[0] == "PARTL")
+    lines: list[str] = [
+        "# Ban bot session report\n",
+        "\n",
+        f"- **Started (local)**: {start_str}\n",
+        f"- **Ended (local)**: {end_str}\n",
+        f"- **Duration**: {duration_s:.1f}s\n",
+        f"- **Exit reason**: {session_exit_reason}\n",
+        f"- **Slots configured**: {len(states)}\n",
+        f"- **Slots OK at report time**: {ok_now}\n",
+        f"- **Slots PARTL at report time**: {partl_now}\n",
+        f"- **Flash auto-launch**: {'yes' if flash_auto_launched else 'no'}\n",
+        f"- **Full trace log**: `{log_txt_path}`\n",
+        "\n",
+        "## Configuration snapshot\n",
+        "\n",
+    ]
+    for key in (
+        "PACKET_AUTO_LOGIN",
+        "PROXY_LISTEN_USE_ACCOUNT_BIND_IP",
+        "BAN_BURST_MODE",
+        "PLAYER_LIST_JOIN_LEADER_ONLY",
+        "PRE_BAN_ROOM_JOIN_STAGGER_SEC",
+        "FLASH_STAGGER_AFTER_LOGIN_SEC",
+    ):
+        try:
+            lines.append(f"- **{key}**: `{getattr(cfg, key, '—')}`\n")
+        except Exception:
+            lines.append(f"- **{key}**: (unavailable)\n")
+    _al_md = tfm_loader_alignment.get_last_alignment_report_md()
+    if _al_md:
+        lines.extend(_al_md)
+    else:
+        lines.extend(
+            [
+                "## Client / loader alignment\n\n",
+                "*Not captured (non-Windows host, or Flash/SWF files missing at startup).*\n\n",
+            ]
+        )
+    _as_snap = flash_launch.as_error_dismiss_session_snapshot()
+    lines.append("## ActionScript error dismiss (session totals)\n\n")
+    lines.append(f"- **Dialogs closed (tracked)**: `{_as_snap['actionscript_error_dialogs_closed']}`\n")
+    lines.append(
+        f"- **Incorrect-version dialog bodies (tracked)**: `{_as_snap['incorrect_version_dialogs']}`\n\n"
+    )
+    lines.append("\n## Ban rounds\n\n")
+    if not ban_rounds:
+        lines.append("*(no ban rounds completed this session)*\n\n")
+    else:
+        lines.append(
+            "| # | Target | OK | Send failed | Skipped | Live @ send | Round s |\n"
+            "|---|--------|----|-------------|---------|-------------|---------|\n"
+        )
+        for i, br in enumerate(ban_rounds, 1):
+            lines.append(
+                f"| {i} | `{br.get('target_user', '')}` | {br.get('ok_count', '')} | "
+                f"{br.get('fail_send', '')} | {br.get('skip_count', '')} | "
+                f"{br.get('live_slots_at_send', '')} | "
+                f"{float(br.get('round_seconds', 0) or 0):.1f} |\n"
+            )
+        lines.append("\n")
+    lines.append("## Final slot status\n\n")
+    lines.append("```text\n")
+    lines.extend(line + "\n" for line in _slot_status_lines(states, title="SLOT STATUS AT SESSION END"))
+    lines.append("```\n")
+    lines.append(
+        "\n*Session reports go under `logs/session_report_*.md`. "
+        "Set `BOT_SESSION_REPORT=0` to disable.*\n"
+    )
+    try:
+        path.write_text("".join(lines), encoding="utf-8")
+    except OSError as e:
+        logger.warning("Session report: write failed %s (%s)", path, e)
+        return None
+    return path
+
+
+def print_slot_status(states: list[SlotState], *, title: str = "SLOT STATUS") -> None:
+    """
+    Print a clearly-formatted per-slot status table to stdout *and* the log so
+    the user can immediately see which slots are not working.
+    """
+    lines = _slot_status_lines(states, title=title)
     for line in lines:
         print(line, flush=True)
         logger.info(line)
@@ -1693,15 +1810,17 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
     Set to 0 to disable.
 
     Slots with no connection at snapshot time are skipped (not counted as send failures).
+
+    Returns a summary dict (ok/fail/skip counts, timing) for :func:`_write_session_report_markdown`.
     """
     set_operator_phase("ban")
     try:
-        _send_ban_to_all_body(states, target_user, cfg)
+        return _send_ban_to_all_body(states, target_user, cfg)
     finally:
         set_operator_phase("idle")
 
 
-def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> None:
+def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dict[str, object]:
     dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
     dmax = float(getattr(cfg, "BAN_DELAY_MAX_SEC", 2.0))
     burst = bool(getattr(cfg, "BAN_BURST_MODE", True))
@@ -1763,6 +1882,7 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> Non
 
     results: list[tuple[str, bool, str, float, str]] = []
     t_round = time.monotonic()
+    live_at_send = len(active)
 
     def _do_one_slot(s: SlotState) -> tuple[bool, str, float]:
         t_slot = time.monotonic()
@@ -1867,6 +1987,16 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> Non
         "Ban round complete: target=%r ok=%d send_fail=%d skipped=%d elapsed=%.1fs",
         target_user, ok_count, fail_send, skip_count, total_dt,
     )
+    return {
+        "target_user": target_user,
+        "ok_count": ok_count,
+        "fail_send": fail_send,
+        "skip_count": skip_count,
+        "total_slots": len(results),
+        "round_seconds": total_dt,
+        "burst_mode": burst,
+        "live_slots_at_send": live_at_send,
+    }
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -1914,6 +2044,10 @@ def main(argv: list[str] | None = None) -> None:
                 except OSError:
                     pass
     _configure_logging()
+    session_wall_start = time.time()
+    log_txt_path = _repo_root() / "log.txt"
+    ban_summaries: list[dict[str, object]] = []
+    session_exit_reason = "finished"
     args = _parse_args(argv)
     from .run_checklist import prompt_run_checklist
 
@@ -1923,6 +2057,9 @@ def main(argv: list[str] | None = None) -> None:
 
         run_network_preflight()
     cfg = _load_accounts_module()
+
+    if sys.platform == "win32" and flash_launch.flash_launch_files_present(_repo_root()):
+        tfm_loader_alignment.log_client_asset_alignment(_repo_root())
 
     this_exe = Path(sys.executable).resolve()
     allow_kill = not args.no_kill_stale
@@ -2675,7 +2812,7 @@ def main(argv: list[str] | None = None) -> None:
                 logger.info("Empty user; try again.")
                 continue
 
-            send_ban_to_all(states, target, cfg)
+            ban_summaries.append(send_ban_to_all(states, target, cfg))
 
             _flush_log_handlers()
             with _quiet_console():
@@ -2686,8 +2823,24 @@ def main(argv: list[str] | None = None) -> None:
 
         logger.info("Exiting (proxy threads stop when you close this process).")
     except KeyboardInterrupt:
+        session_exit_reason = "keyboard_interrupt"
         logger.info("Interrupted by user (Ctrl-C); closing Flash windows before exit.")
     finally:
+        try:
+            report_path = _write_session_report_markdown(
+                repo=_repo_root(),
+                states=states,
+                cfg=cfg,
+                ban_rounds=ban_summaries,
+                session_started_wall=session_wall_start,
+                session_exit_reason=session_exit_reason,
+                flash_auto_launched=auto_flash,
+                log_txt_path=log_txt_path,
+            )
+            if report_path:
+                logger.info("Session report: %s", report_path)
+        except Exception:
+            logger.exception("Session report failed")
         if focus_pump_stop is not None:
             focus_pump_stop.set()
         if flash_dismiss_poll_stop is not None:

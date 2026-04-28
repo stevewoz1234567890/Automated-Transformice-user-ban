@@ -37,6 +37,28 @@ logger = logging.getLogger(__name__)
 _flash_ui_locks: dict[int, threading.Lock] = {}
 _flash_ui_locks_mutex = threading.Lock()
 
+# BM_CLICK / WM_CLOSE paths in :func:`dismiss_flash_error_dialogs_no_mouse` (session totals for log.txt + reports).
+_as_dismiss_closed_total = 0
+_as_dismiss_incorrect_version_total = 0
+_as_dismiss_stats_lock = threading.Lock()
+
+
+def _record_as_dismiss_close(*, incorrect_version: bool) -> tuple[int, int]:
+    global _as_dismiss_closed_total, _as_dismiss_incorrect_version_total
+    with _as_dismiss_stats_lock:
+        _as_dismiss_closed_total += 1
+        if incorrect_version:
+            _as_dismiss_incorrect_version_total += 1
+        return _as_dismiss_closed_total, _as_dismiss_incorrect_version_total
+
+
+def as_error_dismiss_session_snapshot() -> dict[str, int]:
+    with _as_dismiss_stats_lock:
+        return {
+            "actionscript_error_dialogs_closed": _as_dismiss_closed_total,
+            "incorrect_version_dialogs": _as_dismiss_incorrect_version_total,
+        }
+
 
 def _flash_ui_lock(pid: int) -> threading.Lock:
     with _flash_ui_locks_mutex:
@@ -1533,19 +1555,26 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
 
         if best_btn is not None:
             user32.SendMessageW(best_btn, BM_CLICK, 0, 0)
+            sess_tot, sess_bad = _record_as_dismiss_close(
+                incorrect_version=looks_like_incorrect_version,
+            )
             logger.info(
                 "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (method=BM_CLICK "
-                "ranked button %r rank=%s) area=%d title=%r body=%r",
+                "ranked button %r rank=%s) area=%d title=%r body=%r "
+                "| session_total=%d incorrect_version_total=%d",
                 slot_label, pid, top, best_lbl, best_rank, area,
                 (title or "")[:80], (body_text or "")[:240],
+                sess_tot, sess_bad,
             )
             if looks_like_incorrect_version:
                 logger.warning(
                     "Slot %s: Flash dialog reported INCORRECT GAME VERSION — the SWF/loader's "
                     "embedded version no longer matches what the live TFM server expects. "
                     "Re-dump TFM_SECRETS_GAME_VERSION (and the loader SWF if you patched a stale "
-                    "client). Body: %r",
-                    slot_label, (body_text or "")[:240],
+                    "client). incorrect_version_total_this_session=%d Body: %r",
+                    slot_label,
+                    sess_bad,
+                    (body_text or "")[:240],
                 )
             clicked += 1
             continue
@@ -1556,18 +1585,25 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
             label = _win_button_label_normalize(txt.value)
             if label in DISMISS_LABELS:
                 user32.SendMessageW(btn, BM_CLICK, 0, 0)
+                sess_tot, sess_bad = _record_as_dismiss_close(
+                    incorrect_version=looks_like_incorrect_version,
+                )
                 logger.info(
                     "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (method=BM_CLICK "
-                    "exact label %r) area=%d body=%r",
+                    "exact label %r) area=%d body=%r "
+                    "| session_total=%d incorrect_version_total=%d",
                     slot_label, pid, top, txt.value.strip(), area,
                     (body_text or "")[:240],
+                    sess_tot, sess_bad,
                 )
                 if looks_like_incorrect_version:
                     logger.warning(
                         "Slot %s: Flash dialog reported INCORRECT GAME VERSION — re-dump "
                         "TFM_SECRETS_GAME_VERSION (and re-patch the loader SWF if stale). "
-                        "Body: %r",
-                        slot_label, (body_text or "")[:240],
+                        "incorrect_version_total_this_session=%d Body: %r",
+                        slot_label,
+                        sess_bad,
+                        (body_text or "")[:240],
                     )
                 clicked += 1
                 break
@@ -1576,10 +1612,15 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
                 _try_escape_on_dialog(top)
                 if adobe_err and use_wmclose:
                     user32.PostMessageW(top, WM_CLOSE, 0, 0)
+                    sess_tot, sess_bad = _record_as_dismiss_close(
+                        incorrect_version=looks_like_incorrect_version,
+                    )
                     logger.info(
                         "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (buttons present "
-                        "but no match; method=Escape + WM_CLOSE) area=%d",
+                        "but no match; method=Escape + WM_CLOSE) area=%d "
+                        "| session_total=%d incorrect_version_total=%d",
                         slot_label, pid, top, area,
+                        sess_tot, sess_bad,
                     )
                     clicked += 1
                 elif adobe_err and not use_wmclose:
