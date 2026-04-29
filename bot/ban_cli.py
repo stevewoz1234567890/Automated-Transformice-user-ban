@@ -851,22 +851,23 @@ def _taskkill_all_flash_windows(reason: str = "shutdown") -> None:
     import subprocess
     cmd = ['taskkill', '/F', '/FI', 'WINDOWTITLE eq Adobe Flash Player*']
     try:
-        # Hide the taskkill child console; capture output so we can quote it on a single line.
+        # Hide the taskkill child console. Do NOT use capture_output/Pipe stdout+stderr:
+        # subprocess.communicate() spawns helper threads and can raise RuntimeError
+        # ("can't create new thread") during interpreter shutdown. DEVNULL avoids pipes.
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         cp = subprocess.run(
             cmd,
-            capture_output=True,
-            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=15.0,
             startupinfo=startupinfo,
         )
-        out = (cp.stdout or "").strip().replace("\r", "").replace("\n", " | ")
-        err = (cp.stderr or "").strip().replace("\r", "").replace("\n", " | ")
         if cp.returncode == 0:
             logger.info(
-                "Flash cleanup: taskkill 'WINDOWTITLE eq Adobe Flash Player*' OK (%s) — %s",
-                reason, out or "(no output)",
+                "Flash cleanup: taskkill 'WINDOWTITLE eq Adobe Flash Player*' OK (%s).",
+                reason,
             )
         elif cp.returncode == 128:
             # ERROR: The search filter cannot be recognized — happens when zero matching
@@ -877,11 +878,27 @@ def _taskkill_all_flash_windows(reason: str = "shutdown") -> None:
             )
         else:
             logger.info(
-                "Flash cleanup: taskkill rc=%s (%s) — out=%r err=%r",
-                cp.returncode, reason, out, err,
+                "Flash cleanup: taskkill rc=%s (%s).",
+                cp.returncode, reason,
             )
     except FileNotFoundError:
-        logger.debug("taskkill not on PATH; skipping nuclear Flash cleanup.")
+        logger.debug("taskkill not on PATH; skipping nuclear Flash shutdown cleanup.")
+    except subprocess.TimeoutExpired:
+        logger.warning("Flash cleanup: taskkill timed out (%s)", reason)
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if (
+            "can't create new thread" in msg
+            or "can't start new thread" in msg
+            or "interpreter shutdown" in msg
+        ):
+            logger.warning(
+                "Flash cleanup: taskkill skipped (%s) — interpreter shutdown: %s",
+                reason,
+                e,
+            )
+        else:
+            raise
     except Exception:
         logger.exception("Flash cleanup: taskkill raised during shutdown")
 
