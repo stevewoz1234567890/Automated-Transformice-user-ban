@@ -2299,7 +2299,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument(
         "--skip-net-check",
         action="store_true",
-        help="Do not run TCP preflight to the game host (or 1.1.1.1:443 if no host is set).",
+        help=(
+            "Skip startup reachability checks (DNS, multi-port TCP, HTTP_PROXY notes) and do not fail fast. "
+            "Not recommended for diagnosing PC vs mobile / hotspot differences."
+        ),
     )
     return p.parse_args(argv)
 
@@ -2336,6 +2339,11 @@ def main(argv: list[str] | None = None) -> None:
         from .net_preflight import run_network_preflight
 
         run_network_preflight()
+    else:
+        logger.warning(
+            "[preflight] Skipped (--skip-net-check): no DNS/multi-port/HTTP-proxy env probe; "
+            "misconfigured networks may fail later with PARTL or timeouts.",
+        )
     cfg = _load_accounts_module()
 
     if sys.platform == "win32" and flash_launch.flash_launch_files_present(_repo_root()):
@@ -2477,6 +2485,16 @@ def main(argv: list[str] | None = None) -> None:
             s.port,
             s.satellite_port,
             pol,
+        )
+
+    if not args.skip_net_check:
+        from .net_preflight import log_proxy_listen_vs_upstream
+
+        log_proxy_listen_vs_upstream(
+            cfg=cfg,
+            states=states,
+            raw_accounts=raw_accounts,
+            shared_flash_policy_port=shared_flash_policy_port,
         )
 
     for s, row in zip(states, raw_accounts):

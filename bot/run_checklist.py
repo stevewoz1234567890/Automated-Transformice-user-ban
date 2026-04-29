@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 CHECKLIST_LINES: tuple[str, ...] = (
-    "Stable internet / VPN so traffic can reach the game server",
-    "Proxifier (or your proxy split) is running if you route slots via per-account bind_ip",
+    "Stable internet / VPN so traffic can reach the game server (Wi‑Fi vs mobile hotspot can differ — CGNAT / partial port blocks)",
+    "Proxifier (or your proxy split) is running if you route slots via per-account bind_ip; HTTP_PROXY in env does not steer the bot's raw TCP to the game",
     ".env with BOT_ACCOUNTS_JSON matches proxy ports and accounts you intend to use",
     "Firewall / antivirus allows outbound TCP to the upstream host and your local proxy ports",
 )

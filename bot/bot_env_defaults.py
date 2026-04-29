@@ -80,6 +80,8 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_UPSTREAM_MAIN_GAME_PORT_TRY_FIRST": "11801",
     "BOT_UPSTREAM_TCP_PROBE_BEFORE_HEADLESS": "false",
     "BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED": "false",
+    # Startup: DNS + local IPv4 hint + HTTP_PROXY note + multi-port TCP (see bot.net_preflight). Set false for legacy single-port-only check.
+    "BOT_NET_PREFLIGHT_EXTENDED": "true",
     "BOT_UPSTREAM_PROBE_TIMEOUT_SEC": "6",
     "BOT_UPSTREAM_PROBE_RETRIES": "2",
     "BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC": "3",
