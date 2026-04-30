@@ -7,15 +7,24 @@ plain ASCII. We decompress, replace fixed-width strings, and recompress with the
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import struct
 import lzma
+import os
+import re
+import struct
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# (resolved_path, mtime, size) -> sha256 hex digest prefix; avoids re-hashing the same file per slot.
+_source_swf_digest_cache: dict[tuple[str, float, int], str] = {}
+
 _ORIG_MAIN = b"localhost:11801"
 _ORIG_POLICY = b"xmlsocket://localhost:10801"
+
+# Patched-loader cache files now end with ``_<16 hex of source SWF>_zwsflen2.swf``.
+_PATCH_CACHE_NEW_STYLE_SUFFIX = re.compile(r"_[0-9a-f]{16}_zwsflen2\.swf$", re.IGNORECASE)
 
 
 def _lzma_filters_from_zws(p: bytes) -> tuple[list[dict], int]:
@@ -102,6 +111,81 @@ def nine_char_connect_host(connect_host: str) -> str:
     return "127.0.0.1"
 
 
+def _source_swf_cache_tag(source_zws: Path) -> str:
+    """
+    Short stable fingerprint of ``source_zws`` bytes for patch cache filenames.
+
+    Previously the cache key was only ``host`` + ``port``, so replacing ``TFMProxyLoader.swf`` on
+    disk (new game build / aligned loader) while keeping the same ports **reused an old patched
+    file** — Flash then ran stale bytecode against current ``TFM_SECRETS_*`` / server behaviour,
+    which surfaces as repeated ActionScript errors and PARTL ``clean-eof`` on MAIN.
+    """
+    rp = str(source_zws.resolve())
+    try:
+        st = source_zws.stat()
+    except OSError:
+        return "missing"
+    key = (rp, float(st.st_mtime), int(st.st_size))
+    hit = _source_swf_digest_cache.get(key)
+    if hit is not None:
+        return hit
+    digest = hashlib.sha256()
+    with source_zws.open("rb") as bf:
+        for chunk in iter(lambda: bf.read(1024 * 1024), b""):
+            digest.update(chunk)
+    tag = digest.hexdigest()[:16]
+    _source_swf_digest_cache[key] = tag
+    return tag
+
+
+def purge_legacy_loader_patch_cache(cache_dir: Path) -> int:
+    """
+    Remove patched-loader files from before source-hash cache names (``…_<port>_zwsflen2.swf``).
+
+    Current entries include a 16-hex digest before ``_zwsflen2.swf``. Older builds keyed only by host
+    + port could leave stale patched SWFs on disk across loader upgrades.
+    """
+    removed = 0
+    if not cache_dir.is_dir():
+        return 0
+    for entry in cache_dir.iterdir():
+        if not entry.is_file():
+            continue
+        name = entry.name
+        if not name.startswith("TFMProxyLoader_patched_"):
+            continue
+        if not name.endswith("_zwsflen2.swf"):
+            continue
+        if _PATCH_CACHE_NEW_STYLE_SUFFIX.search(name):
+            continue
+        try:
+            entry.unlink()
+            removed += 1
+            logger.info(
+                "Removed legacy patched-loader cache (no source-hash segment; superseded format): %s",
+                name,
+            )
+        except OSError as e:
+            logger.warning("Could not remove legacy loader cache %s (%s)", entry, e)
+    if removed:
+        logger.info(
+            "Loader patch cache cleanup: removed %d legacy file(s) under %s — "
+            "current caches include a 16-hex source SWF fingerprint in the filename.",
+            removed,
+            cache_dir,
+        )
+    return removed
+
+
+def maybe_purge_legacy_loader_patch_cache(repo_root: Path) -> int:
+    """If ``BOT_PURGE_LEGACY_LOADER_PATCH_CACHE`` is enabled (default), run :func:`purge_legacy_loader_patch_cache`."""
+    raw = (os.environ.get("BOT_PURGE_LEGACY_LOADER_PATCH_CACHE") or "true").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return 0
+    cache_dir = repo_root / "tmp" / "loader_patch"
+    return purge_legacy_loader_patch_cache(cache_dir)
+
+
 def build_patched_loader_swf(
     source_zws: Path,
     *,
@@ -116,10 +200,12 @@ def build_patched_loader_swf(
     h9 = nine_char_connect_host(connect_host)
     cache_dir.mkdir(parents=True, exist_ok=True)
     safe_host = h9.replace(":", "_").replace("/", "_")
+    src_tag = _source_swf_cache_tag(source_zws)
     # Bump suffix so caches built with older patchers are ignored. Previous suffix "_zwsflen"
     # left the ZWS CompressedLength field stale, which broke SWFs whose re-compressed body was
     # shorter than the original compressed stream (Flash would silently show a blank window).
-    out = cache_dir / f"TFMProxyLoader_patched_{safe_host}_{port}_zwsflen2.swf"
+    # ``src_tag`` ties the cache entry to the **current** loader bytes (see ``_source_swf_cache_tag``).
+    out = cache_dir / f"TFMProxyLoader_patched_{safe_host}_{port}_{src_tag}_zwsflen2.swf"
     if out.is_file() and out.stat().st_size > 0:
         logger.debug("Using cached patched loader port %s -> %s", port, out)
         return out

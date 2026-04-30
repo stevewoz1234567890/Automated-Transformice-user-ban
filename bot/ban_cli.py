@@ -45,6 +45,7 @@ from .ban_proxy import (
 )
 from . import flash_launch
 from . import tfm_loader_alignment
+from . import tfm_swf_port_patch
 from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
 
 logger = logging.getLogger(__name__)
@@ -2346,8 +2347,11 @@ def main(argv: list[str] | None = None) -> None:
         )
     cfg = _load_accounts_module()
 
+    tfm_swf_port_patch.maybe_purge_legacy_loader_patch_cache(_repo_root())
+
     if sys.platform == "win32" and flash_launch.flash_launch_files_present(_repo_root()):
         tfm_loader_alignment.log_client_asset_alignment(_repo_root())
+        tfm_loader_alignment.log_operator_live_game_alignment_reminders()
 
     this_exe = Path(sys.executable).resolve()
     allow_kill = not args.no_kill_stale

@@ -38,6 +38,35 @@ def get_last_alignment_summary() -> dict[str, object] | None:
     return dict(_last_alignment_summary)
 
 
+def log_operator_live_game_alignment_reminders() -> None:
+    """
+    Post-scan INFO lines for operators: live-game bundle parity + patched-cache hygiene.
+
+    Call after :func:`log_client_asset_alignment` when Flash assets are in use.
+    """
+    summ = get_last_alignment_summary()
+    if summ is None or not summ.get("loader_present"):
+        return
+    logger.info(
+        "[alignment] Keep TFM_PROXY_SWF (or repo-root TFMProxyLoader.swf) and every TFM_SECRETS_* "
+        "value aligned with the **current** Transformice web client — use the same loader + secrets "
+        "as a known-good PC, or re-dump both after each game update.",
+    )
+    logger.info(
+        "[alignment] Patched loaders under tmp/loader_patch/ are cached per source SWF hash "
+        "(16 hex chars before _zwsflen2 in the filename). Legacy cache files without that segment "
+        "are removed at startup when BOT_PURGE_LEGACY_LOADER_PATCH_CACHE is true (default).",
+    )
+    if summ.get("read_error"):
+        return
+    if summ.get("loader_version_embedding_verifiable") is False:
+        logger.info(
+            "[alignment] Loader version could not be verified from SWF bytes alone. If ActionScript "
+            "errors or PARTL persist while files match Transformice, remaining failures are "
+            "secrets/protocol drift vs live Transformice — not stale Python patched-cache reuse.",
+        )
+
+
 def _bool_env(name: str) -> bool:
     v = (os.environ.get(name) or "").strip().lower()
     return v in ("1", "true", "yes", "on")
