@@ -13,6 +13,7 @@ import random
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 
 import pak
@@ -332,6 +333,71 @@ def _main_ring_timeline(buf: list[tuple[float, str]], *, now_mono: float, tag: s
     )
 
 
+# One semaphore per running event loop: caps simultaneous TCP handshakes to the game host
+# across all BanBotProxy slots (Windows WinError 121 under many concurrent connects).
+_upstream_connect_sem_by_loop: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+
+
+def _parse_upstream_max_concurrent_connects() -> int:
+    raw = (os.environ.get("BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS") or "").strip()
+    try:
+        n = int(raw) if raw else 2
+    except ValueError:
+        n = 2
+    return max(1, min(n, 64))
+
+
+def _upstream_open_connection_timeout_sec() -> float:
+    raw = (os.environ.get("BOT_UPSTREAM_OPEN_CONNECTION_TIMEOUT_SEC") or "").strip()
+    try:
+        t = float(raw) if raw else 12.0
+    except ValueError:
+        t = 12.0
+    return max(3.0, min(t, 120.0))
+
+
+def _open_streams_round_retries() -> int:
+    """Extra full port-list sweeps after every port fails once (aligns with preflight retries)."""
+    raw = (os.environ.get("BOT_UPSTREAM_OPEN_STREAMS_ROUND_RETRIES") or "").strip()
+    if raw:
+        try:
+            return max(0, min(int(raw), 10))
+        except ValueError:
+            pass
+    raw2 = (os.environ.get("BOT_UPSTREAM_PROBE_RETRIES") or "").strip()
+    try:
+        n = int(raw2) if raw2 else 2
+    except ValueError:
+        n = 2
+    return max(0, min(n, 10))
+
+
+def _open_streams_round_pause_sec() -> float:
+    raw = (os.environ.get("BOT_UPSTREAM_OPEN_STREAMS_ROUND_PAUSE_SEC") or "").strip()
+    if raw:
+        try:
+            return max(0.0, min(float(raw), 60.0))
+        except ValueError:
+            pass
+    raw2 = (os.environ.get("BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC") or "").strip()
+    try:
+        p = float(raw2) if raw2 else 3.0
+    except ValueError:
+        p = 3.0
+    return max(0.0, min(p, 60.0))
+
+
+def _upstream_connect_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _upstream_connect_sem_by_loop.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(_parse_upstream_max_concurrent_connects())
+        _upstream_connect_sem_by_loop[loop] = sem
+    return sem
+
+
 class BanBotProxy(Proxy):
     """One proxy port ↔ one game instance; sends slash-commands as CommandPacket (no leading /)."""
 
@@ -468,18 +534,64 @@ class BanBotProxy(Proxy):
             self.register_packet_listener(self._log_all_main_packet, Packet)
 
     async def open_streams(self, address, ports):
-        """Try game ports like ``caseus.Proxy.open_streams``, logging each failure for diagnostics."""
+        """Connect upstream like ``caseus.Proxy.open_streams``, with global throttle + timeouts.
+
+        Many simultaneous ``asyncio.open_connection`` calls from 10+ Flash slots often trigger
+        Windows WinError 121 (semaphore timeout). ``BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS`` limits
+        how many handshakes run at once process-wide. Failed sweeps repeat using the same retry
+        knobs as net preflight (``BOT_UPSTREAM_PROBE_RETRIES`` / ``BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC``).
+        """
         port_list = list(ports)
+        timeout_sec = _upstream_open_connection_timeout_sec()
+        rounds = _open_streams_round_retries()
+        pause_sec = _open_streams_round_pause_sec()
         failures: list[tuple[int, str, str]] = []
-        for port in random.sample(port_list, len(port_list)):
-            try:
-                return await asyncio.open_connection(address, port)
-            except Exception as e:
-                msg = str(e).strip().replace("\n", " ")
-                if len(msg) > 180:
-                    msg = msg[:177] + "..."
-                failures.append((port, type(e).__name__, msg))
-                continue
+        sem = _upstream_connect_semaphore()
+
+        async def _try_port(p: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
+            async with sem:
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.open_connection(address, p),
+                        timeout=timeout_sec,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    msg = str(e).strip().replace("\n", " ")
+                    if len(msg) > 180:
+                        msg = msg[:177] + "..."
+                    failures.append((p, type(e).__name__, msg))
+                    return None
+
+        for round_i in range(rounds + 1):
+            for port in random.sample(port_list, len(port_list)):
+                conn = await _try_port(port)
+                if conn is not None:
+                    if round_i > 0:
+                        logger.info(
+                            "Slot %s: upstream TCP OK host=%r port=%s after %s extra sweep round(s)",
+                            self.slot_label,
+                            address,
+                            port,
+                            round_i,
+                        )
+                    return conn
+            if round_i < rounds:
+                logger.warning(
+                    "Slot %s: upstream TCP all ports failed sweep round %s/%s host=%r timeout=%.1fs "
+                    "max_concurrent=%s — sleeping %.1fs then retrying",
+                    self.slot_label,
+                    round_i + 1,
+                    rounds + 1,
+                    address,
+                    timeout_sec,
+                    _parse_upstream_max_concurrent_connects(),
+                    pause_sec,
+                )
+                if pause_sec > 0:
+                    await asyncio.sleep(pause_sec)
+
         logger.warning(
             "Slot %s: upstream TCP failed every attempt host=%r ports=%s per_try=%s "
             "bind_ip(ref)=%r env_main_server_address=%r python_exe=%r — "

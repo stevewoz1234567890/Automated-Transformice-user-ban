@@ -137,6 +137,10 @@ TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE=aabbccdd...
 | `BOT_PROXY_VERBOSE_LOGIN_FLOW` | `true` | Log extra handshake / login packet details |
 | `BOT_PROXY_LOG_ALL_MAIN_PACKETS` | `false` | Log every main-connection packet (debug) |
 | `BOT_PROXY_UPSTREAM_FAIL_TRACE` | *(unset)* | If `true`, log a Python traceback when upstream TCP fails all game ports (after per-port WARNINGs) |
+| `BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS` | `2` | Process-wide cap on simultaneous TCP handshakes to the game server across all slots (raises Windows WinError 121 when too high with many Flash clients / Proxifier). |
+| `BOT_UPSTREAM_OPEN_CONNECTION_TIMEOUT_SEC` | `12` | Per-attempt timeout inside each upstream connect (wrapped with `asyncio.wait_for`). |
+| `BOT_UPSTREAM_OPEN_STREAMS_ROUND_RETRIES` | *(unset)* | Extra full port sweeps when every port fails once; defaults to `BOT_UPSTREAM_PROBE_RETRIES`. |
+| `BOT_UPSTREAM_OPEN_STREAMS_ROUND_PAUSE_SEC` | *(unset)* | Seconds between sweeps; defaults to `BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC`. |
 | `BOT_PROXY_BIND_HOST` | *(all)* | IP the proxy listens on (leave blank for all interfaces) |
 | `BOT_SHARED_FLASH_SOCKET_POLICY_PORT` | `10801` | Port serving Flash socket policy for all slots |
 
