@@ -45,6 +45,15 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC": "7200",
     "BOT_PROXY_VERBOSE_LOGIN_FLOW": "false",
     "BOT_PROXY_LOG_ALL_MAIN_PACKETS": "false",
+    # Timeline-style INFO steps ``[trace #N | phase | slot]`` + full bot DEBUG to log.txt (see bot/trace_log.py).
+    "BOT_DEBUG_TRACE": "false",
+    # Mirror DEBUG to stderr as well as log.txt (noisy).
+    "BOT_DEBUG_TRACE_CONSOLE": "false",
+    # Empty = INFO for root; DEBUG upgrades bot.* detail to log.txt when combined with trace/debug_trace logic.
+    "BOT_LOG_LEVEL": "",
+    # Per-slot asyncio.run threads: log slow callbacks / enable asyncio debug logger when true.
+    "BOT_ASYNCIO_DEBUG": "false",
+    "BOT_ASYNCIO_SLOW_CALLBACK_SEC": "0.05",
     "BOT_SESSION_REPORT": "1",
     "BOT_PROXY_LOGIN_DIAGNOSTICS": "true",
     "BOT_PACKET_LOGIN_DELAY_SEC": "0.35",

@@ -48,6 +48,7 @@ from . import flash_launch
 from . import tfm_loader_alignment
 from . import tfm_swf_port_patch
 from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
+from .trace_log import asyncio_trace_install, reset_trace_session, trace_step
 
 logger = logging.getLogger(__name__)
 
@@ -202,20 +203,55 @@ def _configure_logging() -> None:
     root = logging.getLogger()
     if root.handlers:
         return
+
+    debug_trace = (os.environ.get("BOT_DEBUG_TRACE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    console_debug = (os.environ.get("BOT_DEBUG_TRACE_CONSOLE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    raw_level = (os.environ.get("BOT_LOG_LEVEL") or "").strip().upper()
+    want_debug = debug_trace or raw_level == "DEBUG"
+
+    fmt_verbose = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        "%H:%M:%S",
+    )
+    fmt_simple = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    fmt = fmt_verbose if want_debug else fmt_simple
+
+    # INFO on root: third-party libraries stay at INFO unless explicitly tweaked below.
     root.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
 
     stderr_h = logging.StreamHandler(sys.stderr)
     stderr_h.setFormatter(fmt)
+    stderr_h.setLevel(logging.DEBUG if (want_debug and console_debug) else logging.INFO)
     stderr_h.addFilter(_ConsoleQuietFilter())
     root.addHandler(stderr_h)
 
     log_path = _repo_root() / "log.txt"
     file_h = logging.FileHandler(log_path, encoding="utf-8", mode="a")
     file_h.setFormatter(fmt)
+    file_h.setLevel(logging.DEBUG)
     root.addHandler(file_h)
 
+    logging.getLogger("bot").setLevel(logging.DEBUG if want_debug else logging.INFO)
+
+    if (os.environ.get("BOT_ASYNCIO_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on"):
+        logging.getLogger("asyncio").setLevel(logging.DEBUG)
+
     logging.info("Logging to %s", log_path)
+    if debug_trace:
+        logging.info(
+            "BOT_DEBUG_TRACE=true — session timeline uses [trace #N | phase | slot]; "
+            "full bot DEBUG goes to log.txt; stderr stays INFO unless BOT_DEBUG_TRACE_CONSOLE=true.",
+        )
 
 
 class _quiet_console:
@@ -298,6 +334,17 @@ def _run_slot_async(
 ) -> None:
     async def _run():
         try:
+            asyncio_trace_install()
+            trace_step(
+                logger,
+                "slot_async",
+                "enter asyncio runner main_port=%s satellite=%s policy=%s auto_login_hook=%s",
+                state.port,
+                state.satellite_port,
+                state.policy_port,
+                bool(flash_auto_login_ui and flash_login_main_tcp_hook),
+                slot=state.label,
+            )
             hook = (
                 _flash_login_hook_factory(state, cfg)
                 if (flash_auto_login_ui and flash_login_main_tcp_hook)
@@ -339,7 +386,20 @@ def _run_slot_async(
                 ),
             )
             state.proxy = proxy
+            trace_step(
+                logger,
+                "slot_async",
+                "calling BanBotProxy.startup() main_port=%s",
+                state.port,
+                slot=state.label,
+            )
             await proxy.startup()
+            trace_step(
+                logger,
+                "slot_async",
+                "BanBotProxy.startup() returned; calling on_start()",
+                slot=state.label,
+            )
             state.loop = asyncio.get_running_loop()
             await proxy.on_start()
         except Exception as e:
@@ -361,6 +421,14 @@ def start_all_slots(
     flash_auto_login_ui: bool,
     flash_login_main_tcp_hook: bool,
 ) -> None:
+    trace_step(
+        logger,
+        "slots",
+        "start_all_slots n=%s flash_auto_login_ui=%s main_tcp_hook=%s",
+        len(states),
+        flash_auto_login_ui,
+        flash_login_main_tcp_hook,
+    )
     for s in states:
         port_roles: list[tuple[str, int]] = [
             ("main", s.port),
@@ -2371,26 +2439,38 @@ def main(argv: list[str] | None = None) -> None:
                     reconf(encoding="utf-8", errors="replace")
                 except OSError:
                     pass
+    args = _parse_args(argv)
+    _apply_known_good_parity_mode_env_defaults()
     _configure_logging()
+    reset_trace_session()
+    trace_step(logger, "main", "CLI session begin argv_summary skip_net_check=%s", args.skip_net_check)
     session_wall_start = time.time()
     log_txt_path = _repo_root() / "log.txt"
     ban_summaries: list[dict[str, object]] = []
     session_exit_reason = "finished"
-    args = _parse_args(argv)
-    _apply_known_good_parity_mode_env_defaults()
     from .run_checklist import prompt_run_checklist
 
     prompt_run_checklist()
     if not args.skip_net_check:
+        trace_step(logger, "main", "run_network_preflight() starting")
         from .net_preflight import run_network_preflight
 
         run_network_preflight()
+        trace_step(logger, "main", "run_network_preflight() finished OK")
     else:
         logger.warning(
             "[preflight] Skipped (--skip-net-check): no DNS/multi-port/HTTP-proxy env probe; "
             "misconfigured networks may fail later with PARTL or timeouts.",
         )
+        trace_step(logger, "main", "network preflight skipped (--skip-net-check)")
     cfg = _load_accounts_module()
+    trace_step(
+        logger,
+        "main",
+        "config loaded accounts=%s baseline_max_slots=%s",
+        len(getattr(cfg, "ACCOUNTS", []) or []),
+        int(getattr(cfg, "BASELINE_MAX_SLOTS", 0) or 0),
+    )
 
     tfm_swf_port_patch.maybe_purge_legacy_loader_patch_cache(_repo_root())
 
@@ -2632,6 +2712,7 @@ def main(argv: list[str] | None = None) -> None:
     flash_login_trigger = _flash_login_trigger(cfg)
     flash_login_main_tcp_hook = cfg_flash_auto and flash_login_trigger == "main_tcp"
 
+    trace_step(logger, "main", "starting proxy listener threads n_slots=%s", len(states))
     start_all_slots(
         states,
         this_exe=this_exe,
@@ -2640,6 +2721,7 @@ def main(argv: list[str] | None = None) -> None:
         flash_auto_login_ui=cfg_flash_auto,
         flash_login_main_tcp_hook=flash_login_main_tcp_hook,
     )
+    trace_step(logger, "main", "proxy listener threads spawned (asyncio.run per slot thread)")
 
     auto_flash = (
         sys.platform == "win32"
@@ -2673,6 +2755,7 @@ def main(argv: list[str] | None = None) -> None:
         # logins + sat migrations is the primary driver of "early slot PARTL" in large farms
         # (op_hint in logs often fires during this phase — PRE_BAN/leader is for the room phase).
         stagger_after = _effective_flash_stagger_sec(n_flash_slots, _stagger_from_env)
+        trace_step(logger, "main", "Flash UI launch phase start n_slots=%s stagger=%.2fs", n_flash_slots, stagger_after)
         if n_flash_slots >= 8 and stagger_after > _stagger_from_env + 0.01:
             logger.info(
                 "Flash launch: %d slots — post-login delay before opening the next client is %.1fs "

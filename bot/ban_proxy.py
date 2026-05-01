@@ -22,6 +22,7 @@ from caseus.packets import Packet, ServerboundPacket, clientbound, serverbound
 from caseus.util.crypto import shakikoo
 
 from .upstream_socket_bind import upstream_local_bind_tuple
+from .trace_log import trace_step
 
 logger = logging.getLogger(__name__)
 
@@ -555,6 +556,18 @@ class BanBotProxy(Proxy):
         failures: list[tuple[int, str, str]] = []
         sem = _upstream_connect_semaphore()
         local_bind = upstream_local_bind_tuple(account_bind_ip=self._account_bind_ip)
+        trace_step(
+            logger,
+            "upstream_open_streams",
+            "begin host=%r ports=%s rounds=%s timeout=%.1fs local_bind=%s max_conc=%s",
+            address,
+            port_list,
+            rounds + 1,
+            timeout_sec,
+            local_bind,
+            _parse_upstream_max_concurrent_connects(),
+            slot=self.slot_label,
+        )
 
         async def _try_port(p: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
             async with sem:
@@ -579,6 +592,14 @@ class BanBotProxy(Proxy):
             for port in random.sample(port_list, len(port_list)):
                 conn = await _try_port(port)
                 if conn is not None:
+                    trace_step(
+                        logger,
+                        "upstream_open_streams",
+                        "TCP handshake OK port=%s round=%s",
+                        port,
+                        round_i,
+                        slot=self.slot_label,
+                    )
                     if round_i > 0:
                         logger.info(
                             "Slot %s: upstream TCP OK host=%r port=%s after %s extra sweep round(s)",
@@ -589,6 +610,16 @@ class BanBotProxy(Proxy):
                         )
                     return conn
             if round_i < rounds:
+                trace_step(
+                    logger,
+                    "upstream_open_streams",
+                    "sweep round %s/%s exhausted host=%r sleeping %.1fs",
+                    round_i + 1,
+                    rounds + 1,
+                    address,
+                    pause_sec,
+                    slot=self.slot_label,
+                )
                 logger.warning(
                     "Slot %s: upstream TCP all ports failed sweep round %s/%s host=%r timeout=%.1fs "
                     "max_concurrent=%s — sleeping %.1fs then retrying",
@@ -1289,6 +1320,15 @@ class BanBotProxy(Proxy):
             since_startup if since_startup is not None else 0.0,
             getattr(self, "_main_tcp_generation", 0),
         )
+        trace_step(
+            logger,
+            "main_tcp",
+            "accepted peer=%r main_tcp#(current)=%s MAIN_listen_port=%s",
+            peer,
+            getattr(self, "_main_tcp_generation", 0),
+            self.host_main_port,
+            slot=self.slot_label,
+        )
         if self._on_main_tcp_accepted is not None:
             try:
                 self._on_main_tcp_accepted()
@@ -1354,9 +1394,23 @@ class BanBotProxy(Proxy):
         self._main_sess_anticheat_cli = 0
         close_reason = "clean-eof"
         close_exc: BaseException | None = None
+        trace_step(
+            logger,
+            "main_tcp",
+            "await super().new_main_connection (caseus listen); tcp_generation=%s",
+            getattr(self, "_main_tcp_generation", 0),
+            slot=self.slot_label,
+        )
         try:
             await super().new_main_connection(client_reader, client_writer)
         except ValueError as e:
+            trace_step(
+                logger,
+                "main_tcp",
+                "ValueError (upstream open_streams exhaustion): %s",
+                e,
+                slot=self.slot_label,
+            )
             # Upstream connect exhaustion (see ``open_streams``) — already logged per-port.
             close_reason = "upstream-tcp-all-ports-failed"
             close_exc = e
@@ -1398,6 +1452,14 @@ class BanBotProxy(Proxy):
         except Exception as e:  # noqa: BLE001
             close_reason = f"unhandled:{type(e).__name__}"
             close_exc = e
+            trace_step(
+                logger,
+                "main_tcp",
+                "unhandled exception type=%s msg=%s",
+                type(e).__name__,
+                e,
+                slot=self.slot_label,
+            )
             logger.exception(
                 "Slot %s: main connection listener raised unhandled exception",
                 self.slot_label,

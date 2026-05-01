@@ -137,6 +137,11 @@ TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE=aabbccdd...
 | `BOT_PROXY_VERBOSE_LOGIN_FLOW` | `true` | Log extra handshake / login packet details |
 | `BOT_PROXY_LOG_ALL_MAIN_PACKETS` | `false` | Log every main-connection packet (debug) |
 | `BOT_PROXY_UPSTREAM_FAIL_TRACE` | *(unset)* | If `true`, log a Python traceback when upstream TCP fails all game ports (after per-port WARNINGs) |
+| `BOT_DEBUG_TRACE` | `false` | Session-wide ordered **`[trace #N \| phase \| slot]`** INFO steps (like single-stepping); full **`bot.*`** DEBUG written to **`log.txt`** (stderr stays INFO unless `BOT_DEBUG_TRACE_CONSOLE`). |
+| `BOT_DEBUG_TRACE_CONSOLE` | `false` | With **`BOT_DEBUG_TRACE`**, also mirror DEBUG on stderr (very noisy). |
+| `BOT_LOG_LEVEL` | *(empty)* | Set to **`DEBUG`** for **`bot.*`** file detail without trace markers. |
+| `BOT_ASYNCIO_DEBUG` | `false` | Each slot `asyncio.run`: **`loop.set_debug(True)`** + asyncio logger DEBUG; pairs with trace for scheduler issues. |
+| `BOT_ASYNCIO_SLOW_CALLBACK_SEC` | `0.05` | **`slow_callback_duration`** when **`BOT_ASYNCIO_DEBUG`** is on. |
 | `BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS` | `2` | Process-wide cap on simultaneous TCP handshakes to the game server across all slots (raises Windows WinError 121 when too high with many Flash clients / Proxifier). |
 | `BOT_UPSTREAM_OPEN_CONNECTION_TIMEOUT_SEC` | `12` | Per-attempt timeout inside each upstream connect (wrapped with `asyncio.wait_for`). |
 | `BOT_UPSTREAM_OPEN_STREAMS_ROUND_RETRIES` | *(unset)* | Extra full port sweeps when every port fails once; defaults to `BOT_UPSTREAM_PROBE_RETRIES`. |

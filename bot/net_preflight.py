@@ -20,6 +20,7 @@ from .upstream_socket_bind import (
     unique_account_bind_ipv4s_from_env,
     upstream_local_bind_tuple,
 )
+from .trace_log import trace_step
 
 logger = logging.getLogger(__name__)
 
@@ -283,10 +284,19 @@ def run_network_preflight(*, timeout_sec: float | None = None) -> None:
     * ``BOT_NET_PREFLIGHT_EXTENDED=false``: legacy single TCP check to the first configured port only.
     * ``BOT_UPSTREAM_PROBE_RETRIES`` / ``BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC``: repeat failed TCP checks
       (defaults align with ``bot/bot_env_defaults.py``).
+    * ``BOT_DEBUG_TRACE=true``: emit ordered ``[trace #N | phase | slot]`` INFO lines and enable verbose logger names in ``log.txt``
+      (see ``bot/trace_log.py``).
     """
     t = _probe_timeout_sec() if timeout_sec is None else max(1.0, min(float(timeout_sec), 120.0))
     ext = _env_extended()
 
+    trace_step(
+        logger,
+        "preflight",
+        "run_network_preflight begin extended=%s timeout=%.1fs",
+        ext,
+        t,
+    )
     logger.info("[preflight] ========== network path (before bot proxies start) ==========")
     retries = _probe_retries()
     pause = _probe_retry_pause_sec()
@@ -334,6 +344,7 @@ def run_network_preflight(*, timeout_sec: float | None = None) -> None:
                 if lb:
                     logger.info("[preflight] Single-port TCP check using source bind local_ipv4=%r", lb[0])
                 _tcp_check(h, p, t, "configured game / upstream (first port)", source_address=lb)
+                trace_step(logger, "preflight", "single-port check OK host=%r port=%s", h, p)
             return
 
         from .upstream_probe import log_upstream_tcp_probe_async
@@ -454,6 +465,7 @@ def run_network_preflight(*, timeout_sec: float | None = None) -> None:
             host,
             " ".join(str(p) for p in ports),
         )
+        trace_step(logger, "preflight", "game TCP probe path OK host=%r ports=%s strict_all=%s", host, ports, strict)
         return
 
     host, port, label = _DEFAULT_FALLBACK
