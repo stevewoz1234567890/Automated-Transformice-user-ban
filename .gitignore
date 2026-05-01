@@ -22,6 +22,8 @@ config.py
 tfm-secrets.json
 *.log
 log.txt
+bot_stderr.txt
+bot_stdout.txt
 
 # PyInstaller output in repo root
 ban_bot.exe

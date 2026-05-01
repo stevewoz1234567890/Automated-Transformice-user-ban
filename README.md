@@ -171,6 +171,7 @@ In `.env` set **`BOT_KNOWN_GOOD_PARITY_MODE=true`** (see `bot/bot_env_defaults.p
 - **`BOT_BASELINE_MAX_SLOTS=3`** — use only the first three `BOT_ACCOUNTS_JSON` rows  
 - **`BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS=true`** — exit unless **every** configured game port accepts TCP (not just one)  
 - **`BOT_PARITY_STARTUP_REMINDERS=true`** — log a **`[parity]`** checklist  
+- **`BOT_UPSTREAM_PROBE_RETRIES`** / **`BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC`** — preflight TCP probes repeat after failures (defaults in `bot/bot_env_defaults.py`; helps tether / Wi‑Fi blips)
 
 You can set those keys manually instead of using `BOT_KNOWN_GOOD_PARITY_MODE`.
 
@@ -180,6 +181,8 @@ You can set those keys manually instead of using `BOT_KNOWN_GOOD_PARITY_MODE`.
 | `BOT_BASELINE_MAX_SLOTS` | `0` = use full `BOT_ACCOUNTS_JSON`; `2`–`3` = baseline slice (unique `proxy_port` per row still required) |
 | `BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS` | Require **`[probe] SUMMARY: all N ports accepted TCP`** (fatal if any port fails) |
 | `BOT_PARITY_STARTUP_REMINDERS` | Log **`[parity]`** checklist at startup; **also implied** when `BOT_BASELINE_MAX_SLOTS` > 0 |
+| `BOT_UPSTREAM_PROBE_RETRIES` | Extra preflight attempts after a failed TCP probe (`0`–`10`; default `2`) |
+| `BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC` | Seconds to wait between those attempts (default `3`) |
 
 ### Manual checklist (same logic)
 

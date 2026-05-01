@@ -12,6 +12,7 @@ import logging
 import os
 import socket
 import sys
+import time
 from typing import Final
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,25 @@ def _probe_timeout_sec() -> float:
     except ValueError:
         t = 6.0
     return max(1.0, min(t, 120.0))
+
+
+def _probe_retries() -> int:
+    """Extra TCP preflight attempts after a failed probe (tether/Wi‑Fi handoff, transient blocks)."""
+    raw = (os.environ.get("BOT_UPSTREAM_PROBE_RETRIES") or "").strip()
+    try:
+        n = int(raw) if raw else 2
+    except ValueError:
+        n = 2
+    return max(0, min(n, 10))
+
+
+def _probe_retry_pause_sec() -> float:
+    raw = (os.environ.get("BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC") or "").strip()
+    try:
+        p = float(raw) if raw else 3.0
+    except ValueError:
+        p = 3.0
+    return max(0.0, min(p, 60.0))
 
 
 def _all_tcp_ports(s: str) -> list[int]:
@@ -116,19 +136,46 @@ def _game_host_and_port_minimal() -> tuple[str, int] | None:
 
 
 def _tcp_check(host: str, port: int, timeout_sec: float, desc: str) -> None:
-    try:
-        with socket.create_connection((host, port), timeout=timeout_sec):
-            pass
-    except OSError as e:
-        emsg = str(e)
-        msg = (
-            f"[preflight] FATAL: could not open TCP to {host}:{port} "
-            f"({desc}). {emsg}. Check your connection, VPN, or DNS. "
-            f"To skip this check: --skip-net-check"
-        )
-        logger.error("%s", msg)
-        raise SystemExit(msg) from e
-    logger.info("[preflight] OK — TCP to %s:%d (%s).", host, port, desc)
+    retries = _probe_retries()
+    pause = _probe_retry_pause_sec()
+    for attempt in range(retries + 1):
+        try:
+            with socket.create_connection((host, port), timeout=timeout_sec):
+                pass
+            if attempt > 0:
+                logger.info(
+                    "[preflight] OK — TCP to %s:%d (%s) after %s extra retry attempt(s).",
+                    host,
+                    port,
+                    desc,
+                    attempt,
+                )
+            else:
+                logger.info("[preflight] OK — TCP to %s:%d (%s).", host, port, desc)
+            return
+        except OSError as e:
+            if attempt < retries:
+                logger.warning(
+                    "[preflight] TCP attempt %s/%s failed %s:%d (%s): %s — retry in %.1fs",
+                    attempt + 1,
+                    retries + 1,
+                    host,
+                    port,
+                    desc,
+                    e,
+                    pause,
+                )
+                if pause > 0:
+                    time.sleep(pause)
+                continue
+            emsg = str(e)
+            msg = (
+                f"[preflight] FATAL: could not open TCP to {host}:{port} "
+                f"({desc}). {emsg}. Check your connection, VPN, or DNS. "
+                f"To skip this check: --skip-net-check"
+            )
+            logger.error("%s", msg)
+            raise SystemExit(msg) from e
 
 
 def _log_dns(host: str) -> None:
@@ -218,11 +265,22 @@ def run_network_preflight(*, timeout_sec: float | None = None) -> None:
     * Extended (default): DNS + local IPv4 hint + HTTP-proxy env note + **all** configured game ports
       in parallel (same idea as ``bot.upstream_probe``).
     * ``BOT_NET_PREFLIGHT_EXTENDED=false``: legacy single TCP check to the first configured port only.
+    * ``BOT_UPSTREAM_PROBE_RETRIES`` / ``BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC``: repeat failed TCP checks
+      (defaults align with ``bot/bot_env_defaults.py``).
     """
     t = _probe_timeout_sec() if timeout_sec is None else max(1.0, min(float(timeout_sec), 120.0))
     ext = _env_extended()
 
     logger.info("[preflight] ========== network path (before bot proxies start) ==========")
+    retries = _probe_retries()
+    pause = _probe_retry_pause_sec()
+    if retries > 0:
+        logger.info(
+            "[preflight] BOT_UPSTREAM_PROBE_RETRIES=%s BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC=%.1fs "
+            "(TCP checks repeat after transient failures).",
+            retries,
+            pause,
+        )
     if _env_require_all_game_ports():
         logger.info(
             "[preflight] BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS=true — each configured game port must accept TCP "
@@ -261,9 +319,37 @@ def run_network_preflight(*, timeout_sec: float | None = None) -> None:
 
         from .upstream_probe import log_upstream_tcp_probe_async
 
-        results = asyncio.run(
-            log_upstream_tcp_probe_async(host, tuple(ports), timeout_sec=t),
-        )
+        results: list[tuple[int, str, float | None]] | None = None
+        strict = _env_require_all_game_ports()
+        for attempt in range(retries + 1):
+            results = asyncio.run(
+                log_upstream_tcp_probe_async(host, tuple(ports), timeout_sec=t),
+            )
+            any_ok = any(status == "ok" for _port, status, _dt in results)
+            all_ok = all(status == "ok" for _port, status, _dt in results)
+            satisfied = any_ok and (not strict or all_ok)
+            if satisfied:
+                if attempt > 0:
+                    logger.info(
+                        "[preflight] Multi-port probe succeeded on attempt %s/%s after retries.",
+                        attempt + 1,
+                        retries + 1,
+                    )
+                break
+            if attempt < retries:
+                logger.warning(
+                    "[preflight] Multi-port probe attempt %s/%s did not satisfy checks (host=%r require_all=%s) "
+                    "— retry in %.1fs (tether/Wi‑Fi handoff, firewall blip).",
+                    attempt + 1,
+                    retries + 1,
+                    host,
+                    strict,
+                    pause,
+                )
+                if pause > 0:
+                    time.sleep(pause)
+
+        assert results is not None
         if not any(status == "ok" for _port, status, _dt in results):
             bad = ", ".join(f"{port}:{status}" for port, status, _dt in sorted(results, key=lambda x: x[0]))
             msg = (
