@@ -21,6 +21,8 @@ from caseus import Proxy
 from caseus.packets import Packet, ServerboundPacket, clientbound, serverbound
 from caseus.util.crypto import shakikoo
 
+from .upstream_socket_bind import upstream_local_bind_tuple
+
 logger = logging.getLogger(__name__)
 
 _print_lock = threading.Lock()
@@ -532,6 +534,11 @@ class BanBotProxy(Proxy):
             self._register_verbose_login_flow_listeners()
         if log_all_main_packets:
             self.register_packet_listener(self._log_all_main_packet, Packet)
+        if "open_streams" not in BanBotProxy.__dict__:
+            raise RuntimeError(
+                "BanBotProxy must define open_streams — caseus.Proxy would connect upstream without bot binds/throttle. "
+                "Update bot/ban_proxy.py from the repo."
+            )
 
     async def open_streams(self, address, ports):
         """Connect upstream like ``caseus.Proxy.open_streams``, with global throttle + timeouts.
@@ -547,12 +554,16 @@ class BanBotProxy(Proxy):
         pause_sec = _open_streams_round_pause_sec()
         failures: list[tuple[int, str, str]] = []
         sem = _upstream_connect_semaphore()
+        local_bind = upstream_local_bind_tuple(account_bind_ip=self._account_bind_ip)
 
         async def _try_port(p: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
             async with sem:
                 try:
+                    oc_kw: dict[str, object] = {}
+                    if local_bind is not None:
+                        oc_kw["local_addr"] = local_bind
                     return await asyncio.wait_for(
-                        asyncio.open_connection(address, p),
+                        asyncio.open_connection(address, p, **oc_kw),
                         timeout=timeout_sec,
                     )
                 except asyncio.CancelledError:
@@ -597,7 +608,8 @@ class BanBotProxy(Proxy):
             "bind_ip(ref)=%r env_main_server_address=%r python_exe=%r — "
             "typical causes: tether/Wi‑Fi handoff, VPN drop, firewall, or Proxifier/split-routing not "
             "applied to this Python process (see README). Startup preflight does not guarantee "
-            "mid-session reachability.",
+            "mid-session reachability. With per-row bind_ip and Proxifier, set "
+            "BOT_UPSTREAM_USE_ACCOUNT_BIND_IP_FOR_SOCKET=true or BOT_NET_PREFLIGHT_TRY_ACCOUNT_BIND_IPS=true.",
             self.slot_label,
             address,
             port_list,

@@ -15,6 +15,12 @@ import sys
 import time
 from typing import Final
 
+from .upstream_socket_bind import (
+    env_preflight_try_account_bind_ips,
+    unique_account_bind_ipv4s_from_env,
+    upstream_local_bind_tuple,
+)
+
 logger = logging.getLogger(__name__)
 
 # When no game address is in env, this checks basic outbound TCP.
@@ -135,12 +141,22 @@ def _game_host_and_port_minimal() -> tuple[str, int] | None:
     return (host, ports[0])
 
 
-def _tcp_check(host: str, port: int, timeout_sec: float, desc: str) -> None:
+def _tcp_check(
+    host: str,
+    port: int,
+    timeout_sec: float,
+    desc: str,
+    *,
+    source_address: tuple[str, int] | None = None,
+) -> None:
     retries = _probe_retries()
     pause = _probe_retry_pause_sec()
     for attempt in range(retries + 1):
         try:
-            with socket.create_connection((host, port), timeout=timeout_sec):
+            sock_kw: dict[str, object] = {}
+            if source_address is not None:
+                sock_kw["source_address"] = source_address
+            with socket.create_connection((host, port), timeout=timeout_sec, **sock_kw):
                 pass
             if attempt > 0:
                 logger.info(
@@ -314,16 +330,37 @@ def run_network_preflight(*, timeout_sec: float | None = None) -> None:
             hpm = _game_host_and_port_minimal()
             if hpm:
                 h, p = hpm
-                _tcp_check(h, p, t, "configured game / upstream (first port)")
+                lb = upstream_local_bind_tuple()
+                if lb:
+                    logger.info("[preflight] Single-port TCP check using source bind local_ipv4=%r", lb[0])
+                _tcp_check(h, p, t, "configured game / upstream (first port)", source_address=lb)
             return
 
         from .upstream_probe import log_upstream_tcp_probe_async
 
-        results: list[tuple[int, str, float | None]] | None = None
+        default_bind = upstream_local_bind_tuple()
+        if default_bind:
+            logger.info(
+                "[preflight] Multi-port probe uses BOT_UPSTREAM_LOCAL_BIND_IPV4=%r for outbound sockets.",
+                default_bind[0],
+            )
+
         strict = _env_require_all_game_ports()
+
+        def _probe_satisfied(res: list[tuple[int, str, float | None]]) -> bool:
+            any_ok = any(status == "ok" for _port, status, _dt in res)
+            all_ok = all(status == "ok" for _port, status, _dt in res)
+            return any_ok and (not strict or all_ok)
+
+        results: list[tuple[int, str, float | None]] | None = None
         for attempt in range(retries + 1):
             results = asyncio.run(
-                log_upstream_tcp_probe_async(host, tuple(ports), timeout_sec=t),
+                log_upstream_tcp_probe_async(
+                    host,
+                    tuple(ports),
+                    timeout_sec=t,
+                    local_addr=default_bind,
+                ),
             )
             any_ok = any(status == "ok" for _port, status, _dt in results)
             all_ok = all(status == "ok" for _port, status, _dt in results)
@@ -350,12 +387,41 @@ def run_network_preflight(*, timeout_sec: float | None = None) -> None:
                     time.sleep(pause)
 
         assert results is not None
-        if not any(status == "ok" for _port, status, _dt in results):
+
+        if not _probe_satisfied(results) and env_preflight_try_account_bind_ips():
+            bind_ips = unique_account_bind_ipv4s_from_env()
+            if bind_ips:
+                logger.warning(
+                    "[preflight] Default-route probe failed — BOT_NET_PREFLIGHT_TRY_ACCOUNT_BIND_IPS=true; "
+                    "retrying multi-port probe with %s distinct row bind_ip source address(es).",
+                    len(bind_ips),
+                )
+                for bip in bind_ips:
+                    results = asyncio.run(
+                        log_upstream_tcp_probe_async(
+                            host,
+                            tuple(ports),
+                            timeout_sec=t,
+                            local_addr=(bip, 0),
+                        ),
+                    )
+                    if _probe_satisfied(results):
+                        logger.info(
+                            "[preflight] Probe succeeded with local_bind=%r — set "
+                            "BOT_UPSTREAM_USE_ACCOUNT_BIND_IP_FOR_SOCKET=true so each proxy slot binds upstream TCP "
+                            "the same way (see README).",
+                            bip,
+                        )
+                        break
+
+        if not _probe_satisfied(results):
             bad = ", ".join(f"{port}:{status}" for port, status, _dt in sorted(results, key=lambda x: x[0]))
             msg = (
                 f"[preflight] FATAL: could not open TCP to game host {host!r} on any of ports {ports} "
                 f"(all attempts failed: {bad}). This is reachability (firewall / ISP / VPN / captive portal / "
-                f"mobile CGNAT), not loader/crypto — fix network or use --skip-net-check to bypass (not recommended)."
+                f"mobile CGNAT), not loader/crypto — fix network or use --skip-net-check to bypass (not recommended). "
+                f"If each account uses bind_ip for Proxifier/multi-WAN, try BOT_NET_PREFLIGHT_TRY_ACCOUNT_BIND_IPS=true "
+                f"and BOT_UPSTREAM_USE_ACCOUNT_BIND_IP_FOR_SOCKET=true."
             )
             logger.error("%s", msg)
             raise SystemExit(msg)

@@ -99,6 +99,11 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_UPSTREAM_PROBE_FINAL_TIMEOUT_FLOOR_SEC": "20",
     "BOT_UPSTREAM_MAX_CONCURRENT_CONNECTS": "2",
     "BOT_UPSTREAM_OPEN_CONNECTION_TIMEOUT_SEC": "12",
+    # Bind outbound TCP to a local IPv4 (multi-WAN / Proxifier per-source routing).
+    "BOT_UPSTREAM_LOCAL_BIND_IPV4": "",
+    "BOT_UPSTREAM_USE_ACCOUNT_BIND_IP_FOR_SOCKET": "false",
+    # After default-route preflight fails, retry probe binding each distinct row bind_ip (reads BOT_ACCOUNTS_JSON).
+    "BOT_NET_PREFLIGHT_TRY_ACCOUNT_BIND_IPS": "false",
     "BOT_HEADLESS_CONNECT_TO_SATELLITE": "true",
     "BOT_HEADLESS_EXIT_AFTER_LOGIN_SUCCESS": "true",
     "BOT_HEADLESS_LOGIN_STAGGER_SEC": "2.5",

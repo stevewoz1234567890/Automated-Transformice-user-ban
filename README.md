@@ -141,6 +141,9 @@ TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE=aabbccdd...
 | `BOT_UPSTREAM_OPEN_CONNECTION_TIMEOUT_SEC` | `12` | Per-attempt timeout inside each upstream connect (wrapped with `asyncio.wait_for`). |
 | `BOT_UPSTREAM_OPEN_STREAMS_ROUND_RETRIES` | *(unset)* | Extra full port sweeps when every port fails once; defaults to `BOT_UPSTREAM_PROBE_RETRIES`. |
 | `BOT_UPSTREAM_OPEN_STREAMS_ROUND_PAUSE_SEC` | *(unset)* | Seconds between sweeps; defaults to `BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC`. |
+| `BOT_UPSTREAM_LOCAL_BIND_IPV4` | *(empty)* | Force **all** upstream probes and (when set) proxy connects to bind outbound TCP from this IPv4 (must exist on a local NIC). |
+| `BOT_UPSTREAM_USE_ACCOUNT_BIND_IP_FOR_SOCKET` | `false` | When `true`, each slot’s `BanBotProxy.open_streams` uses `local_addr=(row bind_ip, 0)` so traffic egresses like Proxifier expects (multi-WAN). |
+| `BOT_NET_PREFLIGHT_TRY_ACCOUNT_BIND_IPS` | `false` | If default-route preflight fails, retry the multi-port probe once **per distinct** `bind_ip` in `BOT_ACCOUNTS_JSON`. |
 | `BOT_PROXY_BIND_HOST` | *(all)* | IP the proxy listens on (leave blank for all interfaces) |
 | `BOT_SHARED_FLASH_SOCKET_POLICY_PORT` | `10801` | Port serving Flash socket policy for all slots |
 
@@ -195,7 +198,7 @@ You can set those keys manually instead of using `BOT_KNOWN_GOOD_PARITY_MODE`.
    - Repo-root **`TFMProxyLoader.swf`** (and match **`TFM_PROXY_SWF`** if you set it explicitly).
 2. **One stable uplink—no tether hopping** — Prefer reliable Wi‑Fi or Ethernet; avoid switching **phone tether ↔ Wi‑Fi** during a run. In `log.txt`, confirm **`[probe] SUMMARY: all … ports accepted TCP`** under **`[preflight]`** (use **`BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS=true`** to enforce).
 3. **Baseline with 2–3 slots** — Either trim **`BOT_ACCOUNTS_JSON`** by hand or set **`BOT_BASELINE_MAX_SLOTS=3`**. Each row needs a **unique `proxy_port`**. Run until **`All N slot(s) logged in — proceeding`** without repeated PARTL retries.
-4. **Scale up, then tighten Proxifier** — Add more accounts gradually (set **`BOT_BASELINE_MAX_SLOTS=0`**). **`bind_ip` in JSON is reference only** unless an external tool routes traffic: route the process that opens **upstream TCP to the game**—typically **`python.exe`**, **`venv\Scripts\python.exe`**, or **`ban_bot.exe`**—not Flash alone. Preflight logs the exact **`exe=`** path.
+4. **Scale up, then tighten Proxifier** — Add more accounts gradually (set **`BOT_BASELINE_MAX_SLOTS=0`**). **`bind_ip` in JSON is reference only** unless an external tool routes traffic: route the process that opens **upstream TCP to the game**—typically **`python.exe`**, **`venv\Scripts\python.exe`**, or **`ban_bot.exe`**—not Flash alone. Preflight logs the exact **`exe=`** path. If preflight passes only on tether but fails on Wi‑Fi while each row has **`bind_ip`**, enable **`BOT_NET_PREFLIGHT_TRY_ACCOUNT_BIND_IPS=true`** and **`BOT_UPSTREAM_USE_ACCOUNT_BIND_IP_FOR_SOCKET=true`** so TCP uses those source addresses (README proxy table).
 
 If the 2–3-slot baseline fails even after (1)–(2), the problem is almost always **network reachability** or **artifact mismatch**, not “how many Flash windows.”
 

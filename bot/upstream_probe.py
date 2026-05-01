@@ -27,11 +27,15 @@ async def _probe_one_port(
     port: int,
     *,
     timeout_sec: float,
+    local_addr: tuple[str, int] | None = None,
 ) -> tuple[int, str, float | None]:
     t0 = time.monotonic()
     try:
+        oc_kw: dict[str, object] = {}
+        if local_addr is not None:
+            oc_kw["local_addr"] = local_addr
         _reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
+            asyncio.open_connection(host, port, **oc_kw),
             timeout=timeout_sec,
         )
         dt = time.monotonic() - t0
@@ -54,9 +58,12 @@ async def probe_upstream_tcp_parallel(
     ports: Iterable[int],
     *,
     timeout_sec: float,
+    local_addr: tuple[str, int] | None = None,
 ) -> list[tuple[int, str, float | None]]:
     ports_list = [int(p) for p in ports]
-    tasks = [_probe_one_port(host, p, timeout_sec=timeout_sec) for p in ports_list]
+    tasks = [
+        _probe_one_port(host, p, timeout_sec=timeout_sec, local_addr=local_addr) for p in ports_list
+    ]
     return list(await asyncio.gather(*tasks))
 
 
@@ -65,15 +72,26 @@ async def log_upstream_tcp_probe_async(
     ports: tuple[int, ...],
     *,
     timeout_sec: float,
+    local_addr: tuple[str, int] | None = None,
 ) -> list[tuple[int, str, float | None]]:
-    logger.info(
-        "[probe] Parallel TCP connect test host=%r ports=%s timeout=%.1fs per port (no game protocol)",
-        host,
-        ports,
-        timeout_sec,
-    )
+    if local_addr is not None:
+        logger.info(
+            "[probe] Parallel TCP connect test host=%r ports=%s timeout=%.1fs local_bind=%r per port "
+            "(no game protocol)",
+            host,
+            ports,
+            timeout_sec,
+            local_addr[0],
+        )
+    else:
+        logger.info(
+            "[probe] Parallel TCP connect test host=%r ports=%s timeout=%.1fs per port (no game protocol)",
+            host,
+            ports,
+            timeout_sec,
+        )
     t0 = time.monotonic()
-    results = await probe_upstream_tcp_parallel(host, ports, timeout_sec=timeout_sec)
+    results = await probe_upstream_tcp_parallel(host, ports, timeout_sec=timeout_sec, local_addr=local_addr)
     elapsed = time.monotonic() - t0
     ok = [r for r in results if r[1] == "ok"]
     bad = [r for r in results if r[1] != "ok"]
