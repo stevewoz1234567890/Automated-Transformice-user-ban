@@ -34,6 +34,16 @@ def _env_extended() -> bool:
     )
 
 
+def _env_require_all_game_ports() -> bool:
+    """When true, multi-port preflight fails unless every configured port accepts TCP (parity baseline)."""
+    return (os.environ.get("BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _probe_timeout_sec() -> float:
     raw = (os.environ.get("BOT_UPSTREAM_PROBE_TIMEOUT_SEC") or "").strip()
     try:
@@ -213,12 +223,24 @@ def run_network_preflight(*, timeout_sec: float | None = None) -> None:
     ext = _env_extended()
 
     logger.info("[preflight] ========== network path (before bot proxies start) ==========")
+    if _env_require_all_game_ports():
+        logger.info(
+            "[preflight] BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS=true — each configured game port must accept TCP "
+            "(not only one). Matches known-good parity baseline; disable if your network blocks some ports.",
+        )
     logger.info(
         "[preflight] platform=%s python=%s extended=%s timeout=%.1fs",
         sys.platform,
         sys.version.split()[0],
         ext,
         t,
+    )
+    frozen = bool(getattr(sys, "frozen", False))
+    logger.info(
+        "[preflight] Process opening upstream game TCP: exe=%r frozen=%s — "
+        "route this executable in Proxifier/split-VPN when using per-account bind_ip.",
+        sys.executable,
+        frozen,
     )
 
     if ext:
@@ -251,9 +273,34 @@ def run_network_preflight(*, timeout_sec: float | None = None) -> None:
             )
             logger.error("%s", msg)
             raise SystemExit(msg)
+        if _env_require_all_game_ports():
+            failed = [(port, status) for port, status, _dt in results if status != "ok"]
+            if failed:
+                bad = ", ".join(f"{port}:{status}" for port, status in failed)
+                msg = (
+                    f"[preflight] FATAL: BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS=true but some ports failed "
+                    f"host={host!r} failures=[{bad}]. Use one stable uplink (no tether/Wi‑Fi hopping), fix firewall, "
+                    f"or set BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS=false if partial connectivity is acceptable."
+                )
+                logger.error("%s", msg)
+                raise SystemExit(msg)
+            logger.info(
+                "[preflight] Strict all-ports check: %s/%s OK — baseline parity satisfied for configured ports.",
+                len(results),
+                len(results),
+            )
+        else:
+            logger.info(
+                "[preflight] Upstream: at least one game port OK — multi-port probe helps spot partial blocks "
+                "(some networks allow 12801 but not 11801, etc.). Set BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS=true "
+                "to require every port (recommended when proving parity vs a known-good PC).",
+            )
         logger.info(
-            "[preflight] Upstream: at least one game port OK — multi-port probe helps spot partial blocks "
-            "(some networks allow 12801 but not 11801, etc.).",
+            "[preflight] Reachability: startup probe success does not guarantee mid-session TCP stability "
+            "(tether handoff, Wi‑Fi sleep, VPN). Log keyword upstream-tcp-all-ports-failed indicates "
+            "connect-after-startup failure; re-run `python -m bot.upstream_probe %s %s`.",
+            host,
+            " ".join(str(p) for p in ports),
         )
         return
 

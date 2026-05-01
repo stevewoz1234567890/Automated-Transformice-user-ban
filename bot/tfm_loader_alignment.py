@@ -268,7 +268,9 @@ def log_client_asset_alignment(repo_root: Path) -> None:
             "Client/asset alignment: cannot verify TFM_SECRETS_GAME_VERSION=%s against this loader SWF "
             "(no literal version substring and no swf=r… / gameversion… hints in decompressed payload). "
             "Persistent ActionScript errors often mean TFM_PROXY_SWF is stale vs the live web client — "
-            "re-dump the loader from current Transformice or align secrets.",
+            "re-dump the loader from current Transformice or align secrets. "
+            "Cross-PC: copy this SWF + the full TFM_SECRETS_* block from a machine where Transformice "
+            "loads cleanly (README: Proving parity on another PC).",
             cfg_gvi,
         )
 

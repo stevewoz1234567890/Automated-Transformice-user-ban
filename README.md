@@ -136,6 +136,7 @@ TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE=aabbccdd...
 | `BOT_PACKET_LOGIN_START_ROOM` | *(empty)* | Optional start room sent in `LoginPacket` |
 | `BOT_PROXY_VERBOSE_LOGIN_FLOW` | `true` | Log extra handshake / login packet details |
 | `BOT_PROXY_LOG_ALL_MAIN_PACKETS` | `false` | Log every main-connection packet (debug) |
+| `BOT_PROXY_UPSTREAM_FAIL_TRACE` | *(unset)* | If `true`, log a Python traceback when upstream TCP fails all game ports (after per-port WARNINGs) |
 | `BOT_PROXY_BIND_HOST` | *(all)* | IP the proxy listens on (leave blank for all interfaces) |
 | `BOT_SHARED_FLASH_SOCKET_POLICY_PORT` | `10801` | Port serving Flash socket policy for all slots |
 
@@ -156,6 +157,40 @@ TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE=aabbccdd...
 | `BOT_BAN_DELAY_MAX_SEC` | `2.0` | Maximum random gap between `/ban` sends |
 | `BOT_ROOM_STAGGER_SEC` | `0.15` | Stagger between `JoinRoomPacket` sends across slots |
 | `BOT_BAN_QUORUM_REPORTS` | `11` | Typical in-room distinct reports needed for a ban — [docs](docs/BAN_QUORUM_TRANSFORMICE.md); used for warnings only |
+
+---
+
+## Proving parity on another PC (known-good baseline)
+
+Use this when the bot is stable on **your** machine but flaky on a friend’s (mass PARTL, ActionScript dialogs, preflight timeouts). The goal is to prove **same files + stable network + low slot count** before scaling Proxifier or slot count.
+
+### One-shot automation (recommended)
+
+In `.env` set **`BOT_KNOWN_GOOD_PARITY_MODE=true`** (see `bot/bot_env_defaults.py`). On startup the bot applies **`setdefault`** only (your explicit `.env` values win):
+
+- **`BOT_BASELINE_MAX_SLOTS=3`** — use only the first three `BOT_ACCOUNTS_JSON` rows  
+- **`BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS=true`** — exit unless **every** configured game port accepts TCP (not just one)  
+- **`BOT_PARITY_STARTUP_REMINDERS=true`** — log a **`[parity]`** checklist  
+
+You can set those keys manually instead of using `BOT_KNOWN_GOOD_PARITY_MODE`.
+
+| Key | Purpose |
+|-----|---------|
+| `BOT_KNOWN_GOOD_PARITY_MODE` | Enables the three defaults above via `setdefault` |
+| `BOT_BASELINE_MAX_SLOTS` | `0` = use full `BOT_ACCOUNTS_JSON`; `2`–`3` = baseline slice (unique `proxy_port` per row still required) |
+| `BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS` | Require **`[probe] SUMMARY: all N ports accepted TCP`** (fatal if any port fails) |
+| `BOT_PARITY_STARTUP_REMINDERS` | Log **`[parity]`** checklist at startup; **also implied** when `BOT_BASELINE_MAX_SLOTS` > 0 |
+
+### Manual checklist (same logic)
+
+1. **Copy known-good crypto and loader** from the working PC into the same paths on the other PC:
+   - The full **`TFM_SECRETS_*`** block in `.env` (and keep `TFM_SECRETS_SERVER_ADDRESS` / `TFM_SECRETS_SERVER_PORTS` consistent with that dump).
+   - Repo-root **`TFMProxyLoader.swf`** (and match **`TFM_PROXY_SWF`** if you set it explicitly).
+2. **One stable uplink—no tether hopping** — Prefer reliable Wi‑Fi or Ethernet; avoid switching **phone tether ↔ Wi‑Fi** during a run. In `log.txt`, confirm **`[probe] SUMMARY: all … ports accepted TCP`** under **`[preflight]`** (use **`BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS=true`** to enforce).
+3. **Baseline with 2–3 slots** — Either trim **`BOT_ACCOUNTS_JSON`** by hand or set **`BOT_BASELINE_MAX_SLOTS=3`**. Each row needs a **unique `proxy_port`**. Run until **`All N slot(s) logged in — proceeding`** without repeated PARTL retries.
+4. **Scale up, then tighten Proxifier** — Add more accounts gradually (set **`BOT_BASELINE_MAX_SLOTS=0`**). **`bind_ip` in JSON is reference only** unless an external tool routes traffic: route the process that opens **upstream TCP to the game**—typically **`python.exe`**, **`venv\Scripts\python.exe`**, or **`ban_bot.exe`**—not Flash alone. Preflight logs the exact **`exe=`** path.
+
+If the 2–3-slot baseline fails even after (1)–(2), the problem is almost always **network reachability** or **artifact mismatch**, not “how many Flash windows.”
 
 ---
 

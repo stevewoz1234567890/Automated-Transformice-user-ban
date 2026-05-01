@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import sys
 import threading
 import time
@@ -351,6 +352,7 @@ class BanBotProxy(Proxy):
         packet_login_delay_sec: float = 0.35,
         packet_login_start_room: str = "",
         main_keepalive_interval_sec: float = 15.0,
+        account_bind_ip: str = "",
         **kwargs,
     ):
         # Flash file:// SWF + Socket: use IPv4 literal so the client never targets the public
@@ -381,6 +383,8 @@ class BanBotProxy(Proxy):
         self._main_keepalive_interval_sec = float(main_keepalive_interval_sec)
         self._main_keepalive_task: asyncio.Task | None = None
         self._main_keepalive_started = False
+        # Proxifier reference only (logged when upstream TCP fails); not used for bind().
+        self._account_bind_ip = (account_bind_ip or "").strip()
         # Track when startup() opened the listeners and when MAIN TCP / login
         # success first arrived. Used to annotate the "logged in as …" line with
         # the wall-clock timing so slow slots are easy to spot.
@@ -462,6 +466,35 @@ class BanBotProxy(Proxy):
             self._register_verbose_login_flow_listeners()
         if log_all_main_packets:
             self.register_packet_listener(self._log_all_main_packet, Packet)
+
+    async def open_streams(self, address, ports):
+        """Try game ports like ``caseus.Proxy.open_streams``, logging each failure for diagnostics."""
+        port_list = list(ports)
+        failures: list[tuple[int, str, str]] = []
+        for port in random.sample(port_list, len(port_list)):
+            try:
+                return await asyncio.open_connection(address, port)
+            except Exception as e:
+                msg = str(e).strip().replace("\n", " ")
+                if len(msg) > 180:
+                    msg = msg[:177] + "..."
+                failures.append((port, type(e).__name__, msg))
+                continue
+        logger.warning(
+            "Slot %s: upstream TCP failed every attempt host=%r ports=%s per_try=%s "
+            "bind_ip(ref)=%r env_main_server_address=%r python_exe=%r — "
+            "typical causes: tether/Wi‑Fi handoff, VPN drop, firewall, or Proxifier/split-routing not "
+            "applied to this Python process (see README). Startup preflight does not guarantee "
+            "mid-session reachability.",
+            self.slot_label,
+            address,
+            port_list,
+            failures,
+            self._account_bind_ip or "(none)",
+            getattr(self, "main_server_address", None),
+            sys.executable,
+        )
+        raise ValueError(f"Unable to connect to address '{address}' on ports {port_list}")
 
     def _during_login_wait(self) -> bool:
         ev = self._login_success_event
@@ -1199,6 +1232,32 @@ class BanBotProxy(Proxy):
         close_exc: BaseException | None = None
         try:
             await super().new_main_connection(client_reader, client_writer)
+        except ValueError as e:
+            # Upstream connect exhaustion (see ``open_streams``) — already logged per-port.
+            close_reason = "upstream-tcp-all-ports-failed"
+            close_exc = e
+            hint_os = ""
+            if sys.platform == "win32":
+                hint_os = (
+                    " On Windows, confirm Wi‑Fi/power savings off for the active adapter and that "
+                    "Proxifier targets this python.exe."
+                )
+            logger.warning(
+                "Slot %s: MAIN ended with %s (%s). "
+                "See prior WARNING lines for per-port errors; grep upstream-tcp-all-ports-failed.%s",
+                self.slot_label,
+                close_reason,
+                e,
+                hint_os,
+            )
+            if (
+                os.environ.get("BOT_PROXY_UPSTREAM_FAIL_TRACE", "").strip().lower()
+                in ("1", "true", "yes", "on", "debug")
+            ):
+                logger.exception(
+                    "Slot %s: BOT_PROXY_UPSTREAM_FAIL_TRACE enabled — full traceback",
+                    self.slot_label,
+                )
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
             close_reason = f"{type(e).__name__}"
             close_exc = e
@@ -1206,6 +1265,12 @@ class BanBotProxy(Proxy):
                 "Slot %s: main connection OS-level error (%s: %s)",
                 self.slot_label, type(e).__name__, e,
             )
+            if sys.platform == "win32" and getattr(e, "winerror", None) == 121:
+                logger.warning(
+                    "Slot %s: WinError 121 (semaphore timeout) — often Wi‑Fi/USB tether overload or TCP "
+                    "stack contention; try fewer simultaneous Flash slots, higher stagger, or a stable uplink.",
+                    self.slot_label,
+                )
         except Exception as e:  # noqa: BLE001
             close_reason = f"unhandled:{type(e).__name__}"
             close_exc = e

@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import atexit
 import concurrent.futures
+import json
 import logging
 import random
 import os
@@ -312,6 +313,7 @@ def _run_slot_async(
                 host_satellite_port=state.satellite_port,
                 host_socket_policy_port=state.policy_port,
                 slot_label=state.label,
+                account_bind_ip=state.current_bind_ip or "",
                 login_success_event=state.login_success_event,
                 login_aborted_event=state.login_aborted_event,
                 on_first_main_connection=hook,
@@ -2308,6 +2310,48 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _apply_known_good_parity_mode_env_defaults() -> None:
+    """
+    ``BOT_KNOWN_GOOD_PARITY_MODE=true`` sets baseline defaults (setdefault only — .env wins if explicit).
+
+    Runs before network preflight so strict multi-port probe applies on this process start.
+    """
+    from .env_setup import env_truthy
+
+    if not env_truthy("BOT_KNOWN_GOOD_PARITY_MODE"):
+        return
+    os.environ.setdefault("BOT_BASELINE_MAX_SLOTS", "3")
+    os.environ.setdefault("BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS", "true")
+    os.environ.setdefault("BOT_PARITY_STARTUP_REMINDERS", "true")
+    logger.info(
+        "[parity] BOT_KNOWN_GOOD_PARITY_MODE=true — applied defaults: BOT_BASELINE_MAX_SLOTS=3, "
+        "BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS=true, BOT_PARITY_STARTUP_REMINDERS=true (unless overridden in .env).",
+    )
+
+
+def _log_parity_workflow_reminders(cfg: object) -> None:
+    """Structured checklist — matches README “Proving parity on another PC”."""
+    strict = bool(getattr(cfg, "NET_PREFLIGHT_REQUIRE_ALL_PORTS", False))
+    n_acc = len(getattr(cfg, "ACCOUNTS", []) or [])
+    tfm_swf = (os.environ.get("TFM_PROXY_SWF") or "").strip()
+    swf_note = (
+        "TFM_PROXY_SWF points at a custom path — copy that file too."
+        if tfm_swf
+        else "TFM_PROXY_SWF unset — use repo-root TFMProxyLoader.swf."
+    )
+    logger.info(
+        "[parity] Baseline checklist: (1) Copy full TFM_SECRETS_* block + TFMProxyLoader.swf from a working PC (%s) "
+        "(2) One stable uplink; in log.txt grep `[probe] SUMMARY:` lines for `accepted TCP` "
+        "(strict all-port preflight=%s via BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS). "
+        "(3) Effective BOT_ACCOUNTS_JSON rows=%s (BOT_BASELINE_MAX_SLOTS). "
+        "(4) Route upstream game TCP in Proxifier/split-VPN for exe=%r.",
+        swf_note,
+        strict,
+        n_acc,
+        sys.executable,
+    )
+
+
 def _cfg_shared_flash_policy_port(cfg) -> int | None:
     """Port where TFMProxyLoader expects ``xmlsocket://localhost:...`` (upstream uses 10801)."""
     raw = getattr(cfg, "SHARED_FLASH_SOCKET_POLICY_PORT", 10801)
@@ -2333,6 +2377,7 @@ def main(argv: list[str] | None = None) -> None:
     ban_summaries: list[dict[str, object]] = []
     session_exit_reason = "finished"
     args = _parse_args(argv)
+    _apply_known_good_parity_mode_env_defaults()
     from .run_checklist import prompt_run_checklist
 
     prompt_run_checklist()
@@ -2360,7 +2405,31 @@ def main(argv: list[str] | None = None) -> None:
     if isinstance(proxy_bind, str):
         proxy_bind = proxy_bind.strip() or None
 
-    raw_accounts = cfg.ACCOUNTS
+    raw_accounts = list(cfg.ACCOUNTS)
+    baseline_max = int(getattr(cfg, "BASELINE_MAX_SLOTS", 0) or 0)
+    if baseline_max > 0:
+        n_full = len(raw_accounts)
+        if n_full > baseline_max:
+            logger.warning(
+                "BOT_BASELINE_MAX_SLOTS=%s: using only the first %s of %s account row(s) "
+                "(known-good parity baseline). Set BOT_BASELINE_MAX_SLOTS=0 to use the full list.",
+                baseline_max,
+                baseline_max,
+                n_full,
+            )
+            raw_accounts = raw_accounts[:baseline_max]
+        cfg.ACCOUNTS = raw_accounts
+        try:
+            os.environ["BOT_ACCOUNTS_JSON"] = json.dumps(
+                raw_accounts,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except Exception:
+            logger.debug("Could not refresh BOT_ACCOUNTS_JSON env after baseline slice", exc_info=True)
+
+    if bool(getattr(cfg, "PARITY_STARTUP_REMINDERS", False)) or baseline_max > 0:
+        _log_parity_workflow_reminders(cfg)
     # False: listen on PROXY_BIND_HOST or all interfaces; row bind_ip is Proxifier reference only.
     # True only if each bind_ip is assigned to a NIC on *this* machine (otherwise bind() fails).
     use_account_bind_ip = getattr(cfg, "PROXY_LISTEN_USE_ACCOUNT_BIND_IP", False)

@@ -83,6 +83,14 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_UPSTREAM_ABORT_ON_PROBE_ALL_FAILED": "false",
     # Startup: DNS + local IPv4 hint + HTTP_PROXY note + multi-port TCP (see bot.net_preflight). Set false for legacy single-port-only check.
     "BOT_NET_PREFLIGHT_EXTENDED": "true",
+    # Known-good PC parity (see README): optional one-shot defaults via BOT_KNOWN_GOOD_PARITY_MODE.
+    "BOT_KNOWN_GOOD_PARITY_MODE": "false",
+    # Use only first N rows of BOT_ACCOUNTS_JSON (unique proxy_port each); 0 = use full list.
+    "BOT_BASELINE_MAX_SLOTS": "0",
+    # Fail startup unless every configured game port accepts TCP (stricter than default any-port-OK).
+    "BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS": "false",
+    # Log [parity] checklist at startup (also implied when BOT_BASELINE_MAX_SLOTS > 0).
+    "BOT_PARITY_STARTUP_REMINDERS": "false",
     "BOT_UPSTREAM_PROBE_TIMEOUT_SEC": "6",
     "BOT_UPSTREAM_PROBE_RETRIES": "2",
     "BOT_UPSTREAM_PROBE_RETRY_PAUSE_SEC": "3",

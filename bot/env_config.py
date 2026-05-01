@@ -215,6 +215,15 @@ def load_config_from_env(repo_root: Path) -> object:
     bind = (os.environ.get("BOT_PROXY_BIND_HOST") or "").strip()
     ns.PROXY_BIND_HOST = bind if bind else None
     B("PROXY_LISTEN_USE_ACCOUNT_BIND_IP", "BOT_PROXY_LISTEN_USE_ACCOUNT_BIND_IP", False)
+    B("NET_PREFLIGHT_REQUIRE_ALL_PORTS", "BOT_NET_PREFLIGHT_REQUIRE_ALL_PORTS", False)
+    B("PARITY_STARTUP_REMINDERS", "BOT_PARITY_STARTUP_REMINDERS", False)
+    _bms = (os.environ.get("BOT_BASELINE_MAX_SLOTS") or "").strip()
+    try:
+        ns.BASELINE_MAX_SLOTS = int(_bms, 10) if _bms else 0
+    except ValueError:
+        logger.warning("BOT_BASELINE_MAX_SLOTS invalid %r — using 0", _bms)
+        ns.BASELINE_MAX_SLOTS = 0
+    ns.BASELINE_MAX_SLOTS = max(0, min(64, int(ns.BASELINE_MAX_SLOTS)))
     pbind = (os.environ.get("BOT_FLASH_SOCKET_POLICY_BIND_HOST") or "").strip()
     if pbind:
         ns.FLASH_SOCKET_POLICY_BIND_HOST = pbind
