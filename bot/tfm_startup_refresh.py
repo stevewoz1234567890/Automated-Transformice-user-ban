@@ -100,7 +100,7 @@ def github_latest_asset_download_url(*, github_repo: str, asset_filename: str) -
     return fallback
 
 
-def fetch_proxy_loader_swf(repo: Path) -> bool:
+def fetch_proxy_loader_swf(repo: Path, *, force: bool = False) -> bool:
     """Download ``TFMProxyLoader.swf`` into repo root or ``TFM_PROXY_SWF``."""
     if not _truthy("BOT_FLASH_AUTO_FETCH_PROXY_LOADER", True):
         logger.info("[refresh] Loader download disabled (BOT_FLASH_AUTO_FETCH_PROXY_LOADER=false)")
@@ -109,7 +109,11 @@ def fetch_proxy_loader_swf(repo: Path) -> bool:
     dest = Path(explicit).expanduser().resolve() if explicit else (repo / "TFMProxyLoader.swf")
     refresh_each = _truthy("BOT_FLASH_REFRESH_PROXY_LOADER_EACH_RUN", False)
     fetch_if_missing = _truthy("BOT_FLASH_FETCH_PROXY_LOADER_IF_MISSING", True)
-    need_download = (not dest.is_file() and fetch_if_missing) or (dest.is_file() and refresh_each)
+    need_download = bool(force) or (not dest.is_file() and fetch_if_missing) or (
+        dest.is_file() and refresh_each
+    )
+    if force:
+        logger.info("[refresh] Forcing loader re-download → %s", dest)
     if not need_download:
         if dest.is_file():
             logger.info(
@@ -242,10 +246,36 @@ def run_flash_startup_refresh(repo: Path) -> None:
         logger.info("[refresh] Disabled via BOT_FLASH_STARTUP_REFRESH_TFM_ASSETS=false")
         return
 
+    prior_gv = (os.environ.get("TFM_SECRETS_GAME_VERSION") or "").strip()
     refreshed = refresh_tfm_secrets_via_dumpers(repo)
     if refreshed:
         from .env_setup import sync_upstream_env_with_tfm_secrets
 
         sync_upstream_env_with_tfm_secrets()
 
-    fetch_proxy_loader_swf(repo)
+    force_loader = False
+    if refreshed and _truthy("BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_REFRESH", True):
+        new_gv = (os.environ.get("TFM_SECRETS_GAME_VERSION") or "").strip()
+        if not _truthy("BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED", True):
+            force_loader = True
+            logger.info(
+                "[refresh] Secrets refreshed — fetching loader "
+                "(BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED=false).",
+            )
+        elif prior_gv != new_gv or not prior_gv:
+            force_loader = True
+            logger.info(
+                "[refresh] Secrets refreshed and game_version %r → %r — re-fetching loader "
+                "so TFM_PROXY_SWF matches new crypto/build.",
+                prior_gv or "(unset)",
+                new_gv or "(unset)",
+            )
+        else:
+            logger.info(
+                "[refresh] Secrets refreshed but TFM_SECRETS_GAME_VERSION unchanged (%r); "
+                "keeping existing loader (set BOT_FLASH_REFRESH_PROXY_LOADER_EACH_RUN=true "
+                "or BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED=false to always replace).",
+                new_gv,
+            )
+
+    fetch_proxy_loader_swf(repo, force=force_loader)
