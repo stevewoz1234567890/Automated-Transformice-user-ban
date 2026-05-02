@@ -184,6 +184,12 @@ def _maybe_log_first_seen_as_fingerprint(
         hwnd,
         preview,
     )
+    try:
+        from .issue1_forensic import log_as_error_slot_banner
+
+        log_as_error_slot_banner(slot_label, pid, fp)
+    except Exception:
+        logger.debug("ISSUE1_AS_FIRST_FP banner failed", exc_info=True)
     if (os.environ.get("FLASH_ERROR_LOG_FULL_BODY_FIRST_FP") or "").strip().lower() in (
         "1", "true", "yes", "on",
     ) and len(norm) > prev_cap:

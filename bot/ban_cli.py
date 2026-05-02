@@ -2443,6 +2443,9 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     _apply_known_good_parity_mode_env_defaults()
     _configure_logging()
+    from . import issue1_forensic
+
+    issue1_forensic.apply_env_overrides()
     reset_trace_session()
     trace_step(logger, "main", "CLI session begin argv_summary skip_net_check=%s", args.skip_net_check)
     tfm_startup_refresh.run_flash_startup_refresh(_repo_root())
@@ -2791,18 +2794,29 @@ def main(argv: list[str] | None = None) -> None:
                 _lo,
                 _pb,
             )
-            if (os.environ.get("BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE") or "").strip().lower() in (
+            _rc_deep = (os.environ.get("BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE") or "").strip().lower() in (
                 "1",
                 "true",
                 "yes",
                 "on",
-            ):
+            )
+            _issue1 = (os.environ.get("BOT_ISSUE1_FORENSIC") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if _rc_deep or _issue1:
+                _tags = []
+                if _issue1:
+                    _tags.append("BOT_ISSUE1_FORENSIC")
+                if _rc_deep:
+                    _tags.append("BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE")
                 logger.info(
-                    "ROOT_CAUSE logging: BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE=true — each MAIN end logs "
-                    "ROOT_CAUSE_MAIN_CLOSE (Flash→proxy TCP snapshot, srv/cli packet rings, errno/winerror, "
-                    "sec_since_as_dismiss). For longer AS traces set FLASH_ERROR_FIRST_FP_PREVIEW_CHARS, "
-                    "FLASH_ERROR_LOG_FULL_BODY_FIRST_FP, FLASH_ERROR_DISMISS_BODY_LOG_CHARS, "
-                    "BOT_PROXY_MAIN_PACKET_RING."
+                    "Deep MAIN teardown logging [%s] — grep ISSUE1_HANDSHAKE / ISSUE1_MAIN_CLOSE / "
+                    "ISSUE1_AS_FIRST_FP and ROOT_CAUSE_MAIN_CLOSE. With BOT_ISSUE1_FORENSIC, rings and AS "
+                    "previews widen automatically. Optional: BOT_PROXY_LOG_ALL_MAIN_PACKETS=true.",
+                    "+".join(_tags),
                 )
 
         # Start global dismiss poller BEFORE launching any Flash windows so

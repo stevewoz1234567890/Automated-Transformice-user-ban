@@ -191,6 +191,9 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_PROXY_MAIN_CLOSE_VERBOSE": "false",
     # Extra tcp_side_guess + sess_counts on MAIN close (set false to shorten lines).
     "BOT_PROXY_MAIN_RC_HINT": "true",
+    # One-shot "issue 1" hunt: correlates Handshake game_version vs TFM_SECRETS_GAME_VERSION, MAIN teardown
+    # vs upstream socket + loader sha, AS first fingerprint — forces ROOT_CAUSE_MAIN_CLOSE + verbose login.
+    "BOT_ISSUE1_FORENSIC": "false",
     # Deep clean-eof hunt: WARNING ROOT_CAUSE_MAIN_CLOSE on every MAIN end (Flash TCP, rings, AS-dismiss delta).
     "BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE": "false",
     # Last N packet labels per direction on MAIN (raise during ROOT_CAUSE runs; default 8).

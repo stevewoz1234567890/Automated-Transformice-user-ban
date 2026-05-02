@@ -500,6 +500,8 @@ class BanBotProxy(Proxy):
         self._main_sess_ping_srv: int = 0
         self._main_sess_pong_cli: int = 0
         self._main_sess_anticheat_cli: int = 0
+        self._issue1_last_handshake_gv: str | None = None
+        self._issue1_last_handshake_lss: object | None = None
         # Last close summary for slot-status / grep (set in new_main_connection finally).
         self._main_last_close_diag: str | None = None
         # Cumulative (optional): last join seen on this proxy process.
@@ -926,11 +928,26 @@ class BanBotProxy(Proxy):
         )
 
     async def _vl_handshake_sb(self, source, packet):
-        if not getattr(source, "is_satellite", False) and self._main_handshake_mono is None:
+        sat = getattr(source, "is_satellite", False)
+        if not sat and self._main_handshake_mono is None:
             self._main_handshake_mono = time.monotonic()
+        if not sat:
+            gv = getattr(packet, "game_version", None)
+            self._issue1_last_handshake_gv = None if gv is None else str(gv)
+            self._issue1_last_handshake_lss = getattr(packet, "loader_stage_size", None)
+            try:
+                from .issue1_forensic import maybe_warn_handshake_mismatch
+
+                maybe_warn_handshake_mismatch(
+                    self,
+                    flash_game_version=self._issue1_last_handshake_gv,
+                    loader_stage_size=self._issue1_last_handshake_lss,
+                )
+            except Exception:
+                logger.debug("ISSUE1_HANDSHAKE hook failed", exc_info=True)
         if not self._verbose_login_flow:
             return
-        conn = "SAT" if getattr(source, "is_satellite", False) else "MAIN"
+        conn = "SAT" if sat else "MAIN"
         logger.info(
             "Slot %s [%s→srv] HandshakePacket game_version=%s loader_stage_size=%s player_type=%s "
             "browser_info=%r referrer=%s",
@@ -1392,6 +1409,8 @@ class BanBotProxy(Proxy):
         self._main_sess_ping_srv = 0
         self._main_sess_pong_cli = 0
         self._main_sess_anticheat_cli = 0
+        self._issue1_last_handshake_gv = None
+        self._issue1_last_handshake_lss = None
         close_reason = "clean-eof"
         close_exc: BaseException | None = None
         trace_step(
@@ -1528,7 +1547,9 @@ class BanBotProxy(Proxy):
                     self.slot_label,
                     diag,
                 )
-            if _env_truthy("BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE"):
+            need_rc = _env_truthy("BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE")
+            need_i1 = _env_truthy("BOT_ISSUE1_FORENSIC")
+            if need_rc or need_i1:
                 from .flash_launch import last_as_dismiss_monotonic_for_slot
 
                 now_p = time.monotonic()
@@ -1538,24 +1559,43 @@ class BanBotProxy(Proxy):
                     if adm is not None
                     else "as_dismiss_never_this_slot"
                 )
-                logger.warning(
-                    "ROOT_CAUSE_MAIN_CLOSE slot=%s main_tcp#=%s phase=%s reason=%s login_age=%s %s | "
-                    "%s | %s | %s",
-                    self.slot_label,
-                    getattr(self, "_main_tcp_generation", 0),
-                    get_operator_phase(),
-                    close_reason,
-                    f"{since_login:.3f}s" if since_login is not None else "n/a",
-                    _root_cause_exc_fields(close_exc),
-                    _root_cause_flash_tcp_snapshot(client_writer),
-                    _main_ring_timeline(
-                        self._main_recent_from_server, now_mono=now_p, tag="srv_ring"
-                    ),
-                    _main_ring_timeline(
-                        self._main_recent_from_client, now_mono=now_p, tag="cli_ring"
-                    ),
-                    as_part,
-                )
+                flash_snap = _root_cause_flash_tcp_snapshot(client_writer)
+                if need_rc:
+                    logger.warning(
+                        "ROOT_CAUSE_MAIN_CLOSE slot=%s main_tcp#=%s phase=%s reason=%s login_age=%s %s | "
+                        "%s | %s | %s",
+                        self.slot_label,
+                        getattr(self, "_main_tcp_generation", 0),
+                        get_operator_phase(),
+                        close_reason,
+                        f"{since_login:.3f}s" if since_login is not None else "n/a",
+                        _root_cause_exc_fields(close_exc),
+                        flash_snap,
+                        _main_ring_timeline(
+                            self._main_recent_from_server, now_mono=now_p, tag="srv_ring"
+                        ),
+                        _main_ring_timeline(
+                            self._main_recent_from_client, now_mono=now_p, tag="cli_ring"
+                        ),
+                        as_part,
+                    )
+                if need_i1:
+                    try:
+                        from .issue1_forensic import log_main_teardown_banner
+
+                        log_main_teardown_banner(
+                            self,
+                            close_reason=close_reason,
+                            alive_sec=alive_sec,
+                            since_login=since_login,
+                            close_exc=close_exc,
+                            diag=diag,
+                            flash_tcp_snapshot=flash_snap,
+                            as_since_dismiss=as_part,
+                            packet_login_sent=bool(getattr(self, "_packet_login_sent", False)),
+                        )
+                    except Exception:
+                        logger.debug("ISSUE1_MAIN_CLOSE banner failed", exc_info=True)
             if os.environ.get("BOT_PROXY_MAIN_CLOSE_VERBOSE", "").strip().lower() in (
                 "1",
                 "true",
