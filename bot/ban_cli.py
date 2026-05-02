@@ -46,6 +46,7 @@ from .ban_proxy import (
 )
 from . import flash_launch
 from . import tfm_loader_alignment
+from . import tfm_startup_refresh
 from . import tfm_swf_port_patch
 from .portutil import ensure_port_free_or_kill_same_bot, tcp_port_is_free
 from .trace_log import asyncio_trace_install, reset_trace_session, trace_step
@@ -2444,6 +2445,7 @@ def main(argv: list[str] | None = None) -> None:
     _configure_logging()
     reset_trace_session()
     trace_step(logger, "main", "CLI session begin argv_summary skip_net_check=%s", args.skip_net_check)
+    tfm_startup_refresh.run_flash_startup_refresh(_repo_root())
     session_wall_start = time.time()
     log_txt_path = _repo_root() / "log.txt"
     ban_summaries: list[dict[str, object]] = []

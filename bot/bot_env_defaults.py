@@ -2,9 +2,11 @@
 Default process environment for the ban bot.
 
 The repo root ``.env`` may contain only ``BOT_ACCOUNTS_JSON``. On startup,
-``env_setup.prepare_runtime_environment`` loads that file, then this module
-fills ``os.environ`` from :data:`DEFAULT_PROCESS_ENV` (and restores accounts).
-Edit this module to change non-account behavior.
+``env_setup.prepare_runtime_environment`` loads that file, optionally merges
+``tfm-secrets.json``, then applies :data:`DEFAULT_PROCESS_ENV` with
+:data:`setdefault <os.environ.setdefault>` — **``.env`` and JSON override these
+coded defaults**, except accounts are reconciled specially (see ``apply_process_env_defaults``).
+Edit defaults here only for repo-wide baseline behavior.
 """
 from __future__ import annotations
 
@@ -27,6 +29,10 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "TFM_SECRETS_AUTH_KEY": "3415003",
     "TFM_SECRETS_PACKET_KEY_SOURCES": "2,50,57,19,60,20,56,8,7,45,98,74,90,106,97,75,100,76,80,96",
     "TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE": "aabbccdd00032d623700022d2daabbccdd00072d60602d2d2c2cfd4300072d2d2f2f2f762f0007000003340000238d00001f48170722202400032b2b2b000000",
+    # When true (default), missing TFM_SECRETS_* are filled from repo-root ``tfm-secrets.json`` (after .env).
+    "BOT_MERGE_TFM_SECRETS_JSON": "true",
+    # Empty = ``<repo>/tfm-secrets.json``; otherwise path (absolute or relative to repo root).
+    "BOT_TFM_SECRETS_JSON_PATH": "",
     "BOT_STRICT_LOADER_VERSION_CHECK": "false",
     "BOT_WARN_UNVERIFIED_LOADER_VERSION": "true",
     "BOT_PURGE_LEGACY_LOADER_PATCH_CACHE": "true",
@@ -147,6 +153,16 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_UI_SEQUENTIAL_LOGIN": "false",
     "BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC": "120",
     "BOT_FLASH_AUTO_LOGIN_UI": "false",
+    # Before Flash session: tfm-secrets / leaker (if BOT_HEADLESS_SECRETS_ALWAYS_REFRESH) + optional TFMProxyLoader.swf fetch.
+    "BOT_FLASH_STARTUP_REFRESH_TFM_ASSETS": "true",
+    "BOT_PERSIST_REFRESHED_SECRETS_JSON": "true",
+    "BOT_REFRESH_SECRETS_IN_FROZEN_BUILD": "",
+    "BOT_FLASH_AUTO_FETCH_PROXY_LOADER": "true",
+    "BOT_FLASH_REFRESH_PROXY_LOADER_EACH_RUN": "false",
+    "BOT_FLASH_FETCH_PROXY_LOADER_IF_MISSING": "true",
+    "BOT_TFM_PROXY_LOADER_DOWNLOAD_URL": "",
+    "BOT_TFM_PROXY_LOADER_GITHUB_REPO": "friedkeenan/tfm-proxy-loader",
+    "BOT_TFM_PROXY_LOADER_ASSET_NAME": "TFMProxyLoader.swf",
     "FLASH_MINIMIZE_AFTER_OPEN": "true",
     "BOT_FLASH_LOADER_EARLY_RETRY_INTERVAL_SEC": "2.0",
     "BOT_FLASH_LOADER_EARLY_RETRY_COUNT": "5",
@@ -183,13 +199,17 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
 
 def apply_process_env_defaults() -> None:
     """
-    Set ``os.environ`` from :data:`DEFAULT_PROCESS_ENV`, then restore
-    ``BOT_ACCOUNTS_JSON`` from whatever was read from the user ``.env`` (if non-empty);
-    otherwise use :data:`DEFAULT_ACCOUNTS_JSON`.
+    Fill **missing** ``os.environ`` keys from :data:`DEFAULT_PROCESS_ENV` via
+    :meth:`setdefault <os.environ.setdefault>` so values from ``.env``,
+    optional ``tfm-secrets.json`` merge, or the parent shell survive.
+
+    Then restore ``BOT_ACCOUNTS_JSON`` from whatever was present before this
+    loop (typically from ``.env``); if absent, assign :data:`DEFAULT_ACCOUNTS_JSON`.
     """
     saved = (os.environ.get("BOT_ACCOUNTS_JSON") or "").strip()
     for k, v in DEFAULT_PROCESS_ENV.items():
-        os.environ[k] = v
+        if k != "BOT_ACCOUNTS_JSON":
+            os.environ.setdefault(k, v)
     if saved:
         os.environ["BOT_ACCOUNTS_JSON"] = saved
     else:

@@ -115,6 +115,8 @@ BOT_ACCOUNTS_JSON = [
 
 ### Crypto secrets (packet auto-login)
 
+Put the full block in **`.env`** (it overrides the placeholders in `bot/bot_env_defaults.py`), **or** save the JSON from `scripts/export_tfm_secrets_json.py` / `tfm-secrets` CLI as repo-root **`tfm-secrets.json`** — on startup, any **missing** `TFM_SECRETS_*` variables are filled from that file before code defaults apply (`BOT_MERGE_TFM_SECRETS_JSON`, default on). You still need a **`TFMProxyLoader.swf`** that matches the live game (same build as the secrets dump).
+
 Fill these from a secrets dump (e.g. `tfm-secrets` tool or `TFMSecretsLeaker.swf`):
 
 ```ini

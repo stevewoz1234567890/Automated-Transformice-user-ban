@@ -97,6 +97,9 @@ def main(argv: list[str]) -> int:
         json.loads(text)  # validate
         OUT.write_text(text, encoding="utf-8")
         print(f"Wrote {OUT} (tfm-secrets on PATH)")
+        print(
+            "Bot startup merges missing TFM_SECRETS_* from this JSON (see BOT_MERGE_TFM_SECRETS_JSON in bot_env_defaults)."
+        )
         return 0
 
     flash = _resolve_flash_debugger()
@@ -115,6 +118,9 @@ def main(argv: list[str]) -> int:
     secrets = Secrets.load_from_leaker_swf(leaker, debug_standalone=str(flash))
     OUT.write_text(json.dumps(_secrets_to_dict(secrets), indent=2), encoding="utf-8")
     print(f"Wrote {OUT} (caseus.load_from_leaker_swf)")
+    print(
+        "Bot startup merges missing TFM_SECRETS_* from this JSON (see BOT_MERGE_TFM_SECRETS_JSON in bot_env_defaults)."
+    )
     return 0
 
 

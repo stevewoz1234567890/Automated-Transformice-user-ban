@@ -104,7 +104,10 @@ def _swf_scan_payload(raw: bytes) -> tuple[str, bytes] | None:
 def _extract_urlish_version_hints(body: bytes) -> list[int]:
     patterns = (
         rb"swf=r(\d{2,6})\b",
+        rb"swf=R(\d{2,6})\b",
+        rb"SWF=R(\d{2,6})\b",
         rb"swf%3dr(\d{2,6})\b",
+        rb"swf%3[dD]r(\d{2,6})\b",
         rb"gameversion[=:](\d{2,6})\b",
         rb"game_version[=:](\d{2,6})\b",
     )
@@ -198,7 +201,11 @@ def log_client_asset_alignment(repo_root: Path) -> None:
     gv_ascii = gv_raw.encode("ascii", errors="ignore") if gv_raw else b""
     literal_substrings = False
     if gv_ascii:
+        vu16le = "".join(ch + "\x00" for ch in gv_raw.strip()).encode("utf-16le") if gv_raw.strip() else b""
+        vu16be = "".join("\x00" + ch for ch in gv_raw.strip()).encode("utf-16be") if gv_raw.strip() else b""
         literal_substrings = gv_ascii in body or (b"v" + gv_ascii) in body or (b"=" + gv_ascii) in body
+        if not literal_substrings and vu16le:
+            literal_substrings = vu16le in body or vu16be in body
 
     urlish = _extract_urlish_version_hints(body)
     lines_md.append(f"- **SWF on-disk signature**: `{raw[:3]!r}` **scan_tag**: `{tag}` **payload_bytes**: {len(body)}\n")

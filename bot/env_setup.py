@@ -255,8 +255,120 @@ def require_source_runtime_imports() -> None:
     raise SystemExit(1)
 
 
+def merge_repo_tfm_secrets_json(repo_root: Path, *, prefix: str = "TFM_SECRETS_") -> None:
+    """Fill missing ``TFM_SECRETS_*`` from ``tfm-secrets.json`` (same shape as export_tfm_secrets_json)."""
+
+    def _truthy_merge(key: str, default: bool = True) -> bool:
+        v = os.environ.get(key)
+        if v is None or not str(v).strip():
+            return default
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+    if not _truthy_merge("BOT_MERGE_TFM_SECRETS_JSON", True):
+        return
+    raw_path = (os.environ.get("BOT_TFM_SECRETS_JSON_PATH") or "").strip()
+    if raw_path:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = (repo_root / path).resolve()
+    else:
+        path = repo_root / "tfm-secrets.json"
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("[secrets] Cannot read merge file %s (%s)", path, e)
+        return
+    if not isinstance(data, dict):
+        logger.warning("[secrets] %s: expected JSON object, got %s", path, type(data).__name__)
+        return
+    pfx = str(prefix).strip()
+    if not pfx.endswith("_"):
+        pfx = f"{pfx}_"
+
+    updates: dict[str, str] = {}
+    sv = data.get("server_address")
+    if isinstance(sv, str) and sv.strip():
+        updates[f"{pfx}SERVER_ADDRESS"] = sv.strip()
+    ports = data.get("server_ports")
+    if isinstance(ports, (list, tuple)) and ports:
+        try:
+            updates[f"{pfx}SERVER_PORTS"] = ",".join(str(int(x)) for x in ports)
+        except (TypeError, ValueError):
+            pass
+    gv = data.get("game_version")
+    if gv is not None:
+        try:
+            updates[f"{pfx}GAME_VERSION"] = str(int(gv))
+        except (TypeError, ValueError):
+            pass
+    tok = data.get("connection_token")
+    if isinstance(tok, str) and tok.strip():
+        updates[f"{pfx}CONNECTION_TOKEN"] = tok.strip()
+    ak = data.get("auth_key")
+    if ak is not None:
+        try:
+            updates[f"{pfx}AUTH_KEY"] = str(int(ak))
+        except (TypeError, ValueError):
+            pass
+    pks = data.get("packet_key_sources")
+    if isinstance(pks, (list, tuple)) and pks:
+        try:
+            updates[f"{pfx}PACKET_KEY_SOURCES"] = ",".join(str(int(x)) for x in pks)
+        except (TypeError, ValueError):
+            pass
+    cvt = data.get("client_verification_template")
+    if isinstance(cvt, (bytes, bytearray)):
+        updates[f"{pfx}CLIENT_VERIFICATION_TEMPLATE"] = bytes(cvt).hex()
+    elif isinstance(cvt, str) and cvt.strip():
+        updates[f"{pfx}CLIENT_VERIFICATION_TEMPLATE"] = cvt.strip()
+
+    if not updates:
+        logger.warning("[secrets] %s: no recognizable fields merged", path)
+        return
+
+    merged = 0
+    applied: list[str] = []
+    for k, val in updates.items():
+        prior = os.environ.get(k)
+        if prior is None or not str(prior).strip():
+            os.environ[k] = val
+            merged += 1
+            suffix = k.removeprefix(pfx)
+            applied.append(suffix)
+            continue
+    if merged > 0:
+        logger.info(
+            "[secrets] Merged %s field(s) from %s into empty TFM env keys (%s); .env overrides are kept.",
+            merged,
+            path,
+            ",".join(applied[:12]) + ("…" if len(applied) > 12 else ""),
+        )
+
+
+def sync_upstream_env_with_tfm_secrets() -> None:
+    """Match ``BOT_UPSTREAM_SERVER_*`` to ``TFM_SECRETS_*`` when auto-sync is on (Flash + headless)."""
+    v = os.environ.get("BOT_UPSTREAM_AUTO_SYNC_FROM_SECRETS", "true")
+    if str(v).strip().lower() in ("0", "false", "no", "off"):
+        return
+    addr = (os.environ.get("TFM_SECRETS_SERVER_ADDRESS") or "").strip()
+    ports_s = (os.environ.get("TFM_SECRETS_SERVER_PORTS") or "").strip()
+    if not addr or not ports_s:
+        return
+    os.environ["BOT_UPSTREAM_SERVER_ADDRESS"] = addr
+    os.environ["BOT_UPSTREAM_SERVER_PORTS"] = ports_s
+    os.environ["BOT_UPSTREAM_FROM_SECRETS_DUMP_ONLY"] = "true"
+    os.environ["BOT_UPSTREAM_ALLOW_ADDRESS_MISMATCH"] = "false"
+    logger.info(
+        "[secrets] BOT_UPSTREAM_* synced from TFM_SECRETS_* (address=%s ports=%s)",
+        addr,
+        ports_s,
+    )
+
+
 def prepare_runtime_environment() -> None:
-    """Copy ``.env.example`` → ``.env`` when missing, load the file, then apply code-side defaults in ``os.environ``."""
+    """Bootstrap ``.env``, optional JSON secrets merge, then apply code-side defaults to ``os.environ``."""
     root = repo_root()
     seed = os.environ.get("BOT_HEADLESS_SECRETS_SEED_DOTENV_FROM_EXAMPLE", "true").strip().lower() not in (
         "0",
@@ -273,7 +385,9 @@ def prepare_runtime_environment() -> None:
         except OSError as e:
             logger.warning("Could not copy .env.example to %s: %s", dot, e)
     load_dotenv_file(dot)
+    merge_repo_tfm_secrets_json(root, prefix=os.environ.get("BOT_HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_")
     apply_process_env_defaults()
+    sync_upstream_env_with_tfm_secrets()
 
 
 def _truthy(key: str, default: bool = False) -> bool:
