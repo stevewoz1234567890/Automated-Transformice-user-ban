@@ -168,6 +168,8 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_TFM_PROXY_LOADER_DOWNLOAD_URL": "",
     "BOT_TFM_PROXY_LOADER_GITHUB_REPO": "friedkeenan/tfm-proxy-loader",
     "BOT_TFM_PROXY_LOADER_ASSET_NAME": "TFMProxyLoader.swf",
+    # After replacing TFMProxyLoader.swf: delete tmp/loader_patch/*.swf so Flash repatches from new source bytes.
+    "BOT_PURGE_ALL_LOADER_PATCH_CACHE_ON_LOADER_INSTALL": "true",
     "FLASH_MINIMIZE_AFTER_OPEN": "true",
     "BOT_FLASH_LOADER_EARLY_RETRY_INTERVAL_SEC": "2.0",
     "BOT_FLASH_LOADER_EARLY_RETRY_COUNT": "5",

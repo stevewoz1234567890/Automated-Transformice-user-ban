@@ -186,6 +186,37 @@ def maybe_purge_legacy_loader_patch_cache(repo_root: Path) -> int:
     return purge_legacy_loader_patch_cache(cache_dir)
 
 
+def invalidate_source_swf_digest_cache() -> None:
+    """Clear memo used by :func:`_source_swf_cache_tag` (e.g. after replacing ``TFMProxyLoader.swf`` on disk)."""
+    _source_swf_digest_cache.clear()
+
+
+def purge_all_patched_loader_swfs(repo_root: Path) -> int:
+    """Remove every ``*.swf`` under ``tmp/loader_patch`` so patched loaders are rebuilt from the current source."""
+    cache_dir = repo_root / "tmp" / "loader_patch"
+    if not cache_dir.is_dir():
+        return 0
+    removed = 0
+    for entry in cache_dir.iterdir():
+        if not entry.is_file():
+            continue
+        if entry.suffix.lower() != ".swf":
+            continue
+        try:
+            entry.unlink()
+            removed += 1
+        except OSError as e:
+            logger.warning("Could not remove patched loader cache %s (%s)", entry, e)
+    if removed:
+        logger.info(
+            "Loader patch cache: removed %d patched SWF(s) under %s (rebuilt on next Flash launch).",
+            removed,
+            cache_dir,
+        )
+        invalidate_source_swf_digest_cache()
+    return removed
+
+
 def build_patched_loader_swf(
     source_zws: Path,
     *,

@@ -7,6 +7,7 @@ secrets, and Flash loads a loader SWF that matches upstream tooling releases.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -184,12 +185,17 @@ def fetch_proxy_loader_swf(repo: Path, *, force: bool = False) -> bool:
     try:
         tmp.write_bytes(body)
         shutil.move(str(tmp), dest)
-        logger.info("[refresh] Installed loader SWF (%s bytes) → %s", len(body), dest)
-        try:
-            if getattr(sys, "frozen", False):
-                os.environ.pop("TFM_PURGE_LOADER_PATCH_CACHE_THIS_RUN", None)
-        except Exception:
-            pass
+        sha16 = hashlib.sha256(body).hexdigest()[:16]
+        logger.info(
+            "[refresh] Installed loader SWF (%s bytes, sha256[0:16]=%s) → %s",
+            len(body),
+            sha16,
+            dest,
+        )
+        if _truthy("BOT_PURGE_ALL_LOADER_PATCH_CACHE_ON_LOADER_INSTALL", True):
+            from . import tfm_swf_port_patch
+
+            tfm_swf_port_patch.purge_all_patched_loader_swfs(repo)
     except OSError as e:
         logger.error("[refresh] Could not write loader to %s (%s)", dest, e)
         return False
