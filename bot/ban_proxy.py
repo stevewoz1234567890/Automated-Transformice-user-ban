@@ -429,6 +429,24 @@ class BanBotProxy(Proxy):
         # localhost → ::1 vs proxy listening on IPv4-only edge cases.
         kwargs.setdefault("expected_address", "127.0.0.1")
         super().__init__(**kwargs)
+        # caseus.Proxy rewrites HandshakePacket.loader_stage_size to CORRECTED_LOADER_SIZE (vanilla TFMLoader
+        # magic). Override when live server/tooling expects a different value (BOT_PROXY_* below).
+        _lss_ov = (
+            os.environ.get("BOT_PROXY_HANDSHAKE_LOADER_STAGE_SIZE")
+            or os.environ.get("BOT_PROXY_CORRECTED_LOADER_STAGE_SIZE")
+            or ""
+        ).strip()
+        if _lss_ov:
+            try:
+                self.CORRECTED_LOADER_SIZE = int(_lss_ov, 0)
+            except ValueError:
+                logger.warning(
+                    "Slot %s: invalid BOT_PROXY_HANDSHAKE_LOADER_STAGE_SIZE=%r (expected int or 0x hex) — "
+                    "using caseus default %s",
+                    (slot_label or "").strip() or "?",
+                    _lss_ov,
+                    getattr(self, "CORRECTED_LOADER_SIZE", Proxy.CORRECTED_LOADER_SIZE),
+                )
         self.slot_label = slot_label
         self._login_success_event = login_success_event
         self._login_aborted_event = login_aborted_event

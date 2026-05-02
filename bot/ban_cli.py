@@ -573,12 +573,14 @@ def _effective_flash_stagger_sec(n_slots: int, stagger_from_env: float) -> float
     """POST-login delay before opening the *next* Flash client (sequential farm launch)."""
     stagger_after = float(stagger_from_env)
     if n_slots >= 8:
-        _auto = min(7.0, 0.38 * max(0, n_slots - 1))
+        # Slightly tighter slope than legacy 0.38 so 10–16 slots spread MAIN/sat load more.
+        _auto = min(8.0, 0.42 * max(0, n_slots - 1))
         stagger_after = max(stagger_after, _auto)
     if n_slots >= 12:
-        stagger_after = max(stagger_after, 4.25)
+        stagger_after = max(stagger_after, 5.5)
     if n_slots >= 14:
-        stagger_after = max(stagger_after, 5.0)
+        # 14 concurrent Flash + auto-login stresses MAIN; 5s floors still correlated with mass clean-eof.
+        stagger_after = max(stagger_after, 7.0)
     return stagger_after
 
 
@@ -2765,7 +2767,7 @@ def main(argv: list[str] | None = None) -> None:
             logger.info(
                 "Flash launch: %d slots — post-login delay before opening the next client is %.1fs "
                 "(env BOT_UI_FLASH_LAUNCH_STAGGER_SEC was %.1fs; added automatic minimum for 8+ slots "
-                "(0.38*(n-1) capped at 7s, floors 4.25s@12+ and 5s@14+); override by raising env above %.1f).",
+                "(0.42*(n-1) capped at 8s, floors 5.5s@12+ and 7s@14+); override by raising env above %.1f).",
                 n_flash_slots,
                 stagger_after,
                 _stagger_from_env,

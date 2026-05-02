@@ -148,8 +148,9 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_LEAD_SEC": "1.0",
     "BOT_UI_AUTO_LAUNCH_FLASH": "true",
     "BOT_UI_FLASH_PLAYER_PATH": "",
-    # Slightly higher default spreads Flash/CPU load (fewer PARTL → less time in retry). Override down if you accept more failures.
-    "BOT_UI_FLASH_LAUNCH_STAGGER_SEC": "2.5",
+    # Default pairs with auto floor in ban_cli._effective_flash_stagger_sec (8+ slots). Higher = fewer
+    # overlapping MAIN handshakes / AS crashes on large farms; lower only on fast single-IP setups.
+    "BOT_UI_FLASH_LAUNCH_STAGGER_SEC": "3.5",
     "BOT_UI_SEQUENTIAL_LOGIN": "false",
     "BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC": "120",
     "BOT_FLASH_AUTO_LOGIN_UI": "false",
@@ -191,6 +192,9 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_PROXY_MAIN_CLOSE_VERBOSE": "false",
     # Extra tcp_side_guess + sess_counts on MAIN close (set false to shorten lines).
     "BOT_PROXY_MAIN_RC_HINT": "true",
+    # Optional: override caseus Proxy HandshakePacket loader_stage_size sent upstream (default 0x1FBD = 8125).
+    # Set only if caseus/Tfm server mismatch is proven; wrong value breaks handshake.
+    "BOT_PROXY_HANDSHAKE_LOADER_STAGE_SIZE": "",
     # One-shot "issue 1" hunt: correlates Handshake game_version vs TFM_SECRETS_GAME_VERSION, MAIN teardown
     # vs upstream socket + loader sha, AS first fingerprint — forces ROOT_CAUSE_MAIN_CLOSE + verbose login.
     "BOT_ISSUE1_FORENSIC": "false",

@@ -110,6 +110,9 @@ def _extract_urlish_version_hints(body: bytes) -> list[int]:
         rb"swf%3[dD]r(\d{2,6})\b",
         rb"gameversion[=:](\d{2,6})\b",
         rb"game_version[=:](\d{2,6})\b",
+        rb"gameVersion[=:\"'](\d{2,6})\b",
+        rb"[/\?]r(\d{2,6})[/\.&\?\#]",  # .../r922/... or ?r921&
+        rb"version[=/](\d{2,6})(?:[^\d]|$)",
     )
     found: set[int] = set()
     for pat in patterns:
