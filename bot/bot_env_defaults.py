@@ -158,9 +158,11 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_PERSIST_REFRESHED_SECRETS_JSON": "true",
     "BOT_REFRESH_SECRETS_IN_FROZEN_BUILD": "",
     "BOT_FLASH_AUTO_FETCH_PROXY_LOADER": "true",
-    # After TFMSecretsLeaker/tfim-secrets updates .env: re-download loader when GAME_VERSION changed (fixes stale SWF vs new secrets).
+    # After TFMSecretsLeaker/tfm-secrets updates .env: re-download loader unless disabled below.
     "BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_REFRESH": "true",
-    "BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED": "true",
+    # When true: only re-fetch loader when TFM_SECRETS_GAME_VERSION string changes (fewer downloads; can leave stale SWF).
+    # Default false: GAME_VERSION often stays identical while dumped secrets still mismatch disk loader ⇒ AS/PARTL.
+    "BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED": "false",
     "BOT_FLASH_REFRESH_PROXY_LOADER_EACH_RUN": "false",
     "BOT_FLASH_FETCH_PROXY_LOADER_IF_MISSING": "true",
     "BOT_TFM_PROXY_LOADER_DOWNLOAD_URL": "",

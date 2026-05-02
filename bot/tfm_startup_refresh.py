@@ -256,11 +256,15 @@ def run_flash_startup_refresh(repo: Path) -> None:
     force_loader = False
     if refreshed and _truthy("BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_REFRESH", True):
         new_gv = (os.environ.get("TFM_SECRETS_GAME_VERSION") or "").strip()
-        if not _truthy("BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED", True):
+        # When true: only force loader fetch if GAME_VERSION string changed (fewer downloads).
+        # Default false in env: version string often unchanged while secrets still drift vs disk loader.
+        only_when_gv_changes = _truthy("BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED", False)
+        if not only_when_gv_changes:
             force_loader = True
             logger.info(
-                "[refresh] Secrets refreshed — fetching loader "
-                "(BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED=false).",
+                "[refresh] Secrets refreshed — re-fetching loader so TFM_PROXY_SWF matches dumped secrets "
+                "(default). Set BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED=true to only replace "
+                "when TFM_SECRETS_GAME_VERSION changes.",
             )
         elif prior_gv != new_gv or not prior_gv:
             force_loader = True
@@ -273,8 +277,8 @@ def run_flash_startup_refresh(repo: Path) -> None:
         else:
             logger.info(
                 "[refresh] Secrets refreshed but TFM_SECRETS_GAME_VERSION unchanged (%r); "
-                "keeping existing loader (set BOT_FLASH_REFRESH_PROXY_LOADER_EACH_RUN=true "
-                "or BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED=false to always replace).",
+                "keeping existing loader (BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED=true). "
+                "Unset that or set it false for a loader refresh on every secrets dump.",
                 new_gv,
             )
 
