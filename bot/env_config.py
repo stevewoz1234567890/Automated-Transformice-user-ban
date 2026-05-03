@@ -287,7 +287,8 @@ def load_config_from_env(repo_root: Path) -> object:
     close_fail = _bool_from_env(os.environ.get("BOT_FLASH_CLOSE_ON_LOGIN_FAIL"))
     ns.FLASH_CLOSE_ON_LOGIN_FAIL = True if close_fail is None else close_fail
     F("FLASH_CLOSE_GRACE_SEC", "BOT_FLASH_CLOSE_GRACE_SEC", 2.0)
-    # Embedded "incorrect version, reload" pane (no Win32 button): close projector + relaunch during login wait.
+    # Mid-login Flash relaunch: in-SWF stalls (e.g. incorrect version) and MAIN clean-eof before
+    # LoginSuccess (in-SWF “connection interrupted” with no button). Cap: *_MAX_RELOAD_PER_SLOT.
     emb_iv = _bool_from_env(os.environ.get("BOT_FLASH_EMBEDDED_IV_LOGIN_RELOAD"))
     ns.FLASH_EMBEDDED_IV_LOGIN_RELOAD = True if emb_iv is None else emb_iv
     F("FLASH_EMBEDDED_IV_AFTER_HANDSHAKE_SEC", "BOT_FLASH_EMBEDDED_IV_AFTER_HANDSHAKE_SEC", 38.0)
@@ -300,6 +301,9 @@ def load_config_from_env(repo_root: Path) -> object:
         logger.warning("BOT_FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT invalid %r — using 20", _ivmx)
         ns.FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT = 20
     ns.FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT = max(0, min(200, ns.FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT))
+    # Caps mid-login Flash relaunches below (embedded incorrect-version stalls + MAIN clean-eof before LoginSuccess).
+    mdr = _bool_from_env(os.environ.get("BOT_FLASH_MAIN_DROP_LOGIN_RELOAD"))
+    ns.FLASH_MAIN_DROP_LOGIN_RELOAD = True if mdr is None else mdr
 
     try:
         os.environ["BOT_ACCOUNTS_JSON"] = json.dumps(accounts, ensure_ascii=False, separators=(",", ":"))

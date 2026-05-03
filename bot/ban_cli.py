@@ -3201,10 +3201,13 @@ def main(argv: list[str] | None = None) -> None:
             poll_sec = float(getattr(cfg, "FLASH_LOGIN_WAIT_POLL_SEC", 45.0))
             poll_sec = max(10.0, min(poll_sec, 120.0))
             deadline = time.monotonic() + login_timeout
+            # Shared cap for (1) in-SWF stalls before LoginSuccess and (2) MAIN session ended early
+            # (upstream drop / clean-eof) while Flash shows “connection interrupted” with no usable button.
             _iv_mr = int(getattr(cfg, "FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT", 20))
             _iv_mr = max(0, min(200, _iv_mr))
-            embedded_iv_reload_attempts = 0
+            mid_login_flash_reloads = 0
             embedded_iv_on = bool(getattr(cfg, "FLASH_EMBEDDED_IV_LOGIN_RELOAD", True))
+            main_drop_reload_on = bool(getattr(cfg, "FLASH_MAIN_DROP_LOGIN_RELOAD", True))
             got_login = False
             verbose = bool(getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", True))
             packet_login = bool(getattr(cfg, "PACKET_AUTO_LOGIN", False))
@@ -3352,11 +3355,35 @@ def main(argv: list[str] | None = None) -> None:
                         "(clean-eof during handshake is common with stagger overload or unstable links).",
                         st.label,
                     )
+                    if (
+                        main_drop_reload_on
+                        and _iv_mr > 0
+                        and mid_login_flash_reloads < _iv_mr
+                    ):
+                        mid_login_flash_reloads += 1
+                        logger.warning(
+                            "Slot %s: MAIN_DROP_LOGIN_RELOAD attempt=%d/%s — MAIN ended before LoginSuccess; "
+                            "closing Flash and relaunching (in-SWF “connection interrupted” / no Win32 dismiss). "
+                            "Same cap as BOT_FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT.",
+                            st.label,
+                            mid_login_flash_reloads,
+                            _iv_mr,
+                        )
+                        _embedded_iv_mid_login_relaunch_sequential(
+                            st=st,
+                            flash_row=dict(flash_row),
+                            cfg=cfg,
+                            args=args,
+                            cfg_flash_auto=cfg_flash_auto,
+                            flash_login_trigger=flash_login_trigger,
+                        )
+                        deadline = time.monotonic() + login_timeout
+                        continue
                     break
                 if (
                     embedded_iv_on
                     and _iv_mr > 0
-                    and embedded_iv_reload_attempts < _iv_mr
+                    and mid_login_flash_reloads < _iv_mr
                     and st.flash_pid is not None
                 ):
                     need_iv, iv_tag = _should_reload_flash_embedded_iv_login(
@@ -3365,13 +3392,13 @@ def main(argv: list[str] | None = None) -> None:
                         now_mono=time.monotonic(),
                     )
                     if need_iv:
-                        embedded_iv_reload_attempts += 1
+                        mid_login_flash_reloads += 1
                         logger.warning(
                             "Slot %s: EMBEDDED_IV_LOGIN_RELOAD attempt=%d/%d (%s) — closing Adobe Flash "
                             "Player and relaunching the loader (in-SWF stall; no modal OK). Each attempt "
                             "resets BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC countdown.",
                             st.label,
-                            embedded_iv_reload_attempts,
+                            mid_login_flash_reloads,
                             _iv_mr,
                             iv_tag,
                         )
