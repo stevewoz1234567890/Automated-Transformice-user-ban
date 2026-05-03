@@ -162,8 +162,11 @@ def as_error_dismiss_session_snapshot() -> dict[str, int]:
 def _flash_dialog_aggregate_body_text(top_hwnd: int, user32: object) -> str:
     """
     Adobe Flash Player ActionScript error dialogs often put the stack trace in an ``Edit`` or
-    ``RichEdit20W`` child; older code only read ``Static``, so logs showed ``body='Error de ActionScript:'``
-    without the actual fault line — useless for root-cause analysis.
+    ``RichEdit20W`` **nested under child ``#32770`` panels**, not only as direct children.
+
+    Older code used a single ``EnumChildWindows`` on the top dialog and only read ``Static``,
+    so logs showed ``body='Error de ActionScript:'`` (locale header only) — hiding **#2048 / #2044**
+    lines needed to fix upstream literals / sandbox issues.
     """
     import ctypes
     from ctypes import wintypes
@@ -172,15 +175,14 @@ def _flash_dialog_aggregate_body_text(top_hwnd: int, user32: object) -> str:
     WM_GETTEXTLENGTH = 0x000E
     parts: list[str] = []
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def _enum_child(ch, _lp):
+    def _maybe_append_piece_for_hwnd(ch: int) -> None:
         cls_buf = ctypes.create_unicode_buffer(96)
         user32.GetClassNameW(ch, cls_buf, 96)
         cls = cls_buf.value.lower()
         piece = ""
         if cls == "static":
-            tb = ctypes.create_unicode_buffer(8192)
-            user32.GetWindowTextW(ch, tb, 8192)
+            tb = ctypes.create_unicode_buffer(16384)
+            user32.GetWindowTextW(ch, tb, 16384)
             piece = (tb.value or "").strip()
         elif cls == "edit" or cls.startswith("richedit"):
             try:
@@ -189,8 +191,8 @@ def _flash_dialog_aggregate_body_text(top_hwnd: int, user32: object) -> str:
                 ln = 0
             ln = max(0, min(int(ln), 32767))
             if ln <= 0:
-                tb = ctypes.create_unicode_buffer(8192)
-                user32.GetWindowTextW(ch, tb, 8192)
+                tb = ctypes.create_unicode_buffer(16384)
+                user32.GetWindowTextW(ch, tb, 16384)
                 piece = (tb.value or "").strip()
             else:
                 buf = ctypes.create_unicode_buffer(ln + 4)
@@ -198,9 +200,18 @@ def _flash_dialog_aggregate_body_text(top_hwnd: int, user32: object) -> str:
                 piece = (buf.value or "").strip()
         if piece:
             parts.append(piece)
-        return True
 
-    user32.EnumChildWindows(top_hwnd, _enum_child, 0)
+    def _walk_dialog_tree(parent: int) -> None:
+        _maybe_append_piece_for_hwnd(parent)
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum_one_level(child, _lp):
+            _walk_dialog_tree(int(child))
+            return True
+
+        user32.EnumChildWindows(parent, _enum_one_level, 0)
+
+    _walk_dialog_tree(top_hwnd)
     merged = " | ".join(parts)
     return merged.strip()
 
@@ -274,6 +285,19 @@ def _maybe_log_first_seen_as_fingerprint(
         hwnd,
         preview,
     )
+    low = norm.lower()
+    if "#2048" in low or "error #2048" in low or "securityerror #2048" in low:
+        logger.warning(
+            "ActionScript root-cause hint fingerprint=%s: Flash security/sandbox Error #2048 — patched "
+            "file:// loader must avoid bare upstream IP literals (see bot/tfm_swf_port_patch.py).",
+            fp,
+        )
+    elif "#2044" in low or "error #2044" in low:
+        logger.warning(
+            "ActionScript root-cause hint fingerprint=%s: Error #2044 IO failure — loader/SWF URL or XML "
+            "socket path often misaligned with live Transformice.",
+            fp,
+        )
     try:
         from .issue1_forensic import log_as_error_slot_banner
 
@@ -305,11 +329,11 @@ def _flash_error_dismiss_verbose_info_cap() -> int:
 
 
 def _flash_dismiss_body_log_chars() -> int:
-    """Max chars of AS dialog body in dismiss log lines (raise for root-cause hunting; default 720)."""
+    """Max chars of AS dialog body in dismiss log lines (raise for root-cause hunting; default 1600)."""
     try:
-        n = int((os.environ.get("FLASH_ERROR_DISMISS_BODY_LOG_CHARS") or "720").strip())
+        n = int((os.environ.get("FLASH_ERROR_DISMISS_BODY_LOG_CHARS") or "1600").strip())
     except ValueError:
-        n = 720
+        n = 1600
     return max(120, min(8000, n))
 
 
@@ -2037,19 +2061,23 @@ def dismiss_flash_error_dialogs_no_mouse(
             area,
             (title or "")[:120],
         )
-        # Enumerate child Button controls; body text via Static + Edit/RichEdit (stack traces live there).
+        # Enumerate Button controls recursively — Adobe often nests the button row inside a panel.
         buttons: list[int] = []
 
-        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-        def _enum_child_btn(ch, _lp):
-            cls_buf = ctypes.create_unicode_buffer(64)
-            user32.GetClassNameW(ch, cls_buf, 64)
-            cls = cls_buf.value.lower()
-            if cls == "button":
-                buttons.append(int(ch))
-            return True
+        def _collect_buttons_recursive(parent_wnd: int) -> None:
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def _enum_child_btn(ch, _lp):
+                ch_i = int(ch)
+                cls_buf = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(ch, cls_buf, 64)
+                if cls_buf.value.lower() == "button":
+                    buttons.append(ch_i)
+                _collect_buttons_recursive(ch_i)
+                return True
 
-        user32.EnumChildWindows(top, _enum_child_btn, 0)
+            user32.EnumChildWindows(parent_wnd, _enum_child_btn, 0)
+
+        _collect_buttons_recursive(top)
 
         body_text = _flash_dialog_aggregate_body_text(top, user32)
         _maybe_log_first_seen_as_fingerprint(

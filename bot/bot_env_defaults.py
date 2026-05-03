@@ -226,7 +226,8 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     # Last N packet labels per direction on MAIN (raise during ROOT_CAUSE runs; default 8).
     "BOT_PROXY_MAIN_PACKET_RING": "8",
     # Longer AS dialog text in logs (default 720; max 8000).
-    "FLASH_ERROR_DISMISS_BODY_LOG_CHARS": "720",
+    # Default raised so nested-dialog #2048 / #2044 lines appear in WARN lines without extra env.
+    "FLASH_ERROR_DISMISS_BODY_LOG_CHARS": "1600",
     # First-seen fingerprint preview length (default 1400; max 12000).
     "FLASH_ERROR_FIRST_FP_PREVIEW_CHARS": "1400",
     # Log a second WARNING line with remaining body after preview (same first fingerprint only).

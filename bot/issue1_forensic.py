@@ -75,9 +75,9 @@ def apply_env_overrides() -> bool:
         os.environ["BOT_ISSUE1_AS_DISMISS_LOG"] = "true"
 
     try:
-        body_prev = int((os.environ.get("FLASH_ERROR_DISMISS_BODY_LOG_CHARS") or "720").strip())
+        body_prev = int((os.environ.get("FLASH_ERROR_DISMISS_BODY_LOG_CHARS") or "1600").strip())
     except ValueError:
-        body_prev = 720
+        body_prev = 1600
     os.environ["FLASH_ERROR_DISMISS_BODY_LOG_CHARS"] = str(max(2000, min(8000, body_prev)))
 
     logger.warning(
