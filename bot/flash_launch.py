@@ -1811,6 +1811,69 @@ def _env_flag_true_by_default(name: str) -> bool:
     return True
 
 
+def _flash_error_esc_use_foreground() -> bool:
+    """Unset / ``true``: try real Esc via ``keybd_event`` after ``SetForegroundWindow`` (like a human)."""
+    v = (os.environ.get("FLASH_ERROR_DISMISS_ESC_USE_FOREGROUND") or "true").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def _flash_error_esc_post_poll_sec() -> float:
+    """Sleep after Esc bursts before polling whether Adobe's HWND is gone."""
+    raw = (os.environ.get("FLASH_ERROR_ESC_POST_POLL_MS") or "").strip()
+    try:
+        ms = float(raw) if raw else 180.0
+    except ValueError:
+        ms = 180.0
+    return max(0.0, min(900.0, ms)) / 1000.0
+
+
+def _adobe_actionscript_dialog_may_remain(hwnd: int, user32: object) -> bool:
+    """True if *hwnd* still looks like an open Adobe dialog (False ⇒ Esc likely dismissed it)."""
+    if not hwnd:
+        return False
+    try:
+        if not bool(user32.IsWindow(hwnd)):
+            return False
+        return bool(user32.IsWindowVisible(hwnd))
+    except Exception:
+        return True
+
+
+def _try_escape_adobe_actionscript_dialog(hwnd: int, user32: object) -> None:
+    """
+    Dismiss Adobe's ActionScript/security error dialogs the same way a user does: **Esc**.
+    Prefer ``SetForegroundWindow`` + ``keybd_event``; fall back to ``PostMessage`` pairs to the HWND.
+    """
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    VK_ESCAPE = 0x1B
+    KEYEVENTF_KEYUP = 0x0002
+
+    def esc_post_once() -> None:
+        user32.PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0)
+        user32.PostMessageW(hwnd, WM_KEYUP, VK_ESCAPE, 0)
+
+    def esc_keybd_once() -> None:
+        user32.keybd_event(VK_ESCAPE, 0, 0, 0)
+        user32.keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0)
+
+    if _flash_error_esc_use_foreground():
+        try:
+            if _win_force_foreground(hwnd):
+                time.sleep(0.04)
+                esc_keybd_once()
+                time.sleep(0.055)
+                esc_keybd_once()
+                return
+        except Exception:
+            logger.debug("Adobe AS dismiss: foreground Esc keybd failed", exc_info=True)
+    esc_post_once()
+    time.sleep(0.045)
+    esc_post_once()
+
+
 def flash_error_dismiss_policy_log_line() -> str:
     """One line for logs: proves FLASH_ERROR_DISMISS_* env (which build/flags are active)."""
     ac = _env_flag_false_by_default("FLASH_ERROR_DISMISS_ALLOW_CONTINUE")
@@ -1823,20 +1886,23 @@ def flash_error_dismiss_policy_log_line() -> str:
         f"FLASH_ERROR_DISMISS_ALLOW_CONTINUE={ac} "
         f"FLASH_ERROR_DISMISS_USE_WMCLOSE={wm} "
         f"FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION={sole} "
-        "— Button matching is multilingual (not English-only); Windows UI langs are logged first for support. "
+        f"FLASH_ERROR_DISMISS_ESC_USE_FOREGROUND={_flash_error_esc_use_foreground()} "
+        "— Adobe Error de ActionScript / #2048 modals honor Esc: we send keyboard Esc "
+        "(and only post WM_CLOSE if the dialog is still open). "
+        "Button matching is multilingual (not English-only); Windows UI langs are logged first for support. "
         "Continuar/Continue is only auto-clicked when ALLOW_CONTINUE is true, or when the "
         "dialog has no Dismiss/OK and CONTINUE_IF_SOLE_OPTION is true (default). "
         "Post-login sweep and login-phase Flash error polling use BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE "
-        "and BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY (default: Adobe AS popups closed with "
-        "Escape+WM_CLOSE only — no BM_CLICK on Descartar/Dismiss buttons; sweep also uses "
-        "BOT_POST_LOGIN_AS_SWEEP_CONTINUE_IF_SOLE_OPTION for sole-Continuar). "
+        "and BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY (default: Esc first, WM_CLOSE fallback; "
+        "no BM_CLICK on Descartar/Dismiss; BOT_POST_LOGIN_AS_SWEEP_CONTINUE_IF_SOLE_OPTION for sole-Continuar). "
     )
 
 
 def adobe_actionscript_escape_wmclose_kw_from_env() -> dict[str, bool]:
     """
     Keyword args for ``dismiss_flash_error_dialogs_no_mouse`` when closing **Adobe** ActionScript
-    error dialogs with Escape + WM_CLOSE (no localized BM_CLICK on Dismiss / Descartar todo).
+    error dialogs: **Esc** (keyboard, after foreground when enabled) then optional ``WM_CLOSE`` if the
+    modal is still open — no localized ``BM_CLICK`` on Dismiss / Descartar.
 
     Shared by the post-login sweep and the Flash error poll during login
     (``dismiss_correlation_context=login_phase_poll``).
@@ -1853,11 +1919,13 @@ def post_login_sweep_dismiss_kw() -> dict[str, bool]:
     """
     Dismiss overrides for ``post_login_actionscript_error_sweep``.
 
-    ``continue_if_sole_option`` applies only here; Adobe Escape+WM_CLOSE flags come from
+    ``continue_if_sole_option`` applies only here; Adobe Esc / WM_CLOSE fallback flags come from
     ``adobe_actionscript_escape_wmclose_kw_from_env()`` (same as login-phase polling).
 
-    Default: **no BM_CLICK at all on Adobe ActionScript dialogs** — only Escape + WM_CLOSE —
-    since localized *Descartar todo* / *Dismiss all* still drops MAIN clean-eof in some runs
+    Default: **no BM_CLICK** on Adobe ActionScript dialogs — **Esc** closes the modal when possible;
+    **WM_CLOSE** only if Esc did not tear down the HWND (some builds need the fallback).
+
+    Localized *Descartar todo* / *Dismiss all* BM_CLICK paths still collapse MAIN clean-eof in logs
     (see ``operator_phase=as_sweep``). Set ``BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY=false``
     to restore BM_CLICK ranked buttons during the sweep.
     """
@@ -1882,12 +1950,15 @@ def dismiss_flash_error_dialogs_no_mouse(
 ) -> int:
     """
     Dismiss Flash ActionScript/security error dialogs for *pid* **without moving
-    the mouse cursor**.  Finds top-level windows owned by the process (small
-    popups, or **large** \"Adobe Flash Player\" ActionScript error windows),
-    enumerates child Button controls, and sends ``BM_CLICK`` to the best match
-    (prefers *Dismiss All*).  Falls back to Escape or, only if
-    ``FLASH_ERROR_DISMISS_USE_WMCLOSE`` is set (or *use_wmclose_override* for
-    callers like the post-login sweep), ``WM_CLOSE`` on the dialog.
+    the mouse cursor**.
+
+    Adobe-titled ActionScript dialogs (Spanish *Error de ActionScript*, #2048, etc.)
+    are closed like a manual user would: keyboard **Esc** after a best-effort
+    foreground (``FLASH_ERROR_DISMISS_ESC_USE_FOREGROUND``); we only send
+    ``WM_CLOSE`` if the dialog HWND stays visible afterward (see sweep flags).
+
+    Other paths rank child ``Button`` controls and send ``BM_CLICK`` (*Dismiss All*, …),
+    falling back to PostMessage Escape and optional ``FLASH_ERROR_DISMISS_USE_WMCLOSE``.
 
     *dismiss_correlation_context* tags the caller (e.g. ``post_login_sweep``, ``login_phase_poll``)
     for
@@ -2005,6 +2076,7 @@ def dismiss_flash_error_dialogs_no_mouse(
     )
 
     def _try_escape_on_dialog(top_hwnd: int) -> None:
+        """Legacy PostMessage Esc (non‑Adobe fallback when we avoid foreground tricks)."""
         user32.PostMessageW(top_hwnd, WM_KEYDOWN, VK_ESCAPE, 0)
         user32.PostMessageW(top_hwnd, WM_KEYUP, VK_ESCAPE, 0)
 
@@ -2104,10 +2176,55 @@ def dismiss_flash_error_dialogs_no_mouse(
                 slot_label, top, _caps,
             )
 
-        # Sweep + login-phase poll: never BM_CLICK Descartar/Dismiss/etc. — on many builds ANY
-        # button dismiss still collapses MAIN (logs: OK decreases during operator_phase=as_sweep).
+        # Sweep + login-phase poll: never BM_CLICK Descartar/Dismiss/etc. Same as manual play: Esc
+        # closes Adobe's modal; WM_CLOSE remains a fallback only if the HWND stays visible (#2048 / es-ES).
         if sweep_adobe_esc_wmclose_only and adobe_err and buttons:
-            _try_escape_on_dialog(top)
+            _try_escape_adobe_actionscript_dialog(top, user32)
+            time.sleep(_flash_error_esc_post_poll_sec())
+            if not _adobe_actionscript_dialog_may_remain(top, user32):
+                sess_tot, sess_bad = _record_as_dismiss_close(
+                    incorrect_version=looks_like_incorrect_version,
+                )
+                _as_dismiss_log_closed(
+                    incorrect_version=looks_like_incorrect_version,
+                    sess_tot=sess_tot,
+                    fmt=(
+                        "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s "
+                        "(method=Esc keyboard — modal dismissed without WM_CLOSE) "
+                        "area=%d title=%r body=%r "
+                        "| session_total=%d incorrect_version_total=%d"
+                    ),
+                    args=(
+                        slot_label,
+                        pid,
+                        top,
+                        area,
+                        (title or "")[:80],
+                        (body_text or "")[: _flash_dismiss_body_log_chars()],
+                        sess_tot,
+                        sess_bad,
+                    ),
+                )
+                if looks_like_incorrect_version:
+                    logger.warning(
+                        "Slot %s: Flash dialog reported INCORRECT GAME VERSION — re-dump "
+                        "TFM_SECRETS_GAME_VERSION (and re-patch the loader SWF if stale). "
+                        "incorrect_version_total_this_session=%d Body: %r",
+                        slot_label,
+                        sess_bad,
+                        (body_text or "")[: _flash_dismiss_body_log_chars()],
+                    )
+                clicked += 1
+                record_as_dismiss_monotonic_for_slot(
+                    slot_label,
+                    detail=_corr(
+                        "Escape_keyboard_only_adobe_esc",
+                        top,
+                        incorrect_version=looks_like_incorrect_version,
+                    ),
+                )
+                continue
+
             if use_wmclose:
                 user32.PostMessageW(top, WM_CLOSE, 0, 0)
                 sess_tot, sess_bad = _record_as_dismiss_close(
@@ -2118,7 +2235,7 @@ def dismiss_flash_error_dialogs_no_mouse(
                     sess_tot=sess_tot,
                     fmt=(
                         "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s "
-                        "(method=Escape+WM_CLOSE adobe_no_BMCLICK; avoids localized Dismiss clicks) "
+                        "(method=Esc then WM_CLOSE — modal stayed open after Esc) "
                         "area=%d title=%r body=%r "
                         "| session_total=%d incorrect_version_total=%d"
                     ),
@@ -2153,8 +2270,8 @@ def dismiss_flash_error_dialogs_no_mouse(
                 )
             else:
                 logger.warning(
-                    "ActionScript error dismiss: Adobe AS Escape+WM_CLOSE-only mode slot=%s — "
-                    "WM_CLOSE disabled (BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE=false); Escape only hwnd=%s",
+                    "ActionScript error dismiss: Adobe AS slot=%s — Esc sent but HWND still visible "
+                    "and BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE=false (no WM_CLOSE fallback). hwnd=%s",
                     slot_label,
                     top,
                 )
@@ -2173,11 +2290,19 @@ def dismiss_flash_error_dialogs_no_mouse(
                     slot_label, top, area, (title or "")[:100],
                 )
                 continue
-            _try_escape_on_dialog(top)
+            if adobe_err:
+                _try_escape_adobe_actionscript_dialog(top, user32)
+            else:
+                _try_escape_on_dialog(top)
             logger.debug(
                 "ActionScript error dismiss: tiny top-level slot=%s hwnd=%s (area=%d) no Buttons — "
-                "Escape only (never WM_CLOSE without BM_CLICK target). adobe_titled=%s title=%r",
-                slot_label, top, area, adobe_err, (title or "")[:80],
+                "%s Esc (never WM_CLOSE without BM_CLICK target). adobe_titled=%s title=%r",
+                slot_label,
+                top,
+                area,
+                "keyboard" if adobe_err else "PostMessage",
+                adobe_err,
+                (title or "")[:80],
             )
             continue
 
@@ -2325,8 +2450,47 @@ def dismiss_flash_error_dialogs_no_mouse(
                 break
         else:
             if adobe_err or area < _MAX_SMALL_POPUP_AREA:
-                _try_escape_on_dialog(top)
-                if adobe_err and use_wmclose:
+                if adobe_err:
+                    _try_escape_adobe_actionscript_dialog(top, user32)
+                    time.sleep(_flash_error_esc_post_poll_sec())
+                    closed_by_esc = not _adobe_actionscript_dialog_may_remain(top, user32)
+                else:
+                    _try_escape_on_dialog(top)
+                    closed_by_esc = False
+                if adobe_err and closed_by_esc:
+                    sess_tot, sess_bad = _record_as_dismiss_close(
+                        incorrect_version=looks_like_incorrect_version,
+                    )
+                    _as_dismiss_log_closed(
+                        incorrect_version=looks_like_incorrect_version,
+                        sess_tot=sess_tot,
+                        fmt=(
+                            "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s "
+                            "(method=Esc keyboard; buttons unmatched / rank skip) "
+                            "area=%d title=%r body=%r "
+                            "| session_total=%d incorrect_version_total=%d"
+                        ),
+                        args=(
+                            slot_label,
+                            pid,
+                            top,
+                            area,
+                            (title or "")[:80],
+                            (body_text or "")[: _flash_dismiss_body_log_chars()],
+                            sess_tot,
+                            sess_bad,
+                        ),
+                    )
+                    clicked += 1
+                    record_as_dismiss_monotonic_for_slot(
+                        slot_label,
+                        detail=_corr(
+                            "Escape_keyboard_nomatch_buttons",
+                            top,
+                            incorrect_version=looks_like_incorrect_version,
+                        ),
+                    )
+                elif adobe_err and use_wmclose:
                     user32.PostMessageW(top, WM_CLOSE, 0, 0)
                     sess_tot, sess_bad = _record_as_dismiss_close(
                         incorrect_version=looks_like_incorrect_version,
@@ -2335,11 +2499,21 @@ def dismiss_flash_error_dialogs_no_mouse(
                         incorrect_version=looks_like_incorrect_version,
                         sess_tot=sess_tot,
                         fmt=(
-                            "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s (buttons present "
-                            "but no match; method=Escape + WM_CLOSE) area=%d "
+                            "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s "
+                            "(method=Esc then WM_CLOSE; buttons unmatched — modal still open after Esc) "
+                            "area=%d title=%r body=%r "
                             "| session_total=%d incorrect_version_total=%d"
                         ),
-                        args=(slot_label, pid, top, area, sess_tot, sess_bad),
+                        args=(
+                            slot_label,
+                            pid,
+                            top,
+                            area,
+                            (title or "")[:80],
+                            (body_text or "")[: _flash_dismiss_body_log_chars()],
+                            sess_tot,
+                            sess_bad,
+                        ),
                     )
                     clicked += 1
                     record_as_dismiss_monotonic_for_slot(
@@ -2353,16 +2527,23 @@ def dismiss_flash_error_dialogs_no_mouse(
                 elif adobe_err and not use_wmclose:
                     logger.warning(
                         "ActionScript error dismiss: slot=%s pid=%s hwnd=%s — no safe button; "
-                        "Escape only. (Try FLASH_ERROR_DISMISS_ALLOW_CONTINUE=true, or "
+                        "Esc left dialog visible and WM_CLOSE disabled. "
+                        "(Try FLASH_ERROR_DISMISS_ALLOW_CONTINUE=true, or "
                         "FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION=true when Continue is the "
                         "sole option — default is on). area=%d title=%r",
-                        slot_label, pid, top, area, (title or "")[:80],
+                        slot_label,
+                        pid,
+                        top,
+                        area,
+                        (title or "")[:80],
                     )
                 else:
                     logger.debug(
                         "ActionScript error dismiss: no matching button label; Escape only "
                         "slot=%s hwnd=%s (area=%d)",
-                        slot_label, top, area,
+                        slot_label,
+                        top,
+                        area,
                     )
 
     if clicked:

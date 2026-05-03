@@ -2969,7 +2969,7 @@ def main(argv: list[str] | None = None) -> None:
                 "ActionScript error dismiss: background poll every %.2fs during login only "
                 "(stops when the initial login batch finishes, before PARTL retry; set "
                 "FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC=0 to disable). "
-                "Adobe AS dialogs use same Escape+WM_CLOSE policy as post-login sweep: "
+                "Adobe AS dialogs use Esc first (keyboard) then WM_CLOSE fallback like post-login sweep: "
                 "BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE=%s BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY=%s.",
                 _pd_early,
                 _login_phase_adobe_esc_kw["use_wmclose_override"],

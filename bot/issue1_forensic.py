@@ -113,6 +113,10 @@ def dismiss_tail_issue1_cues(detail: str) -> str | None:
         tok.append("AUTO_BM_CLICK")
         if "rank3" in tail or "rank4" in tail:
             tok.append("BM_CLICK_CONTINUE_RANK")
+    elif "meth=Escape_keyboard_only_adobe_esc" in tail:
+        tok.append("AUTO_ESC_KEYBD_ADOBE_PRIMARY")
+    elif "meth=Escape_keyboard_nomatch_buttons" in tail:
+        tok.append("AUTO_ESC_KEYBD_NOMATCH")
     elif "meth=Escape+WM_CLOSE_adobe_esc" in tail:
         tok.append("AUTO_ADOBE_ESC_WM_CLOSE")
     elif "meth=Escape+WM_CLOSE_nomatch_buttons" in tail:

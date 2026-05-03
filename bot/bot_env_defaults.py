@@ -151,7 +151,7 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     # and can drop MAIN (operator_phase=as_sweep). Use WM_CLOSE on the Adobe popup instead.
     "BOT_POST_LOGIN_AS_SWEEP_CONTINUE_IF_SOLE_OPTION": "false",
     "BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE": "true",
-    # Sweep: close Adobe AS popups with Escape+WM_CLOSE only (no BM_CLICK on Descartar/Dismiss)—
+    # Sweep: Adobe AS popups — Esc first (keyboard), WM_CLOSE fallback if modal stays open—
     # BM_CLICK ranked buttons still dropped MAIN in multi-locale logs (phase=as_sweep).
     "BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY": "true",
     # Optional spacing (seconds) between slots within each sweep pass — spreads WM_CLOSE in time.
@@ -225,7 +225,11 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE": "false",
     # Last N packet labels per direction on MAIN (raise during ROOT_CAUSE runs; default 8).
     "BOT_PROXY_MAIN_PACKET_RING": "8",
-    # Longer AS dialog text in logs (default 720; max 8000).
+    # Prefer SetForegroundWindow + keybd_event Esc before PostMessage Esc (Unset=true).
+    "FLASH_ERROR_DISMISS_ESC_USE_FOREGROUND": "true",
+    # After Esc bursts: wait before checking if Adobe error dialog HWND vanished (milliseconds).
+    "FLASH_ERROR_ESC_POST_POLL_MS": "180",
+    # Longer AS dialog text in logs (max 8000).
     # Default raised so nested-dialog #2048 / #2044 lines appear in WARN lines without extra env.
     "FLASH_ERROR_DISMISS_BODY_LOG_CHARS": "1600",
     # First-seen fingerprint preview length (default 1400; max 12000).
