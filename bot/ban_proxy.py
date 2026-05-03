@@ -23,6 +23,7 @@ from caseus.util.crypto import shakikoo
 
 from .upstream_socket_bind import upstream_local_bind_tuple
 from .trace_log import trace_step
+from .issue1_forensic import dismiss_tail_issue1_cues
 
 logger = logging.getLogger(__name__)
 
@@ -1350,6 +1351,18 @@ class BanBotProxy(Proxy):
                         parts.append("issue1_near_as_dismiss=%.2fs|%s" % (dt_disp, tail))
                     else:
                         parts.append("issue1_near_as_dismiss=%.2fs|no_tail" % dt_disp)
+                    cue_ln = dismiss_tail_issue1_cues(det)
+                    if cue_ln:
+                        parts.append(cue_ln)
+                        if close_reason == "clean-eof":
+                            if "WRONG_VERSION_HINT_IN_AS_BODY" in cue_ln:
+                                parts.append(
+                                    "ISSUE1_PRIMARY_SUSPECT=STALE_GAME_VERSION_OR_LOADER_MISMATCH"
+                                )
+                            elif "BM_CLICK_CONTINUE_RANK" in cue_ln:
+                                parts.append(
+                                    "ISSUE1_PRIMARY_SUSPECT=CONTINUE_BMCLICK_AS_SESSION_TEARDOWN"
+                                )
         except Exception:
             pass
 
@@ -1597,13 +1610,27 @@ class BanBotProxy(Proxy):
                 now_p = time.monotonic()
                 adm = last_as_dismiss_monotonic_for_slot(self.slot_label)
                 det = last_as_dismiss_detail_for_slot(self.slot_label)
-                det_s = (det.strip()[:400] + ("…" if len(det.strip()) > 400 else "")) if det else ""
+                det_trim = det.strip() if det else ""
+                det_s = (det_trim[:400] + ("…" if len(det_trim) > 400 else "")) if det_trim else ""
                 if adm is None:
                     as_part = "as_dismiss_never_this_slot"
                 elif det_s:
                     as_part = f"sec_since_as_dismiss={now_p - adm:.4f} dismiss_tail={det_s}"
                 else:
                     as_part = f"sec_since_as_dismiss={now_p - adm:.4f}"
+                cues_root = dismiss_tail_issue1_cues(det_trim)
+                if cues_root:
+                    as_part = f"{as_part} | {cues_root}"
+                    if (
+                        close_reason == "clean-eof"
+                        and "WRONG_VERSION_HINT_IN_AS_BODY" in cues_root
+                    ):
+                        as_part += " | ISSUE1_PRIMARY_SUSPECT=STALE_GAME_VERSION_OR_LOADER_MISMATCH"
+                    elif (
+                        close_reason == "clean-eof"
+                        and "BM_CLICK_CONTINUE_RANK" in cues_root
+                    ):
+                        as_part += " | ISSUE1_PRIMARY_SUSPECT=CONTINUE_BMCLICK_AS_SESSION_TEARDOWN"
                 flash_snap = _root_cause_flash_tcp_snapshot(client_writer)
                 if need_rc:
                     logger.warning(

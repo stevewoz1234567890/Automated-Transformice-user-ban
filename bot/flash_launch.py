@@ -87,14 +87,27 @@ def _dismiss_action_corr(
     meth: str,
     dlg_hwnd: int,
     extra: str = "",
+    incorrect_version: bool = False,
 ) -> str:
     ctx = dismiss_context or "default"
     ph = operator_phase if operator_phase else "?"
     x = " ".join((extra or "").replace("\r", " ").replace("\n", " ").split())
     if len(x) > 120:
         x = x[:117] + "…"
-    base = f"ctx={ctx} phase={ph} pid={pid} meth={meth} dlg={dlg_hwnd}"
+    iv_bit = "1" if incorrect_version else "0"
+    base = (
+        f"ctx={ctx} phase={ph} pid={pid} dlg={dlg_hwnd} meth={meth} iv={iv_bit}"
+    )
     return f"{base} {x}".strip() if x else base
+
+
+def _issue1_as_dismiss_action_log_enabled() -> bool:
+    return (os.environ.get("BOT_ISSUE1_AS_DISMISS_LOG") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def record_as_dismiss_monotonic_for_slot(
@@ -110,7 +123,14 @@ def record_as_dismiss_monotonic_for_slot(
         _last_as_dismiss_mono_by_slot[lab] = time.monotonic()
         if detail:
             t = " ".join(detail.replace("\r", " ").replace("\n", " ").split())
-            _last_as_dismiss_detail_by_slot[lab] = t[:400] + ("…" if len(t) > 400 else "")
+            clipped = t[:440] + ("…" if len(t) > 440 else "")
+            _last_as_dismiss_detail_by_slot[lab] = clipped
+            if _issue1_as_dismiss_action_log_enabled():
+                logger.warning(
+                    "ISSUE1_AS_DISMISS_ACTION slot=%s %s",
+                    lab,
+                    t[:560] + ("…" if len(t) > 560 else ""),
+                )
 
 
 def last_as_dismiss_monotonic_for_slot(slot_label: str) -> float | None:
@@ -1764,14 +1784,35 @@ def flash_error_dismiss_policy_log_line() -> str:
         "— Button matching is multilingual (not English-only); Windows UI langs are logged first for support. "
         "Continuar/Continue is only auto-clicked when ALLOW_CONTINUE is true, or when the "
         "dialog has no Dismiss/OK and CONTINUE_IF_SOLE_OPTION is true (default). "
-        "Post-login sweep uses BOT_POST_LOGIN_AS_SWEEP_* (default: Adobe AS popups closed with "
-        "Escape+WM_CLOSE only — no BM_CLICK on Descartar/Dismiss buttons; avoid sole-Continuar too). "
+        "Post-login sweep and login-phase Flash error polling use BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE "
+        "and BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY (default: Adobe AS popups closed with "
+        "Escape+WM_CLOSE only — no BM_CLICK on Descartar/Dismiss buttons; sweep also uses "
+        "BOT_POST_LOGIN_AS_SWEEP_CONTINUE_IF_SOLE_OPTION for sole-Continuar). "
     )
+
+
+def adobe_actionscript_escape_wmclose_kw_from_env() -> dict[str, bool]:
+    """
+    Keyword args for ``dismiss_flash_error_dialogs_no_mouse`` when closing **Adobe** ActionScript
+    error dialogs with Escape + WM_CLOSE (no localized BM_CLICK on Dismiss / Descartar todo).
+
+    Shared by the post-login sweep and the Flash error poll during login
+    (``dismiss_correlation_context=login_phase_poll``).
+    """
+    return {
+        "use_wmclose_override": _env_flag_true_by_default("BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE"),
+        "adobe_escape_wmclose_only": _env_flag_true_by_default(
+            "BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY"
+        ),
+    }
 
 
 def post_login_sweep_dismiss_kw() -> dict[str, bool]:
     """
-    Dismiss overrides for ``post_login_actionscript_error_sweep`` only.
+    Dismiss overrides for ``post_login_actionscript_error_sweep``.
+
+    ``continue_if_sole_option`` applies only here; Adobe Escape+WM_CLOSE flags come from
+    ``adobe_actionscript_escape_wmclose_kw_from_env()`` (same as login-phase polling).
 
     Default: **no BM_CLICK at all on Adobe ActionScript dialogs** — only Escape + WM_CLOSE —
     since localized *Descartar todo* / *Dismiss all* still drops MAIN clean-eof in some runs
@@ -1781,13 +1822,9 @@ def post_login_sweep_dismiss_kw() -> dict[str, bool]:
     c_raw = (os.environ.get("BOT_POST_LOGIN_AS_SWEEP_CONTINUE_IF_SOLE_OPTION") or "").strip().lower()
     continue_sole = c_raw in ("1", "true", "yes", "on")
 
-    esc_raw = (os.environ.get("BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY") or "").strip().lower()
-    adobe_esc_only = esc_raw not in ("0", "false", "no", "off")
-
     return {
         "continue_if_sole_option": continue_sole,
-        "use_wmclose_override": use_wm,
-        "adobe_escape_wmclose_only": adobe_esc_only,
+        **adobe_actionscript_escape_wmclose_kw_from_env(),
     }
 
 
@@ -1810,7 +1847,8 @@ def dismiss_flash_error_dialogs_no_mouse(
     ``FLASH_ERROR_DISMISS_USE_WMCLOSE`` is set (or *use_wmclose_override* for
     callers like the post-login sweep), ``WM_CLOSE`` on the dialog.
 
-    *dismiss_correlation_context* tags the caller (e.g. ``post_login_sweep``) for
+    *dismiss_correlation_context* tags the caller (e.g. ``post_login_sweep``, ``login_phase_poll``)
+    for
     ``issue1_near_as_dismiss=`` on MAIN teardown. *log_operator_phase* should be
     ``get_operator_phase()`` from the CLI when possible.
 
@@ -1853,7 +1891,13 @@ def dismiss_flash_error_dialogs_no_mouse(
     )
     DISMISS_LABELS = flash_dialog_fallback_bmclick_labels(allow_continue=allow_continue)
 
-    def _corr(meth: str, dlg_hwnd: int, *, extra: str = "") -> str:
+    def _corr(
+        meth: str,
+        dlg_hwnd: int,
+        *,
+        extra: str = "",
+        incorrect_version: bool = False,
+    ) -> str:
         return _dismiss_action_corr(
             dismiss_context=dismiss_correlation_context,
             operator_phase=log_operator_phase,
@@ -1861,6 +1905,7 @@ def dismiss_flash_error_dialogs_no_mouse(
             meth=meth,
             dlg_hwnd=dlg_hwnd,
             extra=extra,
+            incorrect_version=incorrect_version,
         )
     # ActionScript / securityError dialogs from Flash Player (large client area is normal).
     _MAX_SMALL_POPUP_AREA = 120_000
@@ -2013,8 +2058,8 @@ def dismiss_flash_error_dialogs_no_mouse(
                 slot_label, top, _caps,
             )
 
-        # Post-login sweep: never BM_CLICK Descartar/Dismiss/etc. — on many builds ANY button dismiss
-        # still collapses MAIN (logs: OK decreases during operator_phase=as_sweep).
+        # Sweep + login-phase poll: never BM_CLICK Descartar/Dismiss/etc. — on many builds ANY
+        # button dismiss still collapses MAIN (logs: OK decreases during operator_phase=as_sweep).
         if sweep_adobe_esc_wmclose_only and adobe_err and buttons:
             _try_escape_on_dialog(top)
             if use_wmclose:
@@ -2027,7 +2072,7 @@ def dismiss_flash_error_dialogs_no_mouse(
                     sess_tot=sess_tot,
                     fmt=(
                         "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s "
-                        "(method=Escape+WM_CLOSE sweep_no_BMCLICK; avoids localized Dismiss clicks) "
+                        "(method=Escape+WM_CLOSE adobe_no_BMCLICK; avoids localized Dismiss clicks) "
                         "area=%d title=%r body=%r "
                         "| session_total=%d incorrect_version_total=%d"
                     ),
@@ -2054,12 +2099,16 @@ def dismiss_flash_error_dialogs_no_mouse(
                 clicked += 1
                 record_as_dismiss_monotonic_for_slot(
                     slot_label,
-                    detail=_corr("Escape+WM_CLOSE_sweep_esc", top),
+                    detail=_corr(
+                        "Escape+WM_CLOSE_adobe_esc",
+                        top,
+                        incorrect_version=looks_like_incorrect_version,
+                    ),
                 )
             else:
                 logger.warning(
-                    "ActionScript error dismiss: sweep_adobe_esc_wmclose_only ignored slot=%s — "
-                    "WM_CLOSE disabled (BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE); Escape only hwnd=%s",
+                    "ActionScript error dismiss: Adobe AS Escape+WM_CLOSE-only mode slot=%s — "
+                    "WM_CLOSE disabled (BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE=false); Escape only hwnd=%s",
                     slot_label,
                     top,
                 )
@@ -2171,7 +2220,12 @@ def dismiss_flash_error_dialogs_no_mouse(
             clicked += 1
             record_as_dismiss_monotonic_for_slot(
                 slot_label,
-                detail=_corr(f"BM_CLICK_ranked_rank{best_rank}", top, extra=f"btn_cap={best_lbl!r}"),
+                detail=_corr(
+                    f"BM_CLICK_ranked_rank{best_rank}",
+                    top,
+                    extra=f"btn_cap={best_lbl!r}",
+                    incorrect_version=looks_like_incorrect_version,
+                ),
             )
             continue
 
@@ -2215,7 +2269,12 @@ def dismiss_flash_error_dialogs_no_mouse(
                 clicked += 1
                 record_as_dismiss_monotonic_for_slot(
                     slot_label,
-                    detail=_corr("BM_CLICK_exact", top, extra=f"btn_cap={txt.value.strip()!r}"),
+                    detail=_corr(
+                        "BM_CLICK_exact",
+                        top,
+                        extra=f"btn_cap={txt.value.strip()!r}",
+                        incorrect_version=looks_like_incorrect_version,
+                    ),
                 )
                 break
         else:
@@ -2239,7 +2298,11 @@ def dismiss_flash_error_dialogs_no_mouse(
                     clicked += 1
                     record_as_dismiss_monotonic_for_slot(
                         slot_label,
-                        detail=_corr("Escape+WM_CLOSE_nomatch_buttons", top),
+                        detail=_corr(
+                            "Escape+WM_CLOSE_nomatch_buttons",
+                            top,
+                            incorrect_version=looks_like_incorrect_version,
+                        ),
                     )
                 elif adobe_err and not use_wmclose:
                     logger.warning(

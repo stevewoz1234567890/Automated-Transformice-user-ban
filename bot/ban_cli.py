@@ -1871,7 +1871,8 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
     if issue1_banner:
         logger.warning(
             "ISSUE1_SWEEP_END mono=%.3f elapsed_sweep=%.2fs dialogs_closed=%d ok_delta=%+d partl_delta=%+d "
-            "operator_phase_at_end=%s — PARTL lines: grep issue1_near_as_dismiss= and dismiss_tail=",
+            "operator_phase_at_end=%s — PARTL hunt: grep issue1_near_as_dismiss= ISSUE1_DISMISS_CUE= "
+            "ISSUE1_PRIMARY_SUSPECT= dismiss_tail= ISSUE1_AS_DISMISS_ACTION",
             time.monotonic(),
             time.monotonic() - sweep_mono_start,
             total,
@@ -2893,8 +2894,10 @@ def main(argv: list[str] | None = None) -> None:
                     _tags.append("BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE")
                 logger.info(
                     "Deep MAIN teardown logging [%s] — grep ISSUE1_HANDSHAKE / ISSUE1_MAIN_CLOSE / "
-                    "ISSUE1_AS_FIRST_FP and ROOT_CAUSE_MAIN_CLOSE. With BOT_ISSUE1_FORENSIC, rings and AS "
-                    "previews widen automatically. Optional: BOT_PROXY_LOG_ALL_MAIN_PACKETS=true.",
+                    "ISSUE1_AS_FIRST_FP / ROOT_CAUSE_MAIN_CLOSE / ISSUE1_DISMISS_CUE / "
+                    "ISSUE1_PRIMARY_SUSPECT / ISSUE1_AS_DISMISS_ACTION. With BOT_ISSUE1_FORENSIC, rings and AS "
+                    "previews widen automatically; BOT_ISSUE1_AS_DISMISS_LOG defaults on (set false to quiet). "
+                    "Optional: BOT_PROXY_LOG_ALL_MAIN_PACKETS=true.",
                     "+".join(_tags),
                 )
 
@@ -2913,6 +2916,7 @@ def main(argv: list[str] | None = None) -> None:
         if _pd_early > 0 and sys.platform == "win32":
             flash_dismiss_poll_stop = threading.Event()
             _dismiss_stop = flash_dismiss_poll_stop
+            _login_phase_adobe_esc_kw = flash_launch.adobe_actionscript_escape_wmclose_kw_from_env()
 
             def _global_dismiss_worker_early(
                 _states: list[SlotState] = states,
@@ -2936,6 +2940,7 @@ def main(argv: list[str] | None = None) -> None:
                             flash_launch.dismiss_flash_error_dialogs_no_mouse(
                                 pid,
                                 _s.label,
+                                **_login_phase_adobe_esc_kw,
                                 dismiss_correlation_context="login_phase_poll",
                                 log_operator_phase=get_operator_phase(),
                             )
@@ -2955,8 +2960,12 @@ def main(argv: list[str] | None = None) -> None:
             logger.info(
                 "ActionScript error dismiss: background poll every %.2fs during login only "
                 "(stops when the initial login batch finishes, before PARTL retry; set "
-                "FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC=0 to disable).",
+                "FLASH_FLASHPLAYER_ERROR_DISMISS_POLL_SEC=0 to disable). "
+                "Adobe AS dialogs use same Escape+WM_CLOSE policy as post-login sweep: "
+                "BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE=%s BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY=%s.",
                 _pd_early,
+                _login_phase_adobe_esc_kw["use_wmclose_override"],
+                _login_phase_adobe_esc_kw["adobe_escape_wmclose_only"],
             )
 
         # Rotate which Flash window is briefly foreground: background Flash throttles

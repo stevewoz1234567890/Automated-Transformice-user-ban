@@ -9,10 +9,13 @@ Grep defaults (always on unless disabled)::
 
     ISSUE1_SWEEP_BEGIN  ISSUE1_SWEEP_END
     issue1_near_as_dismiss=   dismiss_tail=
+    ISSUE1_DISMISS_CUE=       ISSUE1_AS_DISMISS_ACTION
 
 Set ``BOT_ISSUE1_SWEEP_BOUNDARY_LOG=0`` to hide sweep boundary markers.
 Tune ``BOT_ISSUE1_AS_MAIN_CORR_WINDOW_SEC`` (seconds) for MAIN-vs-dismiss proximity on diagnostics.
 Also see ``BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE`` for extra ROOT_CAUSE lines.
+``BOT_ISSUE1_AS_DISMISS_LOG=true`` logs one WARNING per Flash dismiss (anchor ``ISSUE1_AS_DISMISS_ACTION``);
+when ``BOT_ISSUE1_FORENSIC`` is enabled this defaults on unless you set the var to ``false`` explicitly.
 """
 
 from __future__ import annotations
@@ -20,10 +23,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_RE_ISSUE1_IV1 = re.compile(r"(?:^|\s)iv=1(?:\s|$)")
 
 
 def active() -> bool:
@@ -61,6 +67,10 @@ def apply_env_overrides() -> bool:
 
     os.environ["FLASH_ERROR_LOG_FULL_BODY_FIRST_FP"] = "true"
 
+    _dm = os.environ.get("BOT_ISSUE1_AS_DISMISS_LOG")
+    if _dm is None or str(_dm).strip() == "":
+        os.environ["BOT_ISSUE1_AS_DISMISS_LOG"] = "true"
+
     try:
         body_prev = int((os.environ.get("FLASH_ERROR_DISMISS_BODY_LOG_CHARS") or "720").strip())
     except ValueError:
@@ -69,10 +79,44 @@ def apply_env_overrides() -> bool:
 
     logger.warning(
         "ISSUE1_FORENSIC enabled — tightened env: ROOT_CAUSE_MAIN_CLOSE VERBOSE_LOGIN "
-        "MAIN_PACKET_RING=%s long AS previews; optional packet flood BOT_PROXY_LOG_ALL_MAIN_PACKETS=true.",
+        "MAIN_PACKET_RING=%s long AS previews; BOT_ISSUE1_AS_DISMISS_LOG defaulted on "
+        "(ISSUE1_AS_DISMISS_ACTION per dismiss; set BOT_ISSUE1_AS_DISMISS_LOG=false to quiet). "
+        "Optional BOT_PROXY_LOG_ALL_MAIN_PACKETS=true.",
         target_ring,
     )
     return True
+
+
+def dismiss_tail_issue1_cues(detail: str) -> str | None:
+    """
+    Compact tokens for MAIN / ROOT_CAUSE lines (grep ``ISSUE1_DISMISS_CUE=``).
+
+    Built from the same string stored as ``last_as_dismiss_detail_for_slot`` /
+    ``issue1_near_as_dismiss=...|tail`` (see ``_dismiss_action_corr`` in flash_launch).
+    """
+    if not (detail or "").strip():
+        return None
+    tail = detail.strip()
+    tok: list[str] = []
+    if _RE_ISSUE1_IV1.search(tail):
+        tok.append("WRONG_VERSION_HINT_IN_AS_BODY")
+    if "ctx=login_phase_poll" in tail:
+        tok.append("DISMISS_CTX_LOGIN_POLL")
+    elif "ctx=post_login_sweep" in tail:
+        tok.append("DISMISS_CTX_POST_LOGIN_SWEEP")
+    elif "ctx=pre_ban_round" in tail:
+        tok.append("DISMISS_CTX_PRE_BAN")
+    if "meth=BM_CLICK" in tail:
+        tok.append("AUTO_BM_CLICK")
+        if "rank3" in tail or "rank4" in tail:
+            tok.append("BM_CLICK_CONTINUE_RANK")
+    elif "meth=Escape+WM_CLOSE_adobe_esc" in tail:
+        tok.append("AUTO_ADOBE_ESC_WM_CLOSE")
+    elif "meth=Escape+WM_CLOSE_nomatch_buttons" in tail:
+        tok.append("AUTO_ESC_WM_CLOSE_NOMATCH_FALLBACK")
+    if tok:
+        return "ISSUE1_DISMISS_CUE=" + ",".join(tok)
+    return None
 
 
 def loader_source_fingerprint() -> str:

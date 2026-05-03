@@ -209,6 +209,8 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_ISSUE1_FORENSIC": "false",
     # Always-on (unless 0): seconds — MAIN close diagnostic gains issue1_near_as_dismiss= when Flash dismiss was recent.
     "BOT_ISSUE1_AS_MAIN_CORR_WINDOW_SEC": "12",
+    # Per-dismiss ISSUE1_AS_DISMISS_ACTION WARNING lines (spammy); forensic mode defaults this on when unset.
+    "BOT_ISSUE1_AS_DISMISS_LOG": "false",
     # Sweep markers ISSUE1_SWEEP_BEGIN / ISSUE1_SWEEP_END (set false to hide).
     "BOT_ISSUE1_SWEEP_BOUNDARY_LOG": "true",
     # Deep clean-eof hunt: WARNING ROOT_CAUSE_MAIN_CLOSE on every MAIN end (Flash TCP, rings, AS-dismiss delta).
