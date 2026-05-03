@@ -29,8 +29,14 @@ _source_swf_digest_cache: dict[tuple[str, float, int], str] = {}
 _ORIG_MAIN = b"localhost:11801"
 _ORIG_POLICY = b"xmlsocket://localhost:10801"
 
-# Patched-loader cache files now end with ``_<16 hex of source SWF>_zwsflen2.swf``.
-_PATCH_CACHE_NEW_STYLE_SUFFIX = re.compile(r"_[0-9a-f]{16}_zwsflen2\.swf$", re.IGNORECASE)
+# Patched-loader cache basename shape (see :func:`build_patched_loader_swf`):
+# ``TFMProxyLoader_patched_<host>_<port>_<8 hex up_slug>_<16 hex source>_zwsflen2.swf``.
+# Older intermediate names used ``…_<port>_<16hex>_zwsflen2.swf`` only; purge drops those so Flash cannot
+# keep a patched loader missing upstream literal neutralization (Flash #2048).
+_PATCH_CACHE_UPSTREAM_AWARE_SUFFIX = re.compile(
+    r"_\d+_[0-9a-f]{8}_[0-9a-f]{16}_zwsflen2\.swf$",
+    re.IGNORECASE,
+)
 
 
 def _lzma_filters_from_zws(p: bytes) -> tuple[list[dict], int]:
@@ -269,10 +275,12 @@ def _source_swf_cache_tag(source_zws: Path) -> str:
 
 def purge_legacy_loader_patch_cache(cache_dir: Path) -> int:
     """
-    Remove patched-loader files from before source-hash cache names (``…_<port>_zwsflen2.swf``).
+    Remove patched-loader cache files that are not the **current** filename shape.
 
-    Current entries include a 16-hex digest before ``_zwsflen2.swf``. Older builds keyed only by host
-    + port could leave stale patched SWFs on disk across loader upgrades.
+    Keeps only ``…_<port>_<8hex upslug>_<16hex src>_zwsflen2.swf`` (upstream-neutralization-aware).
+    Drops: host+port-only names, zlib-era ``_zwsflen`` artifacts, and the intermediate
+    ``…_<port>_<16hex src>_zwsflen2.swf`` shape (same source digest suffix as today but missing
+    ``up_slug`` — Flash would reuse a loader built without plaintext-IP stripping).
     """
     removed = 0
     if not cache_dir.is_dir():
@@ -285,13 +293,13 @@ def purge_legacy_loader_patch_cache(cache_dir: Path) -> int:
             continue
         if not name.endswith("_zwsflen2.swf"):
             continue
-        if _PATCH_CACHE_NEW_STYLE_SUFFIX.search(name):
+        if _PATCH_CACHE_UPSTREAM_AWARE_SUFFIX.search(name):
             continue
         try:
             entry.unlink()
             removed += 1
             logger.info(
-                "Removed legacy patched-loader cache (no source-hash segment; superseded format): %s",
+                "Removed legacy patched-loader cache (superseded filename; rebuilt with current patcher): %s",
                 name,
             )
         except OSError as e:
@@ -299,7 +307,7 @@ def purge_legacy_loader_patch_cache(cache_dir: Path) -> int:
     if removed:
         logger.info(
             "Loader patch cache cleanup: removed %d legacy file(s) under %s — "
-            "current caches include a 16-hex source SWF fingerprint in the filename.",
+            "current caches use ``_<port>_<8hex upstream slug>_<16hex source>_zwsflen2.swf``.",
             removed,
             cache_dir,
         )
