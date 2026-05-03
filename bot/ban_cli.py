@@ -1705,7 +1705,12 @@ def pre_ban_dismiss_flash_dialogs(states: list[SlotState], cfg: object) -> None:
         if not pid or not flash_launch.flash_pid_is_alive(pid):
             continue
         try:
-            total += flash_launch.dismiss_flash_error_dialogs_no_mouse(pid, s.label)
+            total += flash_launch.dismiss_flash_error_dialogs_no_mouse(
+                pid,
+                s.label,
+                dismiss_correlation_context="pre_ban_round",
+                log_operator_phase=get_operator_phase(),
+            )
         except Exception:
             logger.debug("pre-ban dismiss: slot %s failed", s.label, exc_info=True)
     if total:
@@ -1744,19 +1749,64 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
         lead_sec = 1.5
     lead_sec = max(0.0, min(10.0, lead_sec))
 
+    raw_gap = (os.environ.get("BOT_POST_LOGIN_AS_SWEEP_INTER_SLOT_PAUSE_SEC") or "").strip()
+    try:
+        inter_slot_pause = float(raw_gap) if raw_gap else 0.0
+    except ValueError:
+        inter_slot_pause = 0.0
+    inter_slot_pause = max(0.0, min(2.0, inter_slot_pause))
+
     sweep_kw = flash_launch.post_login_sweep_dismiss_kw()
+    issue1_banner = (os.environ.get("BOT_ISSUE1_SWEEP_BOUNDARY_LOG") or "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+    sweep_mono_start = time.monotonic()
+    if issue1_banner:
+        gv_e = (os.environ.get("TFM_SECRETS_GAME_VERSION") or "").strip()
+        try:
+            from .issue1_forensic import loader_source_fingerprint
+
+            lfp = loader_source_fingerprint()
+        except Exception:
+            lfp = "loader_digest_unavailable"
+
+        logger.warning(
+            "ISSUE1_SWEEP_BEGIN mono=%.3f operator_phase=%s n_slots=%d ok_slots=%s partl_slots=%s lead=%.2fs "
+            "between_pass=%.2fs inter_slot_pause=%.3fs | game_version_env=%r | loader:%s "
+            "| policy=%s",
+            sweep_mono_start,
+            get_operator_phase(),
+            len(states),
+            tuple(sorted(s.label for s in states if _slot_status_label(s)[0] == "OK   ")),
+            tuple(sorted(s.label for s in states if _slot_status_label(s)[0] == "PARTL")),
+            lead_sec,
+            delay,
+            inter_slot_pause,
+            gv_e,
+            lfp,
+            sweep_kw,
+        )
+
+    pause_note = (
+        "non-zero pause spreads WM_CLOSE across slots within each pass"
+        if inter_slot_pause > 0
+        else "increase BOT_POST_LOGIN_AS_SWEEP_INTER_SLOT_PAUSE_SEC (e.g. 0.06–0.2) if bursts correlate with MAIN loss"
+    )
     logger.info(
-        "ActionScript error dismiss: post-login sweep %d pass(es), %.2fs between passes, "
-        "%.2fs lead delay — catching late ActionScript error windows (often the last slots). "
-        "Policy: sweep_continue_if_sole=%s sweep_wmclose=%s sweep_adobe_escape_only=%s "
-        "(BOT_POST_LOGIN_AS_SWEEP_*; default closes Adobe dialogs with Escape+WM_CLOSE, "
-        "no BM_CLICK on Dismiss/Descartar buttons).",
+        "ActionScript error dismiss: post-login sweep passes=%d delay_between_passes=%.2fs lead=%.2fs "
+        "inter_slot_pause=%.3fs | policy_continue_sole=%s policy_wmclose=%s policy_adobe_esc_only=%s | %s",
         n_passes,
         delay,
         lead_sec,
+        inter_slot_pause,
         sweep_kw["continue_if_sole_option"],
         sweep_kw["use_wmclose_override"],
         sweep_kw["adobe_escape_wmclose_only"],
+        pause_note,
     )
     ok_before = sum(1 for s in states if _slot_status_label(s)[0] == "OK   ")
     partl_before = sum(1 for s in states if _slot_status_label(s)[0] == "PARTL")
@@ -1766,7 +1816,9 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
     for p in range(n_passes):
         if p:
             time.sleep(delay)
-        for s in states:
+        for ix, s in enumerate(states):
+            if ix and inter_slot_pause > 0:
+                time.sleep(inter_slot_pause)
             pid = s.flash_pid
             if not pid or not flash_launch.flash_pid_is_alive(pid):
                 continue
@@ -1774,7 +1826,11 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
                 continue
             try:
                 total += flash_launch.dismiss_flash_error_dialogs_no_mouse(
-                    pid, s.label, **sweep_kw
+                    pid,
+                    s.label,
+                    **sweep_kw,
+                    dismiss_correlation_context="post_login_sweep",
+                    log_operator_phase=get_operator_phase(),
                 )
             except Exception:
                 logger.debug("post-login sweep: slot %s failed", s.label, exc_info=True)
@@ -1810,6 +1866,18 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
             ok_after,
             partl_before,
             partl_after,
+        )
+
+    if issue1_banner:
+        logger.warning(
+            "ISSUE1_SWEEP_END mono=%.3f elapsed_sweep=%.2fs dialogs_closed=%d ok_delta=%+d partl_delta=%+d "
+            "operator_phase_at_end=%s — PARTL lines: grep issue1_near_as_dismiss= and dismiss_tail=",
+            time.monotonic(),
+            time.monotonic() - sweep_mono_start,
+            total,
+            ok_after - ok_before,
+            partl_after - partl_before,
+            get_operator_phase(),
         )
 
 
@@ -2865,7 +2933,12 @@ def main(argv: list[str] | None = None) -> None:
                         try:
                             # Logs each pass from flash_launch (scan start / skip reasons at DEBUG;
                             # each close at INFO; pass summary if anything closed).
-                            flash_launch.dismiss_flash_error_dialogs_no_mouse(pid, _s.label)
+                            flash_launch.dismiss_flash_error_dialogs_no_mouse(
+                                pid,
+                                _s.label,
+                                dismiss_correlation_context="login_phase_poll",
+                                log_operator_phase=get_operator_phase(),
+                            )
                         except Exception:
                             logger.debug(
                                 "Slot %s: periodic ActionScript/Flash error dismiss failed",

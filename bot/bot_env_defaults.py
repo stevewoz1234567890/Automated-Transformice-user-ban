@@ -153,6 +153,8 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     # Sweep: close Adobe AS popups with Escape+WM_CLOSE only (no BM_CLICK on Descartar/Dismiss)—
     # BM_CLICK ranked buttons still dropped MAIN in multi-locale logs (phase=as_sweep).
     "BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY": "true",
+    # Optional spacing (seconds) between slots within each sweep pass — spreads WM_CLOSE in time.
+    "BOT_POST_LOGIN_AS_SWEEP_INTER_SLOT_PAUSE_SEC": "0",
     "BOT_UI_AUTO_LAUNCH_FLASH": "true",
     "BOT_UI_FLASH_PLAYER_PATH": "",
     # Default pairs with auto floor in ban_cli._effective_flash_stagger_sec (8+ slots). Higher = fewer
@@ -205,6 +207,10 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     # One-shot "issue 1" hunt: correlates Handshake game_version vs TFM_SECRETS_GAME_VERSION, MAIN teardown
     # vs upstream socket + loader sha, AS first fingerprint — forces ROOT_CAUSE_MAIN_CLOSE + verbose login.
     "BOT_ISSUE1_FORENSIC": "false",
+    # Always-on (unless 0): seconds — MAIN close diagnostic gains issue1_near_as_dismiss= when Flash dismiss was recent.
+    "BOT_ISSUE1_AS_MAIN_CORR_WINDOW_SEC": "12",
+    # Sweep markers ISSUE1_SWEEP_BEGIN / ISSUE1_SWEEP_END (set false to hide).
+    "BOT_ISSUE1_SWEEP_BOUNDARY_LOG": "true",
     # Deep clean-eof hunt: WARNING ROOT_CAUSE_MAIN_CLOSE on every MAIN end (Flash TCP, rings, AS-dismiss delta).
     "BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE": "false",
     # Last N packet labels per direction on MAIN (raise during ROOT_CAUSE runs; default 8).

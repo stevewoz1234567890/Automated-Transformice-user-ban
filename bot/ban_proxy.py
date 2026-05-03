@@ -1332,6 +1332,27 @@ class BanBotProxy(Proxy):
             if getattr(self, "_main_sess_anticheat_cli", 0) > 120 and alive_sec < 180:
                 parts.append("rc_note=heavy_anticheat_traffic_seen_in_other_logs_to_match_AC_kicks")
 
+        try:
+            from .flash_launch import (
+                issue1_as_main_correlation_window_sec,
+                last_as_dismiss_detail_for_slot,
+                last_as_dismiss_monotonic_for_slot,
+            )
+
+            win_i1 = issue1_as_main_correlation_window_sec()
+            adm = last_as_dismiss_monotonic_for_slot(self.slot_label)
+            if win_i1 > 0 and adm is not None:
+                dt_disp = now_mono - adm
+                if dt_disp <= win_i1:
+                    det = (last_as_dismiss_detail_for_slot(self.slot_label) or "").strip()
+                    if det:
+                        tail = det if len(det) <= 260 else det[:257] + "…"
+                        parts.append("issue1_near_as_dismiss=%.2fs|%s" % (dt_disp, tail))
+                    else:
+                        parts.append("issue1_near_as_dismiss=%.2fs|no_tail" % dt_disp)
+        except Exception:
+            pass
+
         return " | ".join(parts)
 
     async def new_main_connection(self, client_reader, client_writer):
@@ -1568,15 +1589,21 @@ class BanBotProxy(Proxy):
             need_rc = _env_truthy("BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE")
             need_i1 = _env_truthy("BOT_ISSUE1_FORENSIC")
             if need_rc or need_i1:
-                from .flash_launch import last_as_dismiss_monotonic_for_slot
+                from .flash_launch import (
+                    last_as_dismiss_detail_for_slot,
+                    last_as_dismiss_monotonic_for_slot,
+                )
 
                 now_p = time.monotonic()
                 adm = last_as_dismiss_monotonic_for_slot(self.slot_label)
-                as_part = (
-                    f"sec_since_as_dismiss={now_p - adm:.4f}"
-                    if adm is not None
-                    else "as_dismiss_never_this_slot"
-                )
+                det = last_as_dismiss_detail_for_slot(self.slot_label)
+                det_s = (det.strip()[:400] + ("…" if len(det.strip()) > 400 else "")) if det else ""
+                if adm is None:
+                    as_part = "as_dismiss_never_this_slot"
+                elif det_s:
+                    as_part = f"sec_since_as_dismiss={now_p - adm:.4f} dismiss_tail={det_s}"
+                else:
+                    as_part = f"sec_since_as_dismiss={now_p - adm:.4f}"
                 flash_snap = _root_cause_flash_tcp_snapshot(client_writer)
                 if need_rc:
                     logger.warning(

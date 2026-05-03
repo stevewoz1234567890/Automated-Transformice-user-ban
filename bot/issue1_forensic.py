@@ -5,7 +5,14 @@ Enable with::
 
     BOT_ISSUE1_FORENSIC=true
 
-Then grep ``log.txt`` for prefixes ``ISSUE1_`` and ``ROOT_CAUSE_MAIN_CLOSE``.
+Grep defaults (always on unless disabled)::
+
+    ISSUE1_SWEEP_BEGIN  ISSUE1_SWEEP_END
+    issue1_near_as_dismiss=   dismiss_tail=
+
+Set ``BOT_ISSUE1_SWEEP_BOUNDARY_LOG=0`` to hide sweep boundary markers.
+Tune ``BOT_ISSUE1_AS_MAIN_CORR_WINDOW_SEC`` (seconds) for MAIN-vs-dismiss proximity on diagnostics.
+Also see ``BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE`` for extra ROOT_CAUSE lines.
 """
 
 from __future__ import annotations

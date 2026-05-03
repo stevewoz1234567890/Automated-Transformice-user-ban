@@ -51,16 +51,66 @@ _as_fp_repeat_in_session: dict[str, int] = {}
 # Monotonic time of last successful AS/Adobe error dismiss per slot — correlated with MAIN
 # clean-eof in ban_proxy when ``BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE`` is enabled.
 _last_as_dismiss_mono_by_slot: dict[str, float] = {}
+_last_as_dismiss_detail_by_slot: dict[str, str] = {}
 _as_dismiss_mono_lock = threading.Lock()
 
 
-def record_as_dismiss_monotonic_for_slot(slot_label: str) -> None:
-    """Record dismiss time for correlation with proxy MAIN teardown (not proof of causation)."""
+def issue1_as_main_correlation_window_sec() -> float:
+    """
+    Seconds: if MAIN closes within this window after an AS-dismiss, diagnostics append ``issue1_near_as_dismiss=``.
+    Set ``BOT_ISSUE1_AS_MAIN_CORR_WINDOW_SEC=0`` to disable (not recommended when hunting PARTL-as_sweep).
+    """
+    raw = (os.environ.get("BOT_ISSUE1_AS_MAIN_CORR_WINDOW_SEC") or "").strip()
+    if not raw:
+        return 12.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 12.0
+    return max(0.0, min(120.0, v))
+
+
+def last_as_dismiss_detail_for_slot(slot_label: str) -> str:
+    """Last correlation tail from :func:`record_as_dismiss_monotonic_for_slot` (Flash UI action). Empty if unset."""
+    lab = (slot_label or "").strip()
+    if not lab:
+        return ""
+    with _as_dismiss_mono_lock:
+        return _last_as_dismiss_detail_by_slot.get(lab, "")
+
+
+def _dismiss_action_corr(
+    *,
+    dismiss_context: str | None,
+    operator_phase: str | None,
+    pid: int,
+    meth: str,
+    dlg_hwnd: int,
+    extra: str = "",
+) -> str:
+    ctx = dismiss_context or "default"
+    ph = operator_phase if operator_phase else "?"
+    x = " ".join((extra or "").replace("\r", " ").replace("\n", " ").split())
+    if len(x) > 120:
+        x = x[:117] + "…"
+    base = f"ctx={ctx} phase={ph} pid={pid} meth={meth} dlg={dlg_hwnd}"
+    return f"{base} {x}".strip() if x else base
+
+
+def record_as_dismiss_monotonic_for_slot(
+    slot_label: str,
+    *,
+    detail: str = "",
+) -> None:
+    """Record dismiss time and optional correlation string for MAIN teardown diagnostics."""
     lab = (slot_label or "").strip()
     if not lab:
         return
     with _as_dismiss_mono_lock:
         _last_as_dismiss_mono_by_slot[lab] = time.monotonic()
+        if detail:
+            t = " ".join(detail.replace("\r", " ").replace("\n", " ").split())
+            _last_as_dismiss_detail_by_slot[lab] = t[:400] + ("…" if len(t) > 400 else "")
 
 
 def last_as_dismiss_monotonic_for_slot(slot_label: str) -> float | None:
@@ -1748,6 +1798,8 @@ def dismiss_flash_error_dialogs_no_mouse(
     continue_if_sole_option: bool | None = None,
     use_wmclose_override: bool | None = None,
     adobe_escape_wmclose_only: bool | None = None,
+    dismiss_correlation_context: str | None = None,
+    log_operator_phase: str | None = None,
 ) -> int:
     """
     Dismiss Flash ActionScript/security error dialogs for *pid* **without moving
@@ -1758,9 +1810,9 @@ def dismiss_flash_error_dialogs_no_mouse(
     ``FLASH_ERROR_DISMISS_USE_WMCLOSE`` is set (or *use_wmclose_override* for
     callers like the post-login sweep), ``WM_CLOSE`` on the dialog.
 
-    *adobe_escape_wmclose_only* (post-login sweep): when True, Adobe-titled AS popups with
-    Win32 ``Button`` children are closed only via Escape + WM_CLOSE — **no** ``BM_CLICK`` on
-    *Descartar todo* / *Dismiss all* / OK, which can still end MAIN on some locales/builds.
+    *dismiss_correlation_context* tags the caller (e.g. ``post_login_sweep``) for
+    ``issue1_near_as_dismiss=`` on MAIN teardown. *log_operator_phase* should be
+    ``get_operator_phase()`` from the CLI when possible.
 
     **Continue / Continuar (default: do not auto-click when Dismiss exists).**  On many
     TFM+Flash setups the only button is *Continuar*; ``BM_CLICK`` on it can end the AS
@@ -1800,6 +1852,16 @@ def dismiss_flash_error_dialogs_no_mouse(
         bool(adobe_escape_wmclose_only) if adobe_escape_wmclose_only is not None else False
     )
     DISMISS_LABELS = flash_dialog_fallback_bmclick_labels(allow_continue=allow_continue)
+
+    def _corr(meth: str, dlg_hwnd: int, *, extra: str = "") -> str:
+        return _dismiss_action_corr(
+            dismiss_context=dismiss_correlation_context,
+            operator_phase=log_operator_phase,
+            pid=pid,
+            meth=meth,
+            dlg_hwnd=dlg_hwnd,
+            extra=extra,
+        )
     # ActionScript / securityError dialogs from Flash Player (large client area is normal).
     _MAX_SMALL_POPUP_AREA = 120_000
     _MAX_ADOBE_ERR_AREA = 2_500_000
@@ -1990,7 +2052,10 @@ def dismiss_flash_error_dialogs_no_mouse(
                         (body_text or "")[: _flash_dismiss_body_log_chars()],
                     )
                 clicked += 1
-                record_as_dismiss_monotonic_for_slot(slot_label)
+                record_as_dismiss_monotonic_for_slot(
+                    slot_label,
+                    detail=_corr("Escape+WM_CLOSE_sweep_esc", top),
+                )
             else:
                 logger.warning(
                     "ActionScript error dismiss: sweep_adobe_esc_wmclose_only ignored slot=%s — "
@@ -2104,7 +2169,10 @@ def dismiss_flash_error_dialogs_no_mouse(
                     (body_text or "")[: _flash_dismiss_body_log_chars()],
                 )
             clicked += 1
-            record_as_dismiss_monotonic_for_slot(slot_label)
+            record_as_dismiss_monotonic_for_slot(
+                slot_label,
+                detail=_corr(f"BM_CLICK_ranked_rank{best_rank}", top, extra=f"btn_cap={best_lbl!r}"),
+            )
             continue
 
         for btn in buttons:
@@ -2145,7 +2213,10 @@ def dismiss_flash_error_dialogs_no_mouse(
                         (body_text or "")[: _flash_dismiss_body_log_chars()],
                     )
                 clicked += 1
-                record_as_dismiss_monotonic_for_slot(slot_label)
+                record_as_dismiss_monotonic_for_slot(
+                    slot_label,
+                    detail=_corr("BM_CLICK_exact", top, extra=f"btn_cap={txt.value.strip()!r}"),
+                )
                 break
         else:
             if adobe_err or area < _MAX_SMALL_POPUP_AREA:
@@ -2166,7 +2237,10 @@ def dismiss_flash_error_dialogs_no_mouse(
                         args=(slot_label, pid, top, area, sess_tot, sess_bad),
                     )
                     clicked += 1
-                    record_as_dismiss_monotonic_for_slot(slot_label)
+                    record_as_dismiss_monotonic_for_slot(
+                        slot_label,
+                        detail=_corr("Escape+WM_CLOSE_nomatch_buttons", top),
+                    )
                 elif adobe_err and not use_wmclose:
                     logger.warning(
                         "ActionScript error dismiss: slot=%s pid=%s hwnd=%s — no safe button; "
