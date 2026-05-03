@@ -1738,6 +1738,144 @@ _FLASH_CONTINUE_CLICK_NON_EN = frozenset[str](
 )
 
 
+_RE_FLASH_SA_PROJECTOR_TITLE = re.compile(r"^adobe flash player\s+\d+\s*$", re.IGNORECASE)
+
+# Adobe Flash Player *settings* local-storage prompt (often es-ES: "Permitir" / "Denegar").
+# Must not collide with standalone projector "Adobe Flash Player 32" or bare AS-error title.
+_FLASH_LSO_DENY_LABELS_EXACT: frozenset[str] = frozenset(
+    {
+        "denegar",
+        "deny",
+        "refuser",
+        "ablehnen",
+        "cancelar",
+        "cancel",
+        "nein",
+        "não",
+        "nie",
+        "dont allow",
+        "don't allow",
+    }
+)
+
+_FLASH_LSO_ALLOW_LABELS_EXACT: frozenset[str] = frozenset(
+    {
+        "permitir",
+        "allow",
+        "zulassen",
+        "erlauben",
+        "accepter",
+        "autoriser",
+        "autorizar",
+        "aceitar",
+        "consentir",
+        "toestaan",
+        "consenti",
+        "accetta",
+        "oui",
+        "yes",
+        "sí",
+        "si",
+        "ja",
+        "sim",
+    }
+)
+
+
+def _flash_title_suggests_player_settings_dialog(title: str) -> bool:
+    tl = (title or "").strip().lower()
+    if not tl:
+        return False
+    if _RE_FLASH_SA_PROJECTOR_TITLE.match(tl):
+        return False
+    if "flash" not in tl:
+        return False
+    chrome = (
+        "settings",
+        "configuración",
+        "configuracion",
+        "einstellungen",
+        "paramètres",
+        "parametres",
+        "impostazioni",
+        "instellingen",
+        "instelling",
+        "configuração",
+        "configuracao",
+        "asetukset",
+        "privacy",
+    )
+    return any(k in tl for k in chrome)
+
+
+def _flash_body_suggests_local_storage_permission(body: str) -> bool:
+    bl = (body or "").lower()
+    return any(
+        s in bl
+        for s in (
+            "almacenamiento local",
+            "almacenar información",
+            "almacenar informacion",
+            "local storage",
+            "store information on your computer",
+            "computer to store information",
+            "computer pour stocker des informations",
+            "lokaler speicher",
+            "lokale speicherung",
+            "opslag op uw computer",
+            "computer localmente",
+            "informações no seu computador",
+            "información en su equipo",
+            "¿permitir",
+        )
+    )
+
+
+def _flash_local_storage_pair_hint_from_buttons(buttons: list[int], user32: object) -> bool:
+    """True if captions look like a paired Allow/Deny row (localized)."""
+    found_allow = False
+    found_deny = False
+    buf = ctypes.create_unicode_buffer(256)
+    for b in buttons:
+        user32.GetWindowTextW(int(b), buf, 256)
+        ln = _win_button_label_normalize(buf.value)
+        if ln in _FLASH_LSO_ALLOW_LABELS_EXACT or ln.startswith("allow "):
+            found_allow = True
+        elif ln in _FLASH_LSO_DENY_LABELS_EXACT or "don't allow" in ln:
+            found_deny = True
+        if found_allow and found_deny:
+            return True
+    return False
+
+
+def _pick_flash_local_storage_allow_buttonhwnd(
+    buttons: list[int],
+    user32: object,
+) -> tuple[int | None, str]:
+    """Prefer *Permitir* / *Allow*; never BM_CLICK deny/cancel equivalents."""
+    candidates: list[tuple[int, int, str]] = []
+    buf = ctypes.create_unicode_buffer(256)
+    for prio, btn in enumerate(buttons):
+        user32.GetWindowTextW(btn, buf, 256)
+        lab = buf.value.strip()
+        ln = _win_button_label_normalize(lab)
+        if not ln:
+            continue
+        if ln in _FLASH_LSO_DENY_LABELS_EXACT or "don't allow" in ln or "do not allow" in ln:
+            continue
+        if ln in _FLASH_LSO_ALLOW_LABELS_EXACT:
+            return int(btn), lab
+        if any(ln.startswith(pref) for pref in ("allow", "permit", "permite")):
+            candidates.append((prio, int(btn), lab))
+        elif "consentir" in ln or "consenti" in ln:
+            candidates.append((prio + 50, int(btn), lab))
+    if not candidates:
+        return None, ""
+    candidates.sort(key=lambda t: t[0])
+    _prio, hwnd, lbl = candidates[0]
+    return hwnd, lbl
+
+
 def _flash_matches_dismiss_all(ln: str) -> bool:
     if not ln:
         return False
@@ -1841,9 +1979,31 @@ def _adobe_actionscript_dialog_may_remain(hwnd: int, user32: object) -> bool:
         return True
 
 
+def _want_flash_local_storage_permission_autoclick(
+    *,
+    title: str,
+    body_text: str,
+    buttons: list[int],
+    user32: object,
+) -> bool:
+    """
+    Adobe Player *settings* privacy prompt (“Almacenamiento local … Permitir”).
+    Separate from standalone projector and ActionScript compile/runtime errors.
+    """
+    if not _env_flag_true_by_default("FLASH_LOCAL_STORAGE_PERMISSION_DISMISS"):
+        return False
+    if not buttons:
+        return False
+    if not _flash_title_suggests_player_settings_dialog(title):
+        return False
+    if _flash_body_suggests_local_storage_permission(body_text):
+        return True
+    return _flash_local_storage_pair_hint_from_buttons(buttons, user32)
+
+
 def _try_escape_adobe_actionscript_dialog(hwnd: int, user32: object) -> None:
     """
-    Dismiss Adobe's ActionScript/security error dialogs the same way a user does: **Esc**.
+    Dismiss Adobe's ActionScript/security error dialogs the same way a user does: Esc.
     Prefer ``SetForegroundWindow`` + ``keybd_event``; fall back to ``PostMessage`` pairs to the HWND.
     """
     WM_KEYDOWN = 0x0100
@@ -1880,15 +2040,19 @@ def flash_error_dismiss_policy_log_line() -> str:
     wm = _env_flag_false_by_default("FLASH_ERROR_DISMISS_USE_WMCLOSE")
     sole = _env_flag_true_by_default("FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION")
     wl = flash_error_windows_ui_language_log_fragment()
+    lso = _env_flag_true_by_default("FLASH_LOCAL_STORAGE_PERMISSION_DISMISS")
     return (
         "ActionScript error dismiss: policy "
         f"[{wl}] "
+        f"FLASH_LOCAL_STORAGE_PERMISSION_DISMISS={lso} "
         f"FLASH_ERROR_DISMISS_ALLOW_CONTINUE={ac} "
         f"FLASH_ERROR_DISMISS_USE_WMCLOSE={wm} "
         f"FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION={sole} "
         f"FLASH_ERROR_DISMISS_ESC_USE_FOREGROUND={_flash_error_esc_use_foreground()} "
         "— Adobe Error de ActionScript / #2048 modals honor Esc: we send keyboard Esc "
         "(and only post WM_CLOSE if the dialog is still open). "
+        "Flash Player privacy (Local Storage) settings windows: BM_CLICK Permitir/Allow when "
+        "FLASH_LOCAL_STORAGE_PERMISSION_DISMISS is true (default). "
         "Button matching is multilingual (not English-only); Windows UI langs are logged first for support. "
         "Continuar/Continue is only auto-clicked when ALLOW_CONTINUE is true, or when the "
         "dialog has no Dismiss/OK and CONTINUE_IF_SOLE_OPTION is true (default). "
@@ -1901,8 +2065,8 @@ def flash_error_dismiss_policy_log_line() -> str:
 def adobe_actionscript_escape_wmclose_kw_from_env() -> dict[str, bool]:
     """
     Keyword args for ``dismiss_flash_error_dialogs_no_mouse`` when closing **Adobe** ActionScript
-    error dialogs: **Esc** (keyboard, after foreground when enabled) then optional ``WM_CLOSE`` if the
-    modal is still open — no localized ``BM_CLICK`` on Dismiss / Descartar.
+    error dialogs: Esc (keyboard, after foreground when enabled) then optional WM_CLOSE if the
+    modal is still open — no localized BM_CLICK on Dismiss / Descartar.
 
     Shared by the post-login sweep and the Flash error poll during login
     (``dismiss_correlation_context=login_phase_poll``).
@@ -2152,6 +2316,62 @@ def dismiss_flash_error_dialogs_no_mouse(
         _collect_buttons_recursive(top)
 
         body_text = _flash_dialog_aggregate_body_text(top, user32)
+
+        # Flash Player privacy / Local Storage modal (Spanish "Permitir", etc.). Must run before AS-error
+        # Esc handling — that title substring also matches generic adobe_err heuristics.
+        if buttons and _want_flash_local_storage_permission_autoclick(
+            title=title,
+            body_text=body_text,
+            buttons=buttons,
+            user32=user32,
+        ):
+            allow_hwnd, allow_cap = _pick_flash_local_storage_allow_buttonhwnd(buttons, user32)
+            if allow_hwnd is None:
+                _bc: list[str] = []
+                _bb = ctypes.create_unicode_buffer(256)
+                for _bh in buttons:
+                    user32.GetWindowTextW(_bh, _bb, 256)
+                    _bc.append((_bb.value or "").strip())
+                logger.warning(
+                    "Flash Player local-storage dialog detected but no Permitir/Allow match — slot=%s "
+                    "hwnd=%s title=%r captions=%r",
+                    slot_label,
+                    top,
+                    (title or "")[:120],
+                    _bc,
+                )
+                continue
+
+            user32.SendMessageW(allow_hwnd, BM_CLICK, 0, 0)
+            sess_tot, sess_bad = _record_as_dismiss_close(incorrect_version=False)
+            _as_dismiss_log_closed(
+                incorrect_version=False,
+                sess_tot=sess_tot,
+                fmt=(
+                    "Flash local-storage permit: clicked slot=%s pid=%s dlg=%s (BM_CLICK Allow %r) "
+                    "title=%r | session_total=%d incorrect_version_total=%d"
+                ),
+                args=(
+                    slot_label,
+                    pid,
+                    top,
+                    allow_cap,
+                    (title or "")[:100],
+                    sess_tot,
+                    sess_bad,
+                ),
+            )
+            clicked += 1
+            record_as_dismiss_monotonic_for_slot(
+                slot_label,
+                detail=_corr(
+                    "BM_CLICK_flash_local_storage_allow",
+                    top,
+                    extra=f"allow_cap={allow_cap!r}",
+                ),
+            )
+            continue
+
         _maybe_log_first_seen_as_fingerprint(
             body_text=body_text,
             slot_label=slot_label,

@@ -225,6 +225,8 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE": "false",
     # Last N packet labels per direction on MAIN (raise during ROOT_CAUSE runs; default 8).
     "BOT_PROXY_MAIN_PACKET_RING": "8",
+    # Click Permitir / Allow on Adobe Flash Player *privacy* dialogs (Local Storage), not Esc.
+    "FLASH_LOCAL_STORAGE_PERMISSION_DISMISS": "true",
     # Prefer SetForegroundWindow + keybd_event Esc before PostMessage Esc (Unset=true).
     "FLASH_ERROR_DISMISS_ESC_USE_FOREGROUND": "true",
     # After Esc bursts: wait before checking if Adobe error dialog HWND vanished (milliseconds).

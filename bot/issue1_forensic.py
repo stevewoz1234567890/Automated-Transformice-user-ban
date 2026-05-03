@@ -121,6 +121,8 @@ def dismiss_tail_issue1_cues(detail: str) -> str | None:
         tok.append("AUTO_ADOBE_ESC_WM_CLOSE")
     elif "meth=Escape+WM_CLOSE_nomatch_buttons" in tail:
         tok.append("AUTO_ESC_WM_CLOSE_NOMATCH_FALLBACK")
+    if "flash_local_storage_allow" in tail:
+        tok.append("BM_CLICK_FLASH_LSO_ALLOW")
     if tok:
         return "ISSUE1_DISMISS_CUE=" + ",".join(tok)
     return None
