@@ -232,6 +232,8 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_PROXY_MAIN_PACKET_RING": "8",
     # Click Permitir / Allow on Adobe Flash Player *privacy* dialogs (Local Storage), not Esc.
     "FLASH_LOCAL_STORAGE_PERMISSION_DISMISS": "true",
+    "FLASH_LOCAL_STORAGE_FOCUS_BEFORE_CLICK": "true",
+    "FLASH_LOCAL_STORAGE_REINFORCE_BTN_CLICK": "true",
     # Prefer SetForegroundWindow + keybd_event Esc before PostMessage Esc (Unset=true).
     "FLASH_ERROR_DISMISS_ESC_USE_FOREGROUND": "true",
     # After Esc bursts: wait before checking if Adobe error dialog HWND vanished (milliseconds).

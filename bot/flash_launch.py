@@ -1571,6 +1571,153 @@ def _win_button_label_normalize(raw: str) -> str:
     return " ".join(t.split())
 
 
+def _win_button_caption_utf16(hwnd: int, user32: object) -> str:
+    """
+    Caption for ranking / Permitir detection. Owner-draw Flash settings buttons sometimes keep
+    an empty ``GetWindowText`` but answer ``WM_GETTEXT``.
+    """
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buf, 512)
+    t = (buf.value or "").strip()
+    if t:
+        return t
+    WM_GETTEXTLENGTH = 0x000E
+    WM_GETTEXT = 0x000D
+    try:
+        ln = int(user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0))
+    except (TypeError, ValueError, OSError):
+        ln = 0
+    ln = max(0, min(int(ln), 512))
+    if ln <= 0:
+        return ""
+    buf2 = ctypes.create_unicode_buffer(ln + 4)
+    try:
+        user32.SendMessageW(hwnd, WM_GETTEXT, ln + 1, ctypes.addressof(buf2))
+    except (TypeError, ValueError, OSError):
+        return ""
+    return (buf2.value or "").strip()
+
+
+def _is_win32_button_hwnd_eligible_for_bm_click(hwnd: int, user32: object) -> bool:
+    """Skip group boxes, radios, checkboxes — class name is still ``Button``."""
+    GWL_STYLE = -16
+    try:
+        style = int(user32.GetWindowLongW(hwnd, GWL_STYLE))
+    except (TypeError, ValueError, OSError):
+        return True
+    low = style & 0xF
+    # See WinUser.h BS_* — keep push / owner-draw / split (~0–1, 8, 0xB, 0xC, 0xD).
+    BS_GROUPBOX = 7
+    BS_RADIOBUTTON = 4
+    BS_AUTORADIOBUTTON = 9
+    BS_CHECKBOX = 2
+    BS_AUTOCHECKBOX = 3
+    BS_AUTO3STATE = 6
+    BS_3STATE = 5
+    if low in (
+        BS_GROUPBOX,
+        BS_RADIOBUTTON,
+        BS_AUTORADIOBUTTON,
+        BS_CHECKBOX,
+        BS_AUTOCHECKBOX,
+        BS_3STATE,
+        BS_AUTO3STATE,
+    ):
+        return False
+    return True
+
+
+def _pick_flash_local_storage_allow_by_bottom_row_leftmost(
+    buttons: list[int],
+    user32: object,
+) -> tuple[int | None, str]:
+    """
+    When captions are blank (owner-draw), Flash still lays out *Permitir* left and *Denegar*
+    right in es-ES / en-US. Pick the leftmost push button on the deepest (max bottom) row.
+    """
+    if not buttons:
+        return None, ""
+    from ctypes import wintypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", wintypes.LONG),
+            ("top", wintypes.LONG),
+            ("right", wintypes.LONG),
+            ("bottom", wintypes.LONG),
+        ]
+
+    rows: list[tuple[int, int, int, int, int]] = []
+    for b in buttons:
+        rr = RECT()
+        if not user32.GetWindowRect(int(b), ctypes.byref(rr)):
+            continue
+        rows.append((int(b), rr.left, rr.top, rr.right, rr.bottom))
+    if not rows:
+        return None, ""
+
+    deepest = max(r[4] for r in rows)
+    band = [(h, l, t, r, bt) for h, l, t, r, bt in rows if abs(bt - deepest) <= 14]
+    if not band:
+        band = rows
+
+    keep: list[tuple[int, int, int, int, int]] = []
+    for item in band:
+        h = item[0]
+        lab = _win_button_caption_utf16(h, user32)
+        ln = _win_button_label_normalize(lab)
+        if ln in _FLASH_LSO_DENY_LABELS_EXACT or "don't allow" in ln or "do not allow" in ln:
+            continue
+        keep.append(item)
+    use = keep if keep else band
+    use.sort(key=lambda x: x[1])
+    return use[0][0], "geometry_bottom_row_leftmost"
+
+
+def _flash_lso_activate_permit_button(*, permit_hwnd: int, dialog_hwnd: int, user32: object) -> None:
+    """BM_CLICK (+ optional Posted client click) after foreground — survives owner-draw controls."""
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    MK_LBUTTON = 0x0001
+    BM_CLICK = 0x00F5
+    reinforce = _env_flag_true_by_default("FLASH_LOCAL_STORAGE_REINFORCE_BTN_CLICK")
+    if _env_flag_true_by_default("FLASH_LOCAL_STORAGE_FOCUS_BEFORE_CLICK"):
+        try:
+            _win_force_foreground(dialog_hwnd)
+            time.sleep(0.045)
+        except Exception:
+            logger.debug("Flash LSO Permit: foreground helper failed", exc_info=True)
+
+    user32.PostMessageW(permit_hwnd, BM_CLICK, 0, 0)
+    time.sleep(0.02)
+    user32.SendMessageW(permit_hwnd, BM_CLICK, 0, 0)
+    if not reinforce:
+        return
+
+    time.sleep(0.02)
+    from ctypes import wintypes
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", wintypes.LONG),
+            ("top", wintypes.LONG),
+            ("right", wintypes.LONG),
+            ("bottom", wintypes.LONG),
+        ]
+
+    rc = RECT()
+    if user32.GetClientRect(permit_hwnd, ctypes.byref(rc)):
+        cx = max(1, (rc.right - rc.left) // 2)
+        cy = max(1, (rc.bottom - rc.top) // 2)
+        lparam = (cy & 0xFFFF) << 16 | (cx & 0xFFFF)
+        try:
+            user32.PostMessageW(permit_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+            time.sleep(0.02)
+            user32.PostMessageW(permit_hwnd, WM_LBUTTONUP, 0, lparam)
+        except OSError:
+            logger.debug("Flash LSO Permit: Posted WM_LBUTTON* failed", exc_info=True)
+
+
 # Multilingual synonyms for FP #2044 / #2048 style Win32 ``Button`` captions.
 # Ranking: lower is stronger preference; Continue-like stays high (3+) so allow_continue guards apply.
 _FLASH_DISMISS_ALL_WORD_PAIRS: tuple[tuple[str, str], ...] = (
@@ -1804,6 +1951,7 @@ def _flash_title_suggests_player_settings_dialog(title: str) -> bool:
         "configuracao",
         "asetukset",
         "privacy",
+        "almacenamiento",
     )
     return any(k in tl for k in chrome)
 
@@ -1827,6 +1975,9 @@ def _flash_body_suggests_local_storage_permission(body: str) -> bool:
             "informações no seu computador",
             "información en su equipo",
             "¿permitir",
+            "pueda almacenar",
+            "permitir que local",
+            "local pueda",
         )
     )
 
@@ -1835,10 +1986,9 @@ def _flash_local_storage_pair_hint_from_buttons(buttons: list[int], user32: obje
     """True if captions look like a paired Allow/Deny row (localized)."""
     found_allow = False
     found_deny = False
-    buf = ctypes.create_unicode_buffer(256)
     for b in buttons:
-        user32.GetWindowTextW(int(b), buf, 256)
-        ln = _win_button_label_normalize(buf.value)
+        lab = _win_button_caption_utf16(int(b), user32)
+        ln = _win_button_label_normalize(lab)
         if ln in _FLASH_LSO_ALLOW_LABELS_EXACT or ln.startswith("allow "):
             found_allow = True
         elif ln in _FLASH_LSO_DENY_LABELS_EXACT or "don't allow" in ln:
@@ -1854,10 +2004,8 @@ def _pick_flash_local_storage_allow_buttonhwnd(
 ) -> tuple[int | None, str]:
     """Prefer *Permitir* / *Allow*; never BM_CLICK deny/cancel equivalents."""
     candidates: list[tuple[int, int, str]] = []
-    buf = ctypes.create_unicode_buffer(256)
     for prio, btn in enumerate(buttons):
-        user32.GetWindowTextW(btn, buf, 256)
-        lab = buf.value.strip()
+        lab = _win_button_caption_utf16(int(btn), user32).strip()
         ln = _win_button_label_normalize(lab)
         if not ln:
             continue
@@ -2041,17 +2189,22 @@ def flash_error_dismiss_policy_log_line() -> str:
     sole = _env_flag_true_by_default("FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION")
     wl = flash_error_windows_ui_language_log_fragment()
     lso = _env_flag_true_by_default("FLASH_LOCAL_STORAGE_PERMISSION_DISMISS")
+    lso_focus = _env_flag_true_by_default("FLASH_LOCAL_STORAGE_FOCUS_BEFORE_CLICK")
+    lso_re = _env_flag_true_by_default("FLASH_LOCAL_STORAGE_REINFORCE_BTN_CLICK")
     return (
         "ActionScript error dismiss: policy "
         f"[{wl}] "
         f"FLASH_LOCAL_STORAGE_PERMISSION_DISMISS={lso} "
+        f"FLASH_LOCAL_STORAGE_FOCUS_BEFORE_CLICK={lso_focus} "
+        f"FLASH_LOCAL_STORAGE_REINFORCE_BTN_CLICK={lso_re} "
         f"FLASH_ERROR_DISMISS_ALLOW_CONTINUE={ac} "
         f"FLASH_ERROR_DISMISS_USE_WMCLOSE={wm} "
         f"FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION={sole} "
         f"FLASH_ERROR_DISMISS_ESC_USE_FOREGROUND={_flash_error_esc_use_foreground()} "
         "— Adobe Error de ActionScript / #2048 modals honor Esc: we send keyboard Esc "
         "(and only post WM_CLOSE if the dialog is still open). "
-        "Flash Player privacy (Local Storage) settings windows: BM_CLICK Permitir/Allow when "
+        "Flash Player privacy (Local Storage) settings windows: activate Permitir/Allow via "
+        "foreground + BM_CLICK + optional Posted client click when "
         "FLASH_LOCAL_STORAGE_PERMISSION_DISMISS is true (default). "
         "Button matching is multilingual (not English-only); Windows UI langs are logged first for support. "
         "Continuar/Continue is only auto-clicked when ALLOW_CONTINUE is true, or when the "
@@ -2306,7 +2459,8 @@ def dismiss_flash_error_dialogs_no_mouse(
                 ch_i = int(ch)
                 cls_buf = ctypes.create_unicode_buffer(64)
                 user32.GetClassNameW(ch, cls_buf, 64)
-                if cls_buf.value.lower() == "button":
+                cl = cls_buf.value.lower()
+                if cl == "button" and _is_win32_button_hwnd_eligible_for_bm_click(ch_i, user32):
                     buttons.append(ch_i)
                 _collect_buttons_recursive(ch_i)
                 return True
@@ -2326,12 +2480,14 @@ def dismiss_flash_error_dialogs_no_mouse(
             user32=user32,
         ):
             allow_hwnd, allow_cap = _pick_flash_local_storage_allow_buttonhwnd(buttons, user32)
+            if allow_hwnd is None and len(buttons) >= 1:
+                allow_hwnd, allow_cap = _pick_flash_local_storage_allow_by_bottom_row_leftmost(
+                    buttons, user32
+                )
             if allow_hwnd is None:
                 _bc: list[str] = []
-                _bb = ctypes.create_unicode_buffer(256)
                 for _bh in buttons:
-                    user32.GetWindowTextW(_bh, _bb, 256)
-                    _bc.append((_bb.value or "").strip())
+                    _bc.append(_win_button_caption_utf16(_bh, user32).strip())
                 logger.warning(
                     "Flash Player local-storage dialog detected but no Permitir/Allow match — slot=%s "
                     "hwnd=%s title=%r captions=%r",
@@ -2342,13 +2498,18 @@ def dismiss_flash_error_dialogs_no_mouse(
                 )
                 continue
 
-            user32.SendMessageW(allow_hwnd, BM_CLICK, 0, 0)
+            _flash_lso_activate_permit_button(
+                permit_hwnd=int(allow_hwnd),
+                dialog_hwnd=int(top),
+                user32=user32,
+            )
             sess_tot, sess_bad = _record_as_dismiss_close(incorrect_version=False)
             _as_dismiss_log_closed(
                 incorrect_version=False,
                 sess_tot=sess_tot,
                 fmt=(
-                    "Flash local-storage permit: clicked slot=%s pid=%s dlg=%s (BM_CLICK Allow %r) "
+                    "Flash local-storage permit: clicked slot=%s pid=%s dlg=%s (Permitir/Allow %r via "
+                    "BM_CLICK+reinforce — see FLASH_LOCAL_STORAGE_* env) "
                     "title=%r | session_total=%d incorrect_version_total=%d"
                 ),
                 args=(
