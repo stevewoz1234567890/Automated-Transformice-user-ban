@@ -175,6 +175,8 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_FLASH_FETCH_LOADER_AFTER_SECRETS_IF_VERSION_CHANGED": "false",
     "BOT_FLASH_REFRESH_PROXY_LOADER_EACH_RUN": "false",
     "BOT_FLASH_FETCH_PROXY_LOADER_IF_MISSING": "true",
+    # Exact https URL for proxy loader SWF (overrides BOT_TFM_PROXY_LOADER_GITHUB_REPO). Use when releases lag
+    # live Transformice; pairs with startup alignment WARN + MAIN ``ISSUE1_LOADER_PREFLIGHT=`` lines.
     "BOT_TFM_PROXY_LOADER_DOWNLOAD_URL": "",
     "BOT_TFM_PROXY_LOADER_GITHUB_REPO": "friedkeenan/tfm-proxy-loader",
     "BOT_TFM_PROXY_LOADER_ASSET_NAME": "TFMProxyLoader.swf",

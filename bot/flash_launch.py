@@ -229,15 +229,33 @@ def _maybe_log_first_seen_as_fingerprint(
             rpt = _as_fp_repeat_in_session[fp]
             # Same underlying ActionScript fault still firing — dismiss spam will not fix it.
             if rpt in (5, 15, 40, 100, 200, 500):
+                suf = ""
+                try:
+                    from .tfm_loader_alignment import (
+                        get_last_alignment_summary,
+                        issue1_alignment_log_fragment,
+                    )
+
+                    alf = issue1_alignment_log_fragment(get_last_alignment_summary())
+                    if alf:
+                        suf = f" — {alf}"
+                    else:
+                        su = get_last_alignment_summary()
+                        if su and su.get("url_hints_strict_mismatch_vs_config"):
+                            suf = " — ISSUE1_LOADER_HINT=embedded_URL_versions_contradict_TFM_SECRETS_GAME_VERSION"
+                except Exception:
+                    pass
                 logger.warning(
                     "ActionScript error duplicate #%d fingerprint=%s slot=%s pid=%s hwnd=%s — "
-                    "same dialog body repeating; prioritize TFM_PROXY_SWF / game version alignment, "
-                    "not higher dismiss cadence",
+                    "same dialog body repeating; prioritize TFM_PROXY_SWF / game version alignment "
+                    "(BOT_TFM_PROXY_LOADER_DOWNLOAD_URL fetch source, copy known-good loader+secrets) "
+                    "%s",
                     rpt,
                     fp,
                     slot_label,
                     pid,
                     hwnd,
+                    suf,
                 )
             return
         _as_dismiss_seen_fp.add(fp)

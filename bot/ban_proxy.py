@@ -521,6 +521,7 @@ class BanBotProxy(Proxy):
         self._main_sess_anticheat_cli: int = 0
         self._issue1_last_handshake_gv: str | None = None
         self._issue1_last_handshake_lss: object | None = None
+        self._issue1_warned_hs_gv_mismatch_tcp_gen: int = -999_999
         # Last close summary for slot-status / grep (set in new_main_connection finally).
         self._main_last_close_diag: str | None = None
         # Cumulative (optional): last join seen on this proxy process.
@@ -954,6 +955,28 @@ class BanBotProxy(Proxy):
             gv = getattr(packet, "game_version", None)
             self._issue1_last_handshake_gv = None if gv is None else str(gv)
             self._issue1_last_handshake_lss = getattr(packet, "loader_stage_size", None)
+            env_gvs = (os.environ.get("TFM_SECRETS_GAME_VERSION") or "").strip()
+            if env_gvs and gv is not None:
+                ok_match = False
+                try:
+                    fv = int(str(gv).strip(), 0)
+                    ok_match = fv == int(env_gvs, 0)
+                except ValueError:
+                    ok_match = str(gv).strip() == env_gvs
+                tcpg_hs = getattr(self, "_main_tcp_generation", -1)
+                if not ok_match and tcpg_hs != self._issue1_warned_hs_gv_mismatch_tcp_gen:
+                    logger.warning(
+                        "ISSUE1_HANDSHAKE_GV_MISMATCH slot=%s main_tcp#=%s TFM_SECRETS_GAME_VERSION=%r "
+                        "HandshakePacket.game_version=%r loader_stage_size=%s "
+                        "| confirm secrets dump + loader SWF from the same Transformice release (expect "
+                        "PARTL/generic AS errors if handshake crypto disagrees).",
+                        self.slot_label,
+                        tcpg_hs,
+                        env_gvs,
+                        gv,
+                        getattr(packet, "loader_stage_size", None),
+                    )
+                    self._issue1_warned_hs_gv_mismatch_tcp_gen = tcpg_hs
             try:
                 from .issue1_forensic import maybe_warn_handshake_mismatch
 
@@ -1366,6 +1389,18 @@ class BanBotProxy(Proxy):
         except Exception:
             pass
 
+        try:
+            from .tfm_loader_alignment import (
+                get_last_alignment_summary,
+                issue1_alignment_log_fragment,
+            )
+
+            al_frag = issue1_alignment_log_fragment(get_last_alignment_summary())
+            if al_frag:
+                parts.append(al_frag)
+        except Exception:
+            pass
+
         return " | ".join(parts)
 
     async def new_main_connection(self, client_reader, client_writer):
@@ -1631,6 +1666,17 @@ class BanBotProxy(Proxy):
                         and "BM_CLICK_CONTINUE_RANK" in cues_root
                     ):
                         as_part += " | ISSUE1_PRIMARY_SUSPECT=CONTINUE_BMCLICK_AS_SESSION_TEARDOWN"
+                try:
+                    from .tfm_loader_alignment import (
+                        get_last_alignment_summary,
+                        issue1_alignment_log_fragment,
+                    )
+
+                    al_rc = issue1_alignment_log_fragment(get_last_alignment_summary())
+                    if al_rc:
+                        as_part = f"{as_part} | {al_rc}"
+                except Exception:
+                    pass
                 flash_snap = _root_cause_flash_tcp_snapshot(client_writer)
                 if need_rc:
                     logger.warning(

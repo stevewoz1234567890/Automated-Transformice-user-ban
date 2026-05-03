@@ -63,7 +63,10 @@ def log_operator_live_game_alignment_reminders() -> None:
         logger.info(
             "[alignment] Loader version could not be verified from SWF bytes alone. If ActionScript "
             "errors or PARTL persist while files match Transformice, remaining failures are "
-            "secrets/protocol drift vs live Transformice — not stale Python patched-cache reuse.",
+            "secrets/protocol drift vs live Transformice — not stale Python patched-cache reuse. "
+            "Grep MAIN close lines for ISSUE1_LOADER_PREFLIGHT= and handshake "
+            "ISSUE1_HANDSHAKE_GV_MISMATCH; override BOT_TFM_PROXY_LOADER_DOWNLOAD_URL if the GitHub proxy "
+            "loader lags Transformice releases.",
         )
 
 
@@ -102,6 +105,12 @@ def _swf_scan_payload(raw: bytes) -> tuple[str, bytes] | None:
 
 
 def _extract_urlish_version_hints(body: bytes) -> list[int]:
+    """
+    Recover ``r924`` / ``swf=R922`` style tokens from compressed or uncompressed SWF bytes.
+
+    We scan ``body`` fragments from both compressed on-disk SWF **and** the decompressed
+    payload — some builds bury URL segments only inside one representation.
+    """
     patterns = (
         rb"swf=r(\d{2,6})\b",
         rb"swf=R(\d{2,6})\b",
@@ -112,7 +121,12 @@ def _extract_urlish_version_hints(body: bytes) -> list[int]:
         rb"game_version[=:](\d{2,6})\b",
         rb"gameVersion[=:\"'](\d{2,6})\b",
         rb"[/\?]r(\d{2,6})[/\.&\?\#]",  # .../r922/... or ?r921&
+        rb"[/\?](?:version|gv|gv_?game)[=:](\d{2,6})\b",
+        rb"[/\?](\d{2,6})\.swf\b",
+        rb"transformice[^\n\x00]{0,180}?r(\d{2,6})(?:[^\d]|$)",
+        rb"atelier801[^\n\x00]{0,240}?[=/_](\d{2,6})(?:[^\d]|$)",
         rb"version[=/](\d{2,6})(?:[^\d]|$)",
+        rb"v=(\d{2,6})(?:[^\d]|$)",
     )
     found: set[int] = set()
     for pat in patterns:
@@ -122,6 +136,59 @@ def _extract_urlish_version_hints(body: bytes) -> list[int]:
             except (ValueError, IndexError):
                 pass
     return sorted(found)
+
+
+def _merged_version_hints(raw: bytes, decompressed_payload: bytes) -> list[int]:
+    return sorted(set(_extract_urlish_version_hints(raw)) | set(_extract_urlish_version_hints(decompressed_payload)))
+
+
+def _literal_version_bytes_in_any(gv_raw: str, *blobs: bytes) -> bool:
+    if not gv_raw or not gv_raw.strip():
+        return False
+    gv_ascii = gv_raw.encode("ascii", errors="ignore")
+    vu16le = "".join(ch + "\x00" for ch in gv_raw.strip()).encode("utf-16le")
+    vu16be = "".join("\x00" + ch for ch in gv_raw.strip()).encode("utf-16be")
+    for body in blobs:
+        if gv_ascii and (
+            gv_ascii in body or (b"v" + gv_ascii) in body or (b"=" + gv_ascii) in body
+        ):
+            return True
+        if vu16le and (vu16le in body or vu16be in body):
+            return True
+    return False
+
+
+def issue1_alignment_log_fragment(summary: dict[str, object] | None) -> str | None:
+    """
+    One compact token chunk for MAIN close / ActionScript greps when loader alignment was weak.
+
+    Grep anchor: ``ISSUE1_LOADER_PREFLIGHT``.
+    """
+    if not summary or not summary.get("loader_present"):
+        return None
+    if summary.get("read_error"):
+        return None
+    if summary.get("loader_version_embedding_verifiable") is True and not summary.get(
+        "url_hints_strict_mismatch_vs_config"
+    ):
+        return None
+    gv_s = summary.get("tfm_secrets_game_version") or "unset"
+    hints = summary.get("url_style_version_hints") or ()
+    literal = summary.get("literal_version_bytes_in_swf_payload") is True
+    mismatch = summary.get("url_hints_strict_mismatch_vs_config") is True
+    tag = []
+    if mismatch:
+        tag.append("URL_HINTS_CONTRADICT_ENVGV")
+    if not literal and not hints:
+        tag.append("NO_URL_OR_LITERAL_MARKERS_IN_SWF")
+    elif literal:
+        tag.append("LITERAL_BYTES_OK")
+    if hints:
+        tag.append(f"hints={tuple(hints)!r}".replace(" ", ""))
+    return "ISSUE1_LOADER_PREFLIGHT=cfg_gv_%s|%s" % (
+        gv_s,
+        ",".join(tag) if tag else "UNVERIFIED",
+    )
 
 
 def _config_game_version_int(raw: str) -> int | None:
@@ -201,16 +268,12 @@ def log_client_asset_alignment(repo_root: Path) -> None:
     else:
         tag, body = scanned
 
-    gv_ascii = gv_raw.encode("ascii", errors="ignore") if gv_raw else b""
-    literal_substrings = False
-    if gv_ascii:
-        vu16le = "".join(ch + "\x00" for ch in gv_raw.strip()).encode("utf-16le") if gv_raw.strip() else b""
-        vu16be = "".join("\x00" + ch for ch in gv_raw.strip()).encode("utf-16be") if gv_raw.strip() else b""
-        literal_substrings = gv_ascii in body or (b"v" + gv_ascii) in body or (b"=" + gv_ascii) in body
-        if not literal_substrings and vu16le:
-            literal_substrings = vu16le in body or vu16be in body
+    gv_ascii_len = len((gv_raw or "").strip())
+    literal_substrings = bool(
+        gv_ascii_len and _literal_version_bytes_in_any(gv_raw.strip(), raw, body),
+    )
 
-    urlish = _extract_urlish_version_hints(body)
+    urlish = _merged_version_hints(raw, body)
     lines_md.append(f"- **SWF on-disk signature**: `{raw[:3]!r}` **scan_tag**: `{tag}` **payload_bytes**: {len(body)}\n")
     lines_md.append(
         f"- **Literal CONFIG version bytes in payload**: "
@@ -276,11 +339,13 @@ def log_client_asset_alignment(repo_root: Path) -> None:
     ):
         logger.warning(
             "Client/asset alignment: cannot verify TFM_SECRETS_GAME_VERSION=%s against this loader SWF "
-            "(no literal version substring and no swf=r… / gameversion… hints in decompressed payload). "
-            "Persistent ActionScript errors often mean TFM_PROXY_SWF is stale vs the live web client — "
-            "re-dump the loader from current Transformice or align secrets. "
-            "Cross-PC: copy this SWF + the full TFM_SECRETS_* block from a machine where Transformice "
-            "loads cleanly (README: Proving parity on another PC).",
+            "(no literal version substring and no swf=r… / gameversion… hints after scanning compressed "
+            "**and** decompressed bytes). "
+            "Persistent ActionScript errors often mean TFM_PROXY_SWF differs from live Transformice — "
+            "set BOT_TFM_PROXY_LOADER_DOWNLOAD_URL to a loader from your known-good client bundle, "
+            "or refresh BOT_TFM_PROXY_LOADER_GITHUB_REPO assets. "
+            "Cross-PC: copy SWF + full TFM_SECRETS_* from a machine where Transformice loads cleanly "
+            "(README: Proving parity on another PC).",
             cfg_gvi,
         )
 
