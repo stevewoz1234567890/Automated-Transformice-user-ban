@@ -1714,8 +1714,8 @@ def flash_error_dismiss_policy_log_line() -> str:
         "— Button matching is multilingual (not English-only); Windows UI langs are logged first for support. "
         "Continuar/Continue is only auto-clicked when ALLOW_CONTINUE is true, or when the "
         "dialog has no Dismiss/OK and CONTINUE_IF_SOLE_OPTION is true (default). "
-        "Post-login sweep uses BOT_POST_LOGIN_AS_SWEEP_* (default: no Continuar BM_CLICK + WM_CLOSE) "
-        "so OK slots do not flip PARTL via as_sweep."
+        "Post-login sweep uses BOT_POST_LOGIN_AS_SWEEP_* (default: Adobe AS popups closed with "
+        "Escape+WM_CLOSE only — no BM_CLICK on Descartar/Dismiss buttons; avoid sole-Continuar too). "
     )
 
 
@@ -1723,18 +1723,21 @@ def post_login_sweep_dismiss_kw() -> dict[str, bool]:
     """
     Dismiss overrides for ``post_login_actionscript_error_sweep`` only.
 
-    Default: do **not** BM_CLICK Continuar when it is the only button (matches manual click /
-    MAIN clean-eof on healthy sessions). Prefer Escape + WM_CLOSE on the popup instead.
+    Default: **no BM_CLICK at all on Adobe ActionScript dialogs** — only Escape + WM_CLOSE —
+    since localized *Descartar todo* / *Dismiss all* still drops MAIN clean-eof in some runs
+    (see ``operator_phase=as_sweep``). Set ``BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY=false``
+    to restore BM_CLICK ranked buttons during the sweep.
     """
     c_raw = (os.environ.get("BOT_POST_LOGIN_AS_SWEEP_CONTINUE_IF_SOLE_OPTION") or "").strip().lower()
     continue_sole = c_raw in ("1", "true", "yes", "on")
 
-    wm_raw = (os.environ.get("BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE") or "").strip().lower()
-    use_wm = wm_raw not in ("0", "false", "no", "off")
+    esc_raw = (os.environ.get("BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY") or "").strip().lower()
+    adobe_esc_only = esc_raw not in ("0", "false", "no", "off")
 
     return {
         "continue_if_sole_option": continue_sole,
         "use_wmclose_override": use_wm,
+        "adobe_escape_wmclose_only": adobe_esc_only,
     }
 
 
@@ -1744,6 +1747,7 @@ def dismiss_flash_error_dialogs_no_mouse(
     *,
     continue_if_sole_option: bool | None = None,
     use_wmclose_override: bool | None = None,
+    adobe_escape_wmclose_only: bool | None = None,
 ) -> int:
     """
     Dismiss Flash ActionScript/security error dialogs for *pid* **without moving
@@ -1753,6 +1757,10 @@ def dismiss_flash_error_dialogs_no_mouse(
     (prefers *Dismiss All*).  Falls back to Escape or, only if
     ``FLASH_ERROR_DISMISS_USE_WMCLOSE`` is set (or *use_wmclose_override* for
     callers like the post-login sweep), ``WM_CLOSE`` on the dialog.
+
+    *adobe_escape_wmclose_only* (post-login sweep): when True, Adobe-titled AS popups with
+    Win32 ``Button`` children are closed only via Escape + WM_CLOSE — **no** ``BM_CLICK`` on
+    *Descartar todo* / *Dismiss all* / OK, which can still end MAIN on some locales/builds.
 
     **Continue / Continuar (default: do not auto-click when Dismiss exists).**  On many
     TFM+Flash setups the only button is *Continuar*; ``BM_CLICK`` on it can end the AS
@@ -1788,6 +1796,9 @@ def dismiss_flash_error_dialogs_no_mouse(
         continue_if_sole = _env_flag_true_by_default("FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION")
     else:
         continue_if_sole = bool(continue_if_sole_option)
+    sweep_adobe_esc_wmclose_only = (
+        bool(adobe_escape_wmclose_only) if adobe_escape_wmclose_only is not None else False
+    )
     DISMISS_LABELS = flash_dialog_fallback_bmclick_labels(allow_continue=allow_continue)
     # ActionScript / securityError dialogs from Flash Player (large client area is normal).
     _MAX_SMALL_POPUP_AREA = 120_000
@@ -1939,6 +1950,55 @@ def dismiss_flash_error_dialogs_no_mouse(
                 "ActionScript error dismiss: child Button captions slot=%s hwnd=%s: %r",
                 slot_label, top, _caps,
             )
+
+        # Post-login sweep: never BM_CLICK Descartar/Dismiss/etc. — on many builds ANY button dismiss
+        # still collapses MAIN (logs: OK decreases during operator_phase=as_sweep).
+        if sweep_adobe_esc_wmclose_only and adobe_err and buttons:
+            _try_escape_on_dialog(top)
+            if use_wmclose:
+                user32.PostMessageW(top, WM_CLOSE, 0, 0)
+                sess_tot, sess_bad = _record_as_dismiss_close(
+                    incorrect_version=looks_like_incorrect_version,
+                )
+                _as_dismiss_log_closed(
+                    incorrect_version=looks_like_incorrect_version,
+                    sess_tot=sess_tot,
+                    fmt=(
+                        "ActionScript error dismiss: closed slot=%s pid=%s hwnd=%s "
+                        "(method=Escape+WM_CLOSE sweep_no_BMCLICK; avoids localized Dismiss clicks) "
+                        "area=%d title=%r body=%r "
+                        "| session_total=%d incorrect_version_total=%d"
+                    ),
+                    args=(
+                        slot_label,
+                        pid,
+                        top,
+                        area,
+                        (title or "")[:80],
+                        (body_text or "")[: _flash_dismiss_body_log_chars()],
+                        sess_tot,
+                        sess_bad,
+                    ),
+                )
+                if looks_like_incorrect_version:
+                    logger.warning(
+                        "Slot %s: Flash dialog reported INCORRECT GAME VERSION — re-dump "
+                        "TFM_SECRETS_GAME_VERSION (and re-patch the loader SWF if stale). "
+                        "incorrect_version_total_this_session=%d Body: %r",
+                        slot_label,
+                        sess_bad,
+                        (body_text or "")[: _flash_dismiss_body_log_chars()],
+                    )
+                clicked += 1
+                record_as_dismiss_monotonic_for_slot(slot_label)
+            else:
+                logger.warning(
+                    "ActionScript error dismiss: sweep_adobe_esc_wmclose_only ignored slot=%s — "
+                    "WM_CLOSE disabled (BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE); Escape only hwnd=%s",
+                    slot_label,
+                    top,
+                )
+            continue
 
         if not buttons:
             # Main Flash stage is large and has **no** Win32 "Button" children — the SWF draws UI.

@@ -1748,13 +1748,15 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
     logger.info(
         "ActionScript error dismiss: post-login sweep %d pass(es), %.2fs between passes, "
         "%.2fs lead delay — catching late ActionScript error windows (often the last slots). "
-        "Policy: sweep_continue_if_sole=%s sweep_wmclose=%s (BOT_POST_LOGIN_AS_SWEEP_*; "
-        "default avoids BM_CLICK Continuar on OK MAIN).",
+        "Policy: sweep_continue_if_sole=%s sweep_wmclose=%s sweep_adobe_escape_only=%s "
+        "(BOT_POST_LOGIN_AS_SWEEP_*; default closes Adobe dialogs with Escape+WM_CLOSE, "
+        "no BM_CLICK on Dismiss/Descartar buttons).",
         n_passes,
         delay,
         lead_sec,
         sweep_kw["continue_if_sole_option"],
         sweep_kw["use_wmclose_override"],
+        sweep_kw["adobe_escape_wmclose_only"],
     )
     ok_before = sum(1 for s in states if _slot_status_label(s)[0] == "OK   ")
     partl_before = sum(1 for s in states if _slot_status_label(s)[0] == "PARTL")

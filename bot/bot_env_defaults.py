@@ -150,6 +150,9 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     # and can drop MAIN (operator_phase=as_sweep). Use WM_CLOSE on the Adobe popup instead.
     "BOT_POST_LOGIN_AS_SWEEP_CONTINUE_IF_SOLE_OPTION": "false",
     "BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE": "true",
+    # Sweep: close Adobe AS popups with Escape+WM_CLOSE only (no BM_CLICK on Descartar/Dismiss)—
+    # BM_CLICK ranked buttons still dropped MAIN in multi-locale logs (phase=as_sweep).
+    "BOT_POST_LOGIN_AS_SWEEP_ADOBE_ESCAPE_WMCLOSE_ONLY": "true",
     "BOT_UI_AUTO_LAUNCH_FLASH": "true",
     "BOT_UI_FLASH_PLAYER_PATH": "",
     # Default pairs with auto floor in ban_cli._effective_flash_stagger_sec (8+ slots). Higher = fewer
