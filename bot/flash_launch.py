@@ -17,12 +17,14 @@ Each account can use a different ``proxy_port`` and local ``bind_ip``: the loade
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import logging
 import os
 import re
 import subprocess
 import sys
+import unicodedata
 import threading
 import time
 from contextlib import contextmanager
@@ -1377,40 +1379,299 @@ def _win_log_visible_windows_for_pid(pid: int, slot_label: str) -> None:
         )
 
 
+# --- Windows UI language detection (preferred list from GetUserPreferredUILanguages) ----------------------------
+def _windows_preferred_ui_language_tags() -> tuple[str, ...]:
+    """
+    Preferred Windows UI language tags in order (BCP‑47): e.g. ``('de-DE', 'en-US')``.
+    Uses ``GetUserPreferredUILanguages(MUI_LANGUAGE_NAME)`` so it follows *Display language*,
+    not only regional/date formats.
+    """
+    if sys.platform != "win32":
+        return ()
+    try:
+        from ctypes import wintypes
+
+        MUI_LANGUAGE_NAME = 0x8
+        k32 = ctypes.windll.kernel32
+        num_langs = ctypes.c_ulong(0)
+        cch = ctypes.c_ulong(0)
+        if not k32.GetUserPreferredUILanguages(
+            ctypes.c_ulong(MUI_LANGUAGE_NAME), ctypes.byref(num_langs), None, ctypes.byref(cch)
+        ):
+            return ()
+        buflen = max(4, min(int(cch.value), 2048))
+        buf = ctypes.create_unicode_buffer(buflen)
+        cch_fill = ctypes.c_ulong(buflen)
+        if not k32.GetUserPreferredUILanguages(
+            ctypes.c_ulong(MUI_LANGUAGE_NAME),
+            ctypes.byref(num_langs),
+            ctypes.cast(buf, wintypes.LPWSTR),
+            ctypes.byref(cch_fill),
+        ):
+            return ()
+        blob = ctypes.string_at(ctypes.addressof(buf), ctypes.sizeof(buf))
+        decoded = blob.decode("utf-16-le", errors="replace")
+        nonempty = tuple(s for s in decoded.split("\0") if s)
+        nl = max(0, min(int(num_langs.value), len(nonempty)))
+        return nonempty[:nl] if nl else nonempty
+    except Exception:
+        logger.debug("GetUserPreferredUILanguages failed", exc_info=True)
+        return ()
+
+
+_LANG_PRIMARY_TAGS: dict[int, str] = {
+    # Win32 PRIMARYLANGID (= LANGID & 0x03FF): heuristic logging only — not exhaustive.
+    4: "zh",
+    7: "de",
+    9: "en",
+    10: "es",
+    12: "fr",
+    16: "it",
+    17: "ja",
+    18: "ko",
+    21: "pl",
+    22: "pt",
+    24: "ro",
+    25: "ru",
+    26: "hr",
+}
+
+
+def flash_error_windows_ui_language_log_fragment() -> str:
+    tags = _windows_preferred_ui_language_tags()
+    if tags:
+        prim = "|".join(t.split("-", 1)[0].strip().lower() for t in tags[:4] if t)
+        safe = "|".join(tags[:6])
+        return f"Detected Windows UI langs (first-checked)={safe!s} PRIMARY={prim!s}"
+    if sys.platform == "win32":
+        lid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+        pr = lid & 0x03FF
+        tag = _LANG_PRIMARY_TAGS.get(pr, hex(pr))
+        return f"No preferred UI-lang list — LANGID_PRIMARY={tag} (fallback 0x{lid:04X})"
+    return "Detected Windows UI langs=n/a (not win32)"
+
+
 def _win_button_label_normalize(raw: str) -> str:
-    # Strip & accelerator; collapse whitespace (handles "&Dismiss &All" etc.)
+    """Strip mnemonic ``&``, case-fold, accent-fold, squash whitespace."""
     t = (raw or "").replace("&", "").strip().lower()
+    t = unicodedata.normalize("NFD", t)
+    t = "".join(ch for ch in t if unicodedata.category(ch) != "Mn")
     return " ".join(t.split())
 
 
-def _flash_error_dismiss_button_rank(label_norm: str) -> int | None:
-    """
-    Lower is better. None = do not use this button for auto-dismiss.
-    Prefer Dismiss All over Continue.
-    """
+# Multilingual synonyms for FP #2044 / #2048 style Win32 ``Button`` captions.
+# Ranking: lower is stronger preference; Continue-like stays high (3+) so allow_continue guards apply.
+_FLASH_DISMISS_ALL_WORD_PAIRS: tuple[tuple[str, str], ...] = (
+    ("dismiss", "all"),
+    ("ignore", "all"),
+    ("omitir", "todo"),
+    ("descartar", "todo"),
+    ("ignorar", "todo"),
+    ("cerrar", "todo"),
+    ("ignorar", "tudo"),
+    ("dispensar", "todo"),
+    ("dispensar", "tudo"),
+    ("ignorer", "tout"),
+    ("tout", "ignorer"),
+    ("schließen", "alle"),
+    ("schliessen", "alle"),
+    ("ignorieren", "alle"),
+    ("ausblenden", "alle"),
+    ("chiudi", "tutto"),
+    ("ignora", "tutto"),
+    ("chiudi", "tutti"),
+    ("pomiń", "wszystko"),
+    ("pomin", "wszystko"),
+    ("pomiń", "wszystkie"),
+    ("pomin", "wszystkie"),
+    ("закрити", "все"),
+    ("игнорировать", "все"),
+    ("пропустить", "все"),
+)
+
+_FLASH_DISMISS_ALL_EXACT = frozenset[str](
+    {
+        "dismiss all",
+        "ignore all",
+        "omitir todo",
+        "ignorar todo",
+        "ignorar todas",
+        "descartar todo",
+        "cerrar todo",
+        "cerrar todas",
+        "dispensar tudo",
+        "ignorar tudo",
+        "ignorer tout",
+        "tout ignorer",
+        "fermer tout",
+        "alle schließen",
+        "alle schliessen",
+        "alle ignorieren",
+        "alle ausblenden",
+        "alle verwerfen",
+        "alles ignorieren",
+        "alles schließen",
+        "alles schliessen",
+        "alles overslaan",
+        "chiudi tutto",
+        "chiudi tutti",
+        "ignora tutto",
+        "ignora tutti",
+        "pomiń wszystkie",
+        "pomin wszystkie",
+        "pomiń wszystko",
+        "pomin wszystko",
+        "zamknij wszystko",
+        "закрыть все",
+        "игнорировать все",
+        "пропустить все",
+        "关闭全部",
+        "全部关闭",
+        "全部忽略",
+        "忽略全部",
+        "すべて無視",
+        "すべてを無視",
+        "すべて閉じる",
+    }
+)
+
+
+def _accent_fold_spaces(s: str) -> str:
+    t = unicodedata.normalize("NFD", (s or "").lower())
+    t = "".join(ch for ch in t if unicodedata.category(ch) != "Mn")
+    return "".join(ch for ch in t if not ch.isspace())
+
+
+def _looks_like_continue_in_label(label_norm: str) -> bool:
+    """Cheap substring traps so compound dismiss labels are not mistaken for rank-1 dismiss."""
     if not label_norm:
-        return None
-    if "dismiss" in label_norm and "all" in label_norm:
-        return 0
-    if label_norm in ("dismiss",) or (
-        "dismiss" in label_norm and "continue" not in label_norm
-    ):
-        return 1
-    for exact in (
+        return False
+    lf = label_norm.casefold().replace("&", "").lower().strip()
+    if "continue" in lf:
+        return True
+    for frag in ("continuar", "continuer", "continuare", "prosseguir"):
+        if frag in lf:
+            return True
+    if lf == "weiter" or lf == "fortfahren":
+        return True
+    prod_cy = "\u043f\u0440\u043e\u0434\u043e\u043b\u0436"
+    if prod_cy in lf or prod_cy in label_norm.casefold():
+        return True
+    lf_ns = _accent_fold_spaces(label_norm)
+    for needle in ("fortfahren", "weiter"):
+        needle_ns = "".join(ch for ch in needle if not ch.isspace())
+        if needle_ns and needle_ns in lf_ns:
+            return True
+    if prod_cy.replace(" ", "") in lf_ns:
+        return True
+    continue_markers_cn_jp_ko_ar = ("继续", "\u7d9a\u3051\u308b", "\u7d9a\u884c", "\uacc4\uad6d", "\u0645\u062a\u0627\u0628\u0639\u0629")
+    for marker in continue_markers_cn_jp_ko_ar:
+        if marker in label_norm:
+            return True
+    return False
+
+
+_FLASH_DISMISS_SINGLE_EXACT = frozenset[str](
+    {
+        "dismiss",
+        "ignore",
+        "ignorer",
+        "ignorar",
+        "omitir",
+        "discard",
+        "abbruch",
+    }
+)
+
+_FLASH_OK_CLICK_EXACT = frozenset[str](
+    {
         "ok",
+        "okay",
+        "aceptar",
+        "cerrar",
         "close",
         "yes",
         "sí",
         "si",
-        "aceptar",
+        "oui",
+        "ja",
+        "sim",
+        "да",
+        "はい",
+        "确定",
+        "確認",
+        "閉じる",
+        "\u9589\u3058\u308b",
+    }
+)
+
+_FLASH_CONTINUE_CLICK_NON_EN = frozenset[str](
+    {
+        "continuar",
+        "continuer",
+        "continuare",
+        "weiter",
+        "fortfahren",
+        "proceed",
+        "prosseguir",
+        "далее",
+        "продолжить",
+        "继续",
+        "\u7d9a\u3051\u308b",
+        "\u7d9a\u884c",
+        "\uacc4\uad6d",
+        "\ub2e4\uc74c",
+        "\u0645\u062a\u0627\u0628\u0639\u0629",
+    }
+)
+
+
+def _flash_matches_dismiss_all(ln: str) -> bool:
+    if not ln:
+        return False
+    if ln in _FLASH_DISMISS_ALL_EXACT:
+        return True
+    for a, b in _FLASH_DISMISS_ALL_WORD_PAIRS:
+        if a in ln and b in ln:
+            return True
+    return False
+
+
+def _flash_error_dismiss_button_rank(label_norm: str) -> int | None:
+    """
+    Lower is better. ``None`` = do not use this button for auto-dismiss.
+    Prefers multilingual *Dismiss all* equivalents over Continue.
+    """
+    if not label_norm:
+        return None
+    if _flash_matches_dismiss_all(label_norm):
+        return 0
+    if (
+        label_norm in _FLASH_DISMISS_SINGLE_EXACT
+        or (
+            not _looks_like_continue_in_label(label_norm)
+            and "dismiss" in label_norm
+        )
     ):
-        if label_norm == exact:
-            return 2
-    if label_norm in ("continuar", "continuer"):
+        return 1
+    if label_norm in _FLASH_OK_CLICK_EXACT:
+        return 2
+    if label_norm in _FLASH_CONTINUE_CLICK_NON_EN:
         return 3
     if label_norm == "continue":
         return 4
     return None
+
+
+def flash_dialog_fallback_bmclick_labels(*, allow_continue: bool) -> set[str]:
+    """
+    Labels we may BM_CLICK via the fallback exact-label loop — mirrors multilingual rank 0–2 (+ optional continue).
+    """
+    out = set(_FLASH_DISMISS_ALL_EXACT | _FLASH_DISMISS_SINGLE_EXACT | _FLASH_OK_CLICK_EXACT)
+    if allow_continue:
+        out |= {"continue"}
+        out |= _FLASH_CONTINUE_CLICK_NON_EN
+    return out
 
 
 def _env_flag_false_by_default(name: str) -> bool:
@@ -1443,24 +1704,55 @@ def flash_error_dismiss_policy_log_line() -> str:
     ac = _env_flag_false_by_default("FLASH_ERROR_DISMISS_ALLOW_CONTINUE")
     wm = _env_flag_false_by_default("FLASH_ERROR_DISMISS_USE_WMCLOSE")
     sole = _env_flag_true_by_default("FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION")
+    wl = flash_error_windows_ui_language_log_fragment()
     return (
         "ActionScript error dismiss: policy "
+        f"[{wl}] "
         f"FLASH_ERROR_DISMISS_ALLOW_CONTINUE={ac} "
         f"FLASH_ERROR_DISMISS_USE_WMCLOSE={wm} "
         f"FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION={sole} "
-        "— Continuar/Continue is only auto-clicked when ALLOW_CONTINUE is true, or when the "
-        "dialog has no Dismiss/OK and CONTINUE_IF_SOLE_OPTION is true (default)."
+        "— Button matching is multilingual (not English-only); Windows UI langs are logged first for support. "
+        "Continuar/Continue is only auto-clicked when ALLOW_CONTINUE is true, or when the "
+        "dialog has no Dismiss/OK and CONTINUE_IF_SOLE_OPTION is true (default). "
+        "Post-login sweep uses BOT_POST_LOGIN_AS_SWEEP_* (default: no Continuar BM_CLICK + WM_CLOSE) "
+        "so OK slots do not flip PARTL via as_sweep."
     )
 
 
-def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
+def post_login_sweep_dismiss_kw() -> dict[str, bool]:
+    """
+    Dismiss overrides for ``post_login_actionscript_error_sweep`` only.
+
+    Default: do **not** BM_CLICK Continuar when it is the only button (matches manual click /
+    MAIN clean-eof on healthy sessions). Prefer Escape + WM_CLOSE on the popup instead.
+    """
+    c_raw = (os.environ.get("BOT_POST_LOGIN_AS_SWEEP_CONTINUE_IF_SOLE_OPTION") or "").strip().lower()
+    continue_sole = c_raw in ("1", "true", "yes", "on")
+
+    wm_raw = (os.environ.get("BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE") or "").strip().lower()
+    use_wm = wm_raw not in ("0", "false", "no", "off")
+
+    return {
+        "continue_if_sole_option": continue_sole,
+        "use_wmclose_override": use_wm,
+    }
+
+
+def dismiss_flash_error_dialogs_no_mouse(
+    pid: int,
+    slot_label: str,
+    *,
+    continue_if_sole_option: bool | None = None,
+    use_wmclose_override: bool | None = None,
+) -> int:
     """
     Dismiss Flash ActionScript/security error dialogs for *pid* **without moving
     the mouse cursor**.  Finds top-level windows owned by the process (small
     popups, or **large** \"Adobe Flash Player\" ActionScript error windows),
     enumerates child Button controls, and sends ``BM_CLICK`` to the best match
     (prefers *Dismiss All*).  Falls back to Escape or, only if
-    ``FLASH_ERROR_DISMISS_USE_WMCLOSE`` is set, ``WM_CLOSE`` on the dialog.
+    ``FLASH_ERROR_DISMISS_USE_WMCLOSE`` is set (or *use_wmclose_override* for
+    callers like the post-login sweep), ``WM_CLOSE`` on the dialog.
 
     **Continue / Continuar (default: do not auto-click when Dismiss exists).**  On many
     TFM+Flash setups the only button is *Continuar*; ``BM_CLICK`` on it can end the AS
@@ -1488,21 +1780,15 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
     WM_KEYUP = 0x0101
     VK_ESCAPE = 0x1B
     allow_continue = _env_flag_false_by_default("FLASH_ERROR_DISMISS_ALLOW_CONTINUE")
-    use_wmclose = _env_flag_false_by_default("FLASH_ERROR_DISMISS_USE_WMCLOSE")
-    continue_if_sole = _env_flag_true_by_default("FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION")
-    # English + common Spanish (Flash / Windows locale) — used for simple exact-set fallback
-    DISMISS_LABELS = {
-        "dismiss all",
-        "dismiss",
-        "ok",
-        "aceptar",
-        "sí",
-        "si",
-        "close",
-        "yes",
-    }
-    if allow_continue:
-        DISMISS_LABELS |= {"continue", "continuar"}
+    if use_wmclose_override is None:
+        use_wmclose = _env_flag_false_by_default("FLASH_ERROR_DISMISS_USE_WMCLOSE")
+    else:
+        use_wmclose = bool(use_wmclose_override)
+    if continue_if_sole_option is None:
+        continue_if_sole = _env_flag_true_by_default("FLASH_ERROR_DISMISS_CONTINUE_IF_SOLE_OPTION")
+    else:
+        continue_if_sole = bool(continue_if_sole_option)
+    DISMISS_LABELS = flash_dialog_fallback_bmclick_labels(allow_continue=allow_continue)
     # ActionScript / securityError dialogs from Flash Player (large client area is normal).
     _MAX_SMALL_POPUP_AREA = 120_000
     _MAX_ADOBE_ERR_AREA = 2_500_000
@@ -1531,6 +1817,10 @@ def dismiss_flash_error_dialogs_no_mouse(pid: int, slot_label: str) -> int:
         if "adobe flash player" in tl:
             return True
         if "flash player" in tl and "actionscript" in tl:
+            return True
+        if ("reproductor" in tl or "reprodutor" in tl or "lecteur" in tl or "spieler" in tl) and (
+            "flash" in tl
+        ):
             return True
         return False
 

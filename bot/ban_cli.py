@@ -1744,12 +1744,17 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
         lead_sec = 1.5
     lead_sec = max(0.0, min(10.0, lead_sec))
 
+    sweep_kw = flash_launch.post_login_sweep_dismiss_kw()
     logger.info(
         "ActionScript error dismiss: post-login sweep %d pass(es), %.2fs between passes, "
-        "%.2fs lead delay — catching late ActionScript error windows (often the last slots).",
+        "%.2fs lead delay — catching late ActionScript error windows (often the last slots). "
+        "Policy: sweep_continue_if_sole=%s sweep_wmclose=%s (BOT_POST_LOGIN_AS_SWEEP_*; "
+        "default avoids BM_CLICK Continuar on OK MAIN).",
         n_passes,
         delay,
         lead_sec,
+        sweep_kw["continue_if_sole_option"],
+        sweep_kw["use_wmclose_override"],
     )
     ok_before = sum(1 for s in states if _slot_status_label(s)[0] == "OK   ")
     partl_before = sum(1 for s in states if _slot_status_label(s)[0] == "PARTL")
@@ -1766,7 +1771,9 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
             if not flash_launch.try_acquire_flash_ui(pid):
                 continue
             try:
-                total += flash_launch.dismiss_flash_error_dialogs_no_mouse(pid, s.label)
+                total += flash_launch.dismiss_flash_error_dialogs_no_mouse(
+                    pid, s.label, **sweep_kw
+                )
             except Exception:
                 logger.debug("post-login sweep: slot %s failed", s.label, exc_info=True)
             finally:

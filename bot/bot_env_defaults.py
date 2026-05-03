@@ -146,6 +146,10 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_PASSES": "3",
     "BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_DELAY_SEC": "0.4",
     "BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_LEAD_SEC": "1.0",
+    # Sweep-only (issue 1): never BM_CLICK sole Continuar by default — that matches a manual click
+    # and can drop MAIN (operator_phase=as_sweep). Use WM_CLOSE on the Adobe popup instead.
+    "BOT_POST_LOGIN_AS_SWEEP_CONTINUE_IF_SOLE_OPTION": "false",
+    "BOT_POST_LOGIN_AS_SWEEP_USE_WMCLOSE": "true",
     "BOT_UI_AUTO_LAUNCH_FLASH": "true",
     "BOT_UI_FLASH_PLAYER_PATH": "",
     # Default pairs with auto floor in ban_cli._effective_flash_stagger_sec (8+ slots). Higher = fewer
