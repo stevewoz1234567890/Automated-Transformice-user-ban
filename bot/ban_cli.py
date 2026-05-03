@@ -1726,7 +1726,9 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
     After all slots report login, #2044 / #2048 popups can still appear a few seconds late
     on the last-opened clients. The background poller may stop before those HWNDs exist;
     this runs several passes with short delays so **Dismiss All** is applied to stragglers.
-    Default pass count (when env unset) is 3; increase via BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_PASSES if needed.
+    Default pass count (when env unset) is 3; set ``BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_PASSES=0``
+    to disable the sweep entirely (sometimes needed when WM_CLOSE bursts correlate with
+    ``phase=as_sweep`` MAIN loss on large farms).
     """
     if sys.platform != "win32":
         return
@@ -1735,7 +1737,12 @@ def post_login_actionscript_error_sweep(states: list[SlotState]) -> None:
         n_passes = int(raw) if raw else 3
     except ValueError:
         n_passes = 6
-    n_passes = max(1, min(20, n_passes))
+    n_passes = max(0, min(20, n_passes))
+    if n_passes <= 0:
+        logger.info(
+            "ActionScript error dismiss: post-login sweep skipped (BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_PASSES<=0)."
+        )
+        return
     raw_d = (os.environ.get("BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_DELAY_SEC") or "").strip()
     try:
         delay = float(raw_d) if raw_d else 0.55

@@ -143,6 +143,7 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_RETRY_DELAY_SEC": "1.25",
     "BOT_RETRY_LOGIN_TIMEOUT_SEC": "120.0",
     "BOT_RETRY_BETWEEN_SLOT_SEC": "2.0",
+    # 0 = skip post-login Adobe AS sweep entirely (fixes logs where MAIN dies with phase=as_sweep).
     "BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_PASSES": "3",
     "BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_DELAY_SEC": "0.4",
     "BOT_POST_LOGIN_ACTIONSCRIPT_SWEEP_LEAD_SEC": "1.0",
