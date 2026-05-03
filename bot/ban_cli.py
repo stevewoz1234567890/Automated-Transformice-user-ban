@@ -569,6 +569,61 @@ def _slot_status_label(s: SlotState) -> tuple[str, str]:
     return ("OK   ", "ready")
 
 
+def _slot_upstream_ok_for_sequential(st: SlotState) -> bool:
+    """True when the slot is OK for /ban (LoginSuccess + live upstream write path)."""
+    return _slot_status_label(st)[0] == "OK"
+
+
+def _sequential_main_stabilize_sec() -> float:
+    """Hold after LoginSuccess before opening the next Flash (MAIN must stay OK). Set 0 to disable."""
+    raw = (os.environ.get("BOT_UI_SEQUENTIAL_MAIN_STABILIZE_SEC") or "").strip()
+    if not raw:
+        return 5.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 5.0
+    return max(0.0, min(v, 120.0))
+
+
+def _sequential_slot_max_retry_passes() -> int:
+    """Close+relaunch the same slot this many times before giving up (pre-batch PARTL storm)."""
+    raw = (os.environ.get("BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY") or "").strip()
+    if not raw:
+        return 24
+    try:
+        n = int(raw)
+    except ValueError:
+        return 24
+    return max(1, min(n, 200))
+
+
+def _sequential_retry_pause_sec(cfg: object) -> float:
+    raw = (os.environ.get("BOT_UI_SEQUENTIAL_RETRY_PAUSE_SEC") or "").strip()
+    if raw:
+        try:
+            return max(0.0, min(float(raw), 60.0))
+        except ValueError:
+            pass
+    return max(0.0, float(getattr(cfg, "FLASH_EMBEDDED_IV_RELOAD_PAUSE_SEC", 1.25) or 0.0))
+
+
+def _wait_sequential_upstream_stable(
+    st: SlotState,
+    *,
+    seconds: float,
+    poll: float = 0.2,
+) -> bool:
+    if seconds <= 0:
+        return True
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not _slot_upstream_ok_for_sequential(st):
+            return False
+        time.sleep(poll)
+    return True
+
+
 def _effective_flash_stagger_sec(n_slots: int, stagger_from_env: float) -> float:
     """POST-login delay before opening the *next* Flash client (sequential farm launch)."""
     stagger_after = float(stagger_from_env)
@@ -3122,387 +3177,483 @@ def main(argv: list[str] | None = None) -> None:
                 "so the terminal stays usable.",
             )
 
-        for idx, (flash_row, st) in enumerate(zip(flash_accounts, states), start=1):
-            st.login_success_event.clear()
-            st.login_aborted_event.clear()
-            st.flash_main_tcp_seen = False
-            st.flash_loader_ready_event.clear()
+        stab_sec = _sequential_main_stabilize_sec()
+        seq_slot_max_retry = _sequential_slot_max_retry_passes()
+        seq_retry_pause = _sequential_retry_pause_sec(cfg)
+        if stab_sec > 0:
             logger.info(
-                "Opening game %s/%s (slot %s); waiting up to %ss for login before next client.",
-                idx,
-                len(flash_accounts),
-                st.label,
-                login_timeout,
+                "Sequential login: BOT_UI_SEQUENTIAL_MAIN_STABILIZE_SEC=%.1fs — next Flash opens only "
+                "after MAIN stays OK that long on the current slot. BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY=%d "
+                "(close failed slot + relaunch before advancing). BOT_UI_SEQUENTIAL_RETRY_PAUSE_SEC=%.2fs "
+                "(pause between sequential relaunches).",
+                stab_sec,
+                seq_slot_max_retry,
+                seq_retry_pause,
             )
-            try:
-                proc = flash_launch.launch_one_flash_loader(
-                    flash_row,
-                    root=_repo_root(),
-                    click_transformice=not args.launch_flash_no_click,
-                    on_flash_pid=lambda pid, st=st: setattr(st, "flash_pid", pid),
-                    post_open_delay_sec=float(
-                        getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
-                    ),
-                )
-            finally:
-                st.flash_loader_ready_event.set()
-            if proc is None:
-                st.flash_pid = None
-            if (
-                cfg_flash_auto
-                and flash_login_trigger == "main_tcp"
-                and st.flash_pid is not None
-            ):
-                dm = float(getattr(cfg, "FLASH_LOGIN_AFTER_MAIN_DELAY_SEC", 1.0))
-                logger.info(
-                    "Slot %s: FLASH auto-login on first MAIN TCP: dismiss ASAP, then %.2fs before username (FLASH_LOGIN_TRIGGER=main_tcp)",
-                    st.label,
-                    max(0.0, dm),
-                )
-            if (
-                cfg_flash_auto
-                and flash_login_trigger == "after_launch"
-                and st.flash_pid is not None
-            ):
-                after_launch_sec = float(getattr(cfg, "FLASH_LOGIN_AFTER_LAUNCH_SEC", 12.0))
 
-                def _run_login_ui_later(
-                    *,
-                    _st: SlotState = st,
-                    _cfg: object = cfg,
-                    _delay: float = after_launch_sec,
-                ) -> None:
-                    time.sleep(max(0.0, _delay))
-                    try:
-                        flash_launch.run_flash_login_ui(
-                            pid=_st.flash_pid,
-                            username=_st.flash_username,
-                            password=_st.flash_password,
-                            slot_label=_st.label,
-                            cfg=_cfg,
-                            trigger="after_launch",
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Slot %s: FLASH_LOGIN_TRIGGER=after_launch login UI failed",
-                            _st.label,
-                        )
+        for idx, (flash_row0, st) in enumerate(zip(flash_accounts, states), start=1):
+            sequential_slot_done = False
+            seq_attempt = 0
+            flash_row_cur = flash_row0
 
-                threading.Thread(
-                    target=_run_login_ui_later,
-                    daemon=True,
-                    name=f"flash-login-ui-{st.label}",
-                ).start()
-                logger.info(
-                    "Slot %s: scheduled FLASH auto-login in %.1fs (after_launch; tune FLASH_LOGIN_AFTER_LAUNCH_SEC)",
-                    st.label,
-                    max(0.0, after_launch_sec),
-                )
-            poll_sec = float(getattr(cfg, "FLASH_LOGIN_WAIT_POLL_SEC", 45.0))
-            poll_sec = max(10.0, min(poll_sec, 120.0))
-            deadline = time.monotonic() + login_timeout
-            # Shared cap for (1) in-SWF stalls before LoginSuccess and (2) MAIN session ended early
-            # (upstream drop / clean-eof) while Flash shows “connection interrupted” with no usable button.
-            _iv_mr = int(getattr(cfg, "FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT", 20))
-            _iv_mr = max(0, min(200, _iv_mr))
-            mid_login_flash_reloads = 0
-            embedded_iv_on = bool(getattr(cfg, "FLASH_EMBEDDED_IV_LOGIN_RELOAD", True))
-            main_drop_reload_on = bool(getattr(cfg, "FLASH_MAIN_DROP_LOGIN_RELOAD", True))
-            got_login = False
-            verbose = bool(getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", True))
-            packet_login = bool(getattr(cfg, "PACKET_AUTO_LOGIN", False))
-            if packet_login:
-                logger.debug(
-                    "Slot %s: PACKET_AUTO_LOGIN — waiting for LoginSuccessPacket (proxy injects credentials automatically).",
-                    st.label,
-                )
-            elif not cfg_flash_auto:
-                logger.info(
-                    "Slot %s: manual login — type username/password and submit in Flash. "
-                    "Watch log for HandshakeResponse, LoginPacket (password redacted), "
-                    "AccountError, Captcha, ChangeSatelliteServer; OK line = LoginSuccess.",
-                    st.label,
-                )
-            elif verbose:
-                logger.info(
-                    "Slot %s: PROXY_VERBOSE_LOGIN_FLOW=True — extra login-phase packet lines in log.",
-                    st.label,
-                )
-
-            # Fast early retry clicks: the initial post_open_delay click (default ~1.15s) frequently
-            # lands before the loader SWF has drawn the Transformice button, especially on later slots
-            # when earlier Flash instances are still consuming CPU. The main poll loop below only
-            # retries every FLASH_LOGIN_WAIT_POLL_SEC (default 45s, floor 10s), which is way too slow
-            # to recover. Do a few aggressive re-clicks in the first ~20s while MAIN TCP is still
-            # missing so slots without bind_ip (which can't rely on Proxifier warming the port) still
-            # reach the proxy.
-            if (
-                st.flash_pid is not None
-                and not args.launch_flash_no_click
-                and not st.flash_main_tcp_seen
-                and not st.login_success_event.is_set()
-            ):
-                early_interval = float(
-                    getattr(cfg, "FLASH_LOADER_EARLY_RETRY_INTERVAL_SEC", 3.0)
-                )
-                early_retries = int(getattr(cfg, "FLASH_LOADER_EARLY_RETRY_COUNT", 5))
-                early_interval = max(0.5, min(early_interval, 15.0))
-                early_retries = max(0, min(early_retries, 20))
-                frac_x_early = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_X", 0.50))
-                frac_y_early = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_Y", 0.55))
-                for attempt in range(1, early_retries + 1):
-                    deadline_early = time.monotonic() + early_interval
-                    while time.monotonic() < deadline_early:
-                        if (
-                            st.flash_main_tcp_seen
-                            or st.login_success_event.is_set()
-                        ):
-                            break
-                        time.sleep(0.2)
-                    if st.flash_main_tcp_seen or st.login_success_event.is_set():
-                        # MAIN TCP accept already logged the arrival; no need to repeat.
-                        logger.debug(
-                            "Slot %s: MAIN TCP observed during early retry window (before attempt %d/%d)",
-                            st.label, attempt, early_retries,
-                        )
-                        break
-                    logger.info(
-                        "Slot %s: no MAIN TCP after ~%.1fs — re-clicking Transformice "
-                        "loader [early retry %d/%d]",
+            while seq_attempt < seq_slot_max_retry and not sequential_slot_done:
+                seq_attempt += 1
+                if seq_attempt > 1:
+                    logger.warning(
+                        "Slot %s: sequential slot retry %d/%d — MAIN dropped before stabilize or login "
+                        "failed; closing this Flash tab and reopening before any later slot proceeds.",
                         st.label,
-                        early_interval * attempt,
-                        attempt, early_retries,
+                        seq_attempt,
+                        seq_slot_max_retry,
                     )
-                    # Dump every visible top-level window belonging to this Flash PID
-                    # — if a Flash error popup / "Restricted content" dialog appeared,
-                    # we want to see it so we know clicks need to target it, not the
-                    # main loader window. Keep the "just 1 window" case quiet since
-                    # it's the expected normal path.
-                    try:
-                        windows = flash_launch.list_flash_windows(st.flash_pid)
-                        if len(windows) != 1:
-                            logger.warning(
-                                "Slot %s: flash_pid=%s has %d top-level window(s): %s",
-                                st.label, st.flash_pid, len(windows),
-                                ", ".join(
-                                    f"HWND={w['hwnd']} title={w['title']!r} "
-                                    f"size={w['width']}x{w['height']}"
-                                    for w in windows
-                                ) or "(none)",
-                            )
-                        else:
-                            logger.debug(
-                                "Slot %s: flash_pid=%s one window (normal) HWND=%s title=%r size=%dx%d",
-                                st.label, st.flash_pid,
-                                windows[0]["hwnd"], windows[0]["title"],
-                                windows[0]["width"], windows[0]["height"],
-                            )
-                    except Exception:
-                        logger.exception(
-                            "Slot %s: list_flash_windows raised", st.label
-                        )
-                    # Try several candidate positions on each retry: the Transformice
-                    # entry in the loader has shifted between builds (sometimes ~0.55y,
-                    # sometimes ~0.45y, sometimes lower on screens that render a cached
-                    # "Continue" button). Hammering a small cluster is far cheaper than
-                    # waiting for the 45s slow-poll retry to land on the right pixel.
-                    click_positions = [
-                        (frac_x_early, frac_y_early),
-                        (frac_x_early, 0.45),
-                        (frac_x_early, 0.65),
-                        (frac_x_early, 0.50),
-                        (frac_x_early, 0.60),
-                    ]
-                    for fx_c, fy_c in click_positions:
-                        if (
-                            st.flash_main_tcp_seen
-                            or st.login_success_event.is_set()
-                        ):
-                            break
-                        flash_launch.click_transformice_in_loader(
-                            st.flash_pid, st.label,
-                            frac_x=fx_c, frac_y=fy_c,
-                        )
-                        time.sleep(0.15)
-
-            while True:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
-                chunk = min(poll_sec, left)
-                if st.login_success_event.wait(timeout=chunk):
-                    got_login = True
-                    # "OK  [slot X] logged in as …" from ban_proxy already covers this;
-                    # a second line would just double the noise.
-                    logger.debug("Slot %s reported login success; proceeding.", st.label)
-                    if bool(getattr(cfg, "FLASH_MINIMIZE_AFTER_OPEN", False)) and st.flash_pid:
-                        # FLASH_MINIMIZE_AFTER_OPEN calls minimize_flash_window, which tiles each
-                        # projector into BOT_FLASH_TILE_* on-screen (not SW_MINIMIZE / off-screen,
-                        # which throttle Flash). BOT_FLASH_DIAG_KEEP_ONSCREEN=1 skips this for diagnosis.
-                        if os.environ.get("BOT_FLASH_DIAG_KEEP_ONSCREEN", "").strip().lower() in ("1", "true", "yes"):
-                            logger.info(
-                                "Slot %s: BOT_FLASH_DIAG_KEEP_ONSCREEN=1 — leaving Flash window visible for diagnosis",
-                                st.label,
-                            )
-                        else:
-                            flash_launch.minimize_flash_window(st.flash_pid, st.label)
-                    break
-                if st.login_aborted_event.is_set():
-                    logger.info(
-                        "Slot %s: MAIN session closed before LoginSuccess — "
-                        "(clean-eof during handshake is common with stagger overload or unstable links).",
-                        st.label,
-                    )
-                    if (
-                        main_drop_reload_on
-                        and _iv_mr > 0
-                        and mid_login_flash_reloads < _iv_mr
-                    ):
-                        mid_login_flash_reloads += 1
-                        logger.warning(
-                            "Slot %s: MAIN_DROP_LOGIN_RELOAD attempt=%d/%s — MAIN ended before LoginSuccess; "
-                            "closing Flash and relaunching (in-SWF “connection interrupted” / no Win32 dismiss). "
-                            "Same cap as BOT_FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT.",
-                            st.label,
-                            mid_login_flash_reloads,
-                            _iv_mr,
-                        )
-                        _embedded_iv_mid_login_relaunch_sequential(
-                            st=st,
-                            flash_row=dict(flash_row),
-                            cfg=cfg,
-                            args=args,
-                            cfg_flash_auto=cfg_flash_auto,
-                            flash_login_trigger=flash_login_trigger,
-                        )
-                        deadline = time.monotonic() + login_timeout
-                        continue
-                    break
-                if (
-                    embedded_iv_on
-                    and _iv_mr > 0
-                    and mid_login_flash_reloads < _iv_mr
-                    and st.flash_pid is not None
-                ):
-                    need_iv, iv_tag = _should_reload_flash_embedded_iv_login(
+                    if seq_retry_pause > 0:
+                        time.sleep(seq_retry_pause)
+                    _close_flash_for_slot_retry(st, cfg)
+                    _reset_slot_state_for_retry(st)
+                    flash_row_cur = _build_flash_row_for_retry(
+                        raw_row=dict(raw_accounts[idx - 1]),
                         st=st,
-                        cfg=cfg,
-                        now_mono=time.monotonic(),
+                        shared_flash_policy_port=shared_flash_policy_port,
                     )
-                    if need_iv:
-                        mid_login_flash_reloads += 1
-                        logger.warning(
-                            "Slot %s: EMBEDDED_IV_LOGIN_RELOAD attempt=%d/%d (%s) — closing Adobe Flash "
-                            "Player and relaunching the loader (in-SWF stall; no modal OK). Each attempt "
-                            "resets BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC countdown.",
-                            st.label,
-                            mid_login_flash_reloads,
-                            _iv_mr,
-                            iv_tag,
-                        )
-                        _embedded_iv_mid_login_relaunch_sequential(
-                            st=st,
-                            flash_row=dict(flash_row),
-                            cfg=cfg,
-                            args=args,
-                            cfg_flash_auto=cfg_flash_auto,
-                            flash_login_trigger=flash_login_trigger,
-                        )
-                        deadline = time.monotonic() + login_timeout
-                        continue
-                if st.flash_main_tcp_seen:
-                    extra_verbose = (
-                        " With PROXY_VERBOSE_LOGIN_FLOW: expect a [MAIN→srv] LoginPacket after you submit; "
-                        "if none appears, auto-login may be too early or submit missed — try "
-                        "FLASH_LOGIN_AFTER_SUBMIT_EXTRA_SEC / FLASH_LOGIN_SECOND_SUBMIT_CLICK in .env."
-                        if verbose
-                        else ""
-                    )
-                    # Specific hint for the "incorrect version" symptom: Flash has a MAIN TCP
-                    # connection to the proxy but never sent SystemInformationPacket (the
-                    # trigger for PACKET_AUTO_LOGIN). That typically means the loader SWF hit
-                    # an error BEFORE sending the handshake — most commonly a "incorrect
-                    # version" / rate-limit screen when the game server refuses rapid-fire
-                    # logins from the same public IP. Tell the user how to recover so they
-                    # don't keep staring at "Still waiting..." lines without guidance.
-                    logger.info(
-                        "Still waiting slot %s (~%.0fs left): no LoginSuccess yet. "
-                        "MAIN TCP already connected — Flash reached 127.0.0.1:%s but never sent "
-                        "SystemInformationPacket. If Flash shows 'incorrect version' or a blank "
-                        "screen here, the game server is rate-limiting logins or the loader "
-                        "failed its self-check; the bot will close+relaunch Flash automatically when "
-                        "stalled (BOT_FLASH_EMBEDDED_IV_*). Otherwise increase BOT_UI_FLASH_LAUNCH_STAGGER_SEC "
-                        "(try 3-5s), re-run TFM_SECRETS_GAME_VERSION dump, or re-run so only failing slots retry.%s",
-                        st.label,
-                        max(0.0, deadline - time.monotonic()),
-                        st.port,
-                        extra_verbose,
-                    )
-                else:
-                    logger.info(
-                        "Still waiting slot %s (~%.0fs left): no LoginSuccess / OK line yet. "
-                        "If the log never shows 'MAIN TCP accept' for this slot, Flash is not connecting "
-                        "to 127.0.0.1:%s — open tmp/loader_patch/*_zwsflen.swf for this port (not raw "
-                        "TFMProxyLoader.swf), check firewall, or click Transformice in the loader."
-                        "%s",
-                        st.label,
-                        max(0.0, deadline - time.monotonic()),
-                        st.port,
-                        (
-                            " With PROXY_VERBOSE_LOGIN_FLOW, look for AccountError / captcha lines above."
-                            if verbose
-                            else ""
+
+                st.login_success_event.clear()
+                st.login_aborted_event.clear()
+                st.flash_main_tcp_seen = False
+                st.flash_loader_ready_event.clear()
+                logger.info(
+                    "Opening game %s/%s (slot %s); waiting up to %ss for login before next client.",
+                    idx,
+                    len(flash_accounts),
+                    st.label,
+                    login_timeout,
+                )
+                try:
+                    proc = flash_launch.launch_one_flash_loader(
+                        flash_row_cur,
+                        root=_repo_root(),
+                        click_transformice=not args.launch_flash_no_click,
+                        on_flash_pid=lambda pid, st=st: setattr(st, "flash_pid", pid),
+                        post_open_delay_sec=float(
+                            getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
                         ),
                     )
-                    # Retry the Transformice loader click in case the first one missed.
-                    if st.flash_pid and args.launch_flash_no_click is False:
-                        frac_x = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_X", 0.50))
-                        frac_y = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_Y", 0.55))
-                        logger.info(
-                            "Slot %s: retrying Transformice loader click at (%.2f, %.2f)",
-                            st.label, frac_x, frac_y,
-                        )
-                        flash_launch.click_transformice_in_loader(
-                            st.flash_pid, st.label, frac_x=frac_x, frac_y=frac_y
-                        )
-            if not got_login:
-                if st.login_aborted_event.is_set():
-                    logger.warning(
-                        "Slot %s: no LoginSuccess — MAIN closed during handshake (see WARNING above). "
-                        "Not a full %ss idle wait; continuing to next slot.",
+                finally:
+                    st.flash_loader_ready_event.set()
+                if proc is None:
+                    st.flash_pid = None
+                if (
+                    cfg_flash_auto
+                    and flash_login_trigger == "main_tcp"
+                    and st.flash_pid is not None
+                ):
+                    dm = float(getattr(cfg, "FLASH_LOGIN_AFTER_MAIN_DELAY_SEC", 1.0))
+                    logger.info(
+                        "Slot %s: FLASH auto-login on first MAIN TCP: dismiss ASAP, then %.2fs before username (FLASH_LOGIN_TRIGGER=main_tcp)",
                         st.label,
-                        login_timeout,
-                    )
-                else:
-                    logger.warning(
-                        "Slot %s: no login success within %ss — finish manually or fix loader/proxy; continuing.",
-                        st.label,
-                        login_timeout,
+                        max(0.0, dm),
                     )
                 if (
-                    bool(getattr(cfg, "FLASH_CLOSE_ON_LOGIN_FAIL", True))
-                    and st.flash_pid
-                    and flash_launch.flash_pid_is_alive(st.flash_pid)
+                    cfg_flash_auto
+                    and flash_login_trigger == "after_launch"
+                    and st.flash_pid is not None
                 ):
+                    after_launch_sec = float(getattr(cfg, "FLASH_LOGIN_AFTER_LAUNCH_SEC", 12.0))
+
+                    def _run_login_ui_later(
+                        *,
+                        _st: SlotState = st,
+                        _cfg: object = cfg,
+                        _delay: float = after_launch_sec,
+                    ) -> None:
+                        time.sleep(max(0.0, _delay))
+                        try:
+                            flash_launch.run_flash_login_ui(
+                                pid=_st.flash_pid,
+                                username=_st.flash_username,
+                                password=_st.flash_password,
+                                slot_label=_st.label,
+                                cfg=_cfg,
+                                trigger="after_launch",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Slot %s: FLASH_LOGIN_TRIGGER=after_launch login UI failed",
+                                _st.label,
+                            )
+
+                    threading.Thread(
+                        target=_run_login_ui_later,
+                        daemon=True,
+                        name=f"flash-login-ui-{st.label}",
+                    ).start()
                     logger.info(
-                        "Slot %s: closing stale Flash window PID=%s "
-                        "(BOT_FLASH_CLOSE_ON_LOGIN_FAIL=true).",
-                        st.label, st.flash_pid,
+                        "Slot %s: scheduled FLASH auto-login in %.1fs (after_launch; tune FLASH_LOGIN_AFTER_LAUNCH_SEC)",
+                        st.label,
+                        max(0.0, after_launch_sec),
                     )
-                    try:
-                        flash_launch.close_flash_window(
-                            st.flash_pid, st.label,
-                            grace_sec=float(
-                                getattr(cfg, "FLASH_CLOSE_GRACE_SEC", 2.0)
+                poll_sec = float(getattr(cfg, "FLASH_LOGIN_WAIT_POLL_SEC", 45.0))
+                poll_sec = max(10.0, min(poll_sec, 120.0))
+                deadline = time.monotonic() + login_timeout
+                # Shared cap for (1) in-SWF stalls before LoginSuccess and (2) MAIN session ended early
+                # (upstream drop / clean-eof) while Flash shows “connection interrupted” with no usable button.
+                _iv_mr = int(getattr(cfg, "FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT", 20))
+                _iv_mr = max(0, min(200, _iv_mr))
+                mid_login_flash_reloads = 0
+                embedded_iv_on = bool(getattr(cfg, "FLASH_EMBEDDED_IV_LOGIN_RELOAD", True))
+                main_drop_reload_on = bool(getattr(cfg, "FLASH_MAIN_DROP_LOGIN_RELOAD", True))
+                got_login = False
+                verbose = bool(getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", True))
+                packet_login = bool(getattr(cfg, "PACKET_AUTO_LOGIN", False))
+                if packet_login:
+                    logger.debug(
+                        "Slot %s: PACKET_AUTO_LOGIN — waiting for LoginSuccessPacket (proxy injects credentials automatically).",
+                        st.label,
+                    )
+                elif not cfg_flash_auto:
+                    logger.info(
+                        "Slot %s: manual login — type username/password and submit in Flash. "
+                        "Watch log for HandshakeResponse, LoginPacket (password redacted), "
+                        "AccountError, Captcha, ChangeSatelliteServer; OK line = LoginSuccess.",
+                        st.label,
+                    )
+                elif verbose:
+                    logger.info(
+                        "Slot %s: PROXY_VERBOSE_LOGIN_FLOW=True — extra login-phase packet lines in log.",
+                        st.label,
+                    )
+
+                # Fast early retry clicks: the initial post_open_delay click (default ~1.15s) frequently
+                # lands before the loader SWF has drawn the Transformice button, especially on later slots
+                # when earlier Flash instances are still consuming CPU. The main poll loop below only
+                # retries every FLASH_LOGIN_WAIT_POLL_SEC (default 45s, floor 10s), which is way too slow
+                # to recover. Do a few aggressive re-clicks in the first ~20s while MAIN TCP is still
+                # missing so slots without bind_ip (which can't rely on Proxifier warming the port) still
+                # reach the proxy.
+                if (
+                    st.flash_pid is not None
+                    and not args.launch_flash_no_click
+                    and not st.flash_main_tcp_seen
+                    and not st.login_success_event.is_set()
+                ):
+                    early_interval = float(
+                        getattr(cfg, "FLASH_LOADER_EARLY_RETRY_INTERVAL_SEC", 3.0)
+                    )
+                    early_retries = int(getattr(cfg, "FLASH_LOADER_EARLY_RETRY_COUNT", 5))
+                    early_interval = max(0.5, min(early_interval, 15.0))
+                    early_retries = max(0, min(early_retries, 20))
+                    frac_x_early = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_X", 0.50))
+                    frac_y_early = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_Y", 0.55))
+                    for attempt in range(1, early_retries + 1):
+                        deadline_early = time.monotonic() + early_interval
+                        while time.monotonic() < deadline_early:
+                            if (
+                                st.flash_main_tcp_seen
+                                or st.login_success_event.is_set()
+                            ):
+                                break
+                            time.sleep(0.2)
+                        if st.flash_main_tcp_seen or st.login_success_event.is_set():
+                            # MAIN TCP accept already logged the arrival; no need to repeat.
+                            logger.debug(
+                                "Slot %s: MAIN TCP observed during early retry window (before attempt %d/%d)",
+                                st.label, attempt, early_retries,
+                            )
+                            break
+                        logger.info(
+                            "Slot %s: no MAIN TCP after ~%.1fs — re-clicking Transformice "
+                            "loader [early retry %d/%d]",
+                            st.label,
+                            early_interval * attempt,
+                            attempt, early_retries,
+                        )
+                        # Dump every visible top-level window belonging to this Flash PID
+                        # — if a Flash error popup / "Restricted content" dialog appeared,
+                        # we want to see it so we know clicks need to target it, not the
+                        # main loader window. Keep the "just 1 window" case quiet since
+                        # it's the expected normal path.
+                        try:
+                            windows = flash_launch.list_flash_windows(st.flash_pid)
+                            if len(windows) != 1:
+                                logger.warning(
+                                    "Slot %s: flash_pid=%s has %d top-level window(s): %s",
+                                    st.label, st.flash_pid, len(windows),
+                                    ", ".join(
+                                        f"HWND={w['hwnd']} title={w['title']!r} "
+                                        f"size={w['width']}x{w['height']}"
+                                        for w in windows
+                                    ) or "(none)",
+                                )
+                            else:
+                                logger.debug(
+                                    "Slot %s: flash_pid=%s one window (normal) HWND=%s title=%r size=%dx%d",
+                                    st.label, st.flash_pid,
+                                    windows[0]["hwnd"], windows[0]["title"],
+                                    windows[0]["width"], windows[0]["height"],
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Slot %s: list_flash_windows raised", st.label
+                            )
+                        # Try several candidate positions on each retry: the Transformice
+                        # entry in the loader has shifted between builds (sometimes ~0.55y,
+                        # sometimes ~0.45y, sometimes lower on screens that render a cached
+                        # "Continue" button). Hammering a small cluster is far cheaper than
+                        # waiting for the 45s slow-poll retry to land on the right pixel.
+                        click_positions = [
+                            (frac_x_early, frac_y_early),
+                            (frac_x_early, 0.45),
+                            (frac_x_early, 0.65),
+                            (frac_x_early, 0.50),
+                            (frac_x_early, 0.60),
+                        ]
+                        for fx_c, fy_c in click_positions:
+                            if (
+                                st.flash_main_tcp_seen
+                                or st.login_success_event.is_set()
+                            ):
+                                break
+                            flash_launch.click_transformice_in_loader(
+                                st.flash_pid, st.label,
+                                frac_x=fx_c, frac_y=fy_c,
+                            )
+                            time.sleep(0.15)
+
+                while True:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    chunk = min(poll_sec, left)
+                    if st.login_success_event.wait(timeout=chunk):
+                        got_login = True
+                        # "OK  [slot X] logged in as …" from ban_proxy already covers this;
+                        # a second line would just double the noise.
+                        logger.debug("Slot %s reported login success; proceeding.", st.label)
+                        if bool(getattr(cfg, "FLASH_MINIMIZE_AFTER_OPEN", False)) and st.flash_pid:
+                            # FLASH_MINIMIZE_AFTER_OPEN calls minimize_flash_window, which tiles each
+                            # projector into BOT_FLASH_TILE_* on-screen (not SW_MINIMIZE / off-screen,
+                            # which throttle Flash). BOT_FLASH_DIAG_KEEP_ONSCREEN=1 skips this for diagnosis.
+                            if os.environ.get("BOT_FLASH_DIAG_KEEP_ONSCREEN", "").strip().lower() in ("1", "true", "yes"):
+                                logger.info(
+                                    "Slot %s: BOT_FLASH_DIAG_KEEP_ONSCREEN=1 — leaving Flash window visible for diagnosis",
+                                    st.label,
+                                )
+                            else:
+                                flash_launch.minimize_flash_window(st.flash_pid, st.label)
+                        break
+                    if st.login_aborted_event.is_set():
+                        logger.info(
+                            "Slot %s: MAIN session closed before LoginSuccess — "
+                            "(clean-eof during handshake is common with stagger overload or unstable links).",
+                            st.label,
+                        )
+                        if (
+                            main_drop_reload_on
+                            and _iv_mr > 0
+                            and mid_login_flash_reloads < _iv_mr
+                        ):
+                            mid_login_flash_reloads += 1
+                            logger.warning(
+                                "Slot %s: MAIN_DROP_LOGIN_RELOAD attempt=%d/%s — MAIN ended before LoginSuccess; "
+                                "closing Flash and relaunching (in-SWF “connection interrupted” / no Win32 dismiss). "
+                                "Same cap as BOT_FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT.",
+                                st.label,
+                                mid_login_flash_reloads,
+                                _iv_mr,
+                            )
+                            _embedded_iv_mid_login_relaunch_sequential(
+                                st=st,
+                                flash_row=dict(flash_row_cur),
+                                cfg=cfg,
+                                args=args,
+                                cfg_flash_auto=cfg_flash_auto,
+                                flash_login_trigger=flash_login_trigger,
+                            )
+                            deadline = time.monotonic() + login_timeout
+                            continue
+                        break
+                    if (
+                        embedded_iv_on
+                        and _iv_mr > 0
+                        and mid_login_flash_reloads < _iv_mr
+                        and st.flash_pid is not None
+                    ):
+                        need_iv, iv_tag = _should_reload_flash_embedded_iv_login(
+                            st=st,
+                            cfg=cfg,
+                            now_mono=time.monotonic(),
+                        )
+                        if need_iv:
+                            mid_login_flash_reloads += 1
+                            logger.warning(
+                                "Slot %s: EMBEDDED_IV_LOGIN_RELOAD attempt=%d/%d (%s) — closing Adobe Flash "
+                                "Player and relaunching the loader (in-SWF stall; no modal OK). Each attempt "
+                                "resets BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC countdown.",
+                                st.label,
+                                mid_login_flash_reloads,
+                                _iv_mr,
+                                iv_tag,
+                            )
+                            _embedded_iv_mid_login_relaunch_sequential(
+                                st=st,
+                                flash_row=dict(flash_row_cur),
+                                cfg=cfg,
+                                args=args,
+                                cfg_flash_auto=cfg_flash_auto,
+                                flash_login_trigger=flash_login_trigger,
+                            )
+                            deadline = time.monotonic() + login_timeout
+                            continue
+                    if st.flash_main_tcp_seen:
+                        extra_verbose = (
+                            " With PROXY_VERBOSE_LOGIN_FLOW: expect a [MAIN→srv] LoginPacket after you submit; "
+                            "if none appears, auto-login may be too early or submit missed — try "
+                            "FLASH_LOGIN_AFTER_SUBMIT_EXTRA_SEC / FLASH_LOGIN_SECOND_SUBMIT_CLICK in .env."
+                            if verbose
+                            else ""
+                        )
+                        # Specific hint for the "incorrect version" symptom: Flash has a MAIN TCP
+                        # connection to the proxy but never sent SystemInformationPacket (the
+                        # trigger for PACKET_AUTO_LOGIN). That typically means the loader SWF hit
+                        # an error BEFORE sending the handshake — most commonly a "incorrect
+                        # version" / rate-limit screen when the game server refuses rapid-fire
+                        # logins from the same public IP. Tell the user how to recover so they
+                        # don't keep staring at "Still waiting..." lines without guidance.
+                        logger.info(
+                            "Still waiting slot %s (~%.0fs left): no LoginSuccess yet. "
+                            "MAIN TCP already connected — Flash reached 127.0.0.1:%s but never sent "
+                            "SystemInformationPacket. If Flash shows 'incorrect version' or a blank "
+                            "screen here, the game server is rate-limiting logins or the loader "
+                            "failed its self-check; the bot will close+relaunch Flash automatically when "
+                            "stalled (BOT_FLASH_EMBEDDED_IV_*). Otherwise increase BOT_UI_FLASH_LAUNCH_STAGGER_SEC "
+                            "(try 3-5s), re-run TFM_SECRETS_GAME_VERSION dump, or re-run so only failing slots retry.%s",
+                            st.label,
+                            max(0.0, deadline - time.monotonic()),
+                            st.port,
+                            extra_verbose,
+                        )
+                    else:
+                        logger.info(
+                            "Still waiting slot %s (~%.0fs left): no LoginSuccess / OK line yet. "
+                            "If the log never shows 'MAIN TCP accept' for this slot, Flash is not connecting "
+                            "to 127.0.0.1:%s — open tmp/loader_patch/*_zwsflen.swf for this port (not raw "
+                            "TFMProxyLoader.swf), check firewall, or click Transformice in the loader."
+                            "%s",
+                            st.label,
+                            max(0.0, deadline - time.monotonic()),
+                            st.port,
+                            (
+                                " With PROXY_VERBOSE_LOGIN_FLOW, look for AccountError / captcha lines above."
+                                if verbose
+                                else ""
                             ),
                         )
-                    except Exception:
-                        logger.exception(
-                            "Slot %s: close_flash_window raised", st.label,
+                        # Retry the Transformice loader click in case the first one missed.
+                        if st.flash_pid and args.launch_flash_no_click is False:
+                            frac_x = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_X", 0.50))
+                            frac_y = float(getattr(cfg, "FLASH_LOADER_CLICK_FRAC_Y", 0.55))
+                            logger.info(
+                                "Slot %s: retrying Transformice loader click at (%.2f, %.2f)",
+                                st.label, frac_x, frac_y,
+                            )
+                            flash_launch.click_transformice_in_loader(
+                                st.flash_pid, st.label, frac_x=frac_x, frac_y=frac_y
+                            )
+                main_stable = got_login and (
+                    stab_sec <= 0 or _wait_sequential_upstream_stable(st, seconds=stab_sec)
+                )
+
+                if main_stable:
+                    if stab_sec > 0:
+                        logger.info(
+                            "Slot %s: MAIN remained OK for %.1fs after login — sequential advance.",
+                            st.label,
+                            stab_sec,
                         )
-                    st.flash_pid = None
-                if st.error is None:
-                    st.error = f"no login within {login_timeout}s"
+                    sequential_slot_done = True
+                    break
+
+                if got_login and stab_sec > 0:
+                    logger.warning(
+                        "Slot %s: LoginSuccess OK but MAIN did not stay UP for "
+                        "BOT_UI_SEQUENTIAL_MAIN_STABILIZE_SEC=%.1fs — relaunch this slot "
+                        "before continuing (attempt %d/%d).",
+                        st.label,
+                        stab_sec,
+                        seq_attempt,
+                        seq_slot_max_retry,
+                    )
+
+                if seq_attempt >= seq_slot_max_retry:
+                    if not got_login:
+                        if st.login_aborted_event.is_set():
+                            logger.warning(
+                                "Slot %s: no LoginSuccess — MAIN closed during handshake (see WARNING above). "
+                                "Not a full %ss idle wait; continuing to next slot.",
+                                st.label,
+                                login_timeout,
+                            )
+                        else:
+                            logger.warning(
+                                "Slot %s: no login success within %ss — finish manually or fix loader/proxy; continuing.",
+                                st.label,
+                                login_timeout,
+                            )
+                        if (
+                            bool(getattr(cfg, "FLASH_CLOSE_ON_LOGIN_FAIL", True))
+                            and st.flash_pid
+                            and flash_launch.flash_pid_is_alive(st.flash_pid)
+                        ):
+                            logger.info(
+                                "Slot %s: closing stale Flash window PID=%s "
+                                "(BOT_FLASH_CLOSE_ON_LOGIN_FAIL=true).",
+                                st.label, st.flash_pid,
+                            )
+                            try:
+                                flash_launch.close_flash_window(
+                                    st.flash_pid, st.label,
+                                    grace_sec=float(
+                                        getattr(cfg, "FLASH_CLOSE_GRACE_SEC", 2.0)
+                                    ),
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Slot %s: close_flash_window raised", st.label,
+                                )
+                            st.flash_pid = None
+                        if st.error is None:
+                            st.error = f"no login within {login_timeout}s"
+                    else:
+                        logger.warning(
+                            "Slot %s: exhausted BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY=%d "
+                            "— MAIN still unstable after LoginSuccess.",
+                            st.label,
+                            seq_slot_max_retry,
+                        )
+                        if (
+                            bool(getattr(cfg, "FLASH_CLOSE_ON_LOGIN_FAIL", True))
+                            and st.flash_pid
+                            and flash_launch.flash_pid_is_alive(st.flash_pid)
+                        ):
+                            logger.info(
+                                "Slot %s: closing stale Flash window PID=%s "
+                                "(post-stabilize failure; BOT_FLASH_CLOSE_ON_LOGIN_FAIL=true).",
+                                st.label, st.flash_pid,
+                            )
+                            try:
+                                flash_launch.close_flash_window(
+                                    st.flash_pid, st.label,
+                                    grace_sec=float(
+                                        getattr(cfg, "FLASH_CLOSE_GRACE_SEC", 2.0)
+                                    ),
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Slot %s: close_flash_window raised", st.label,
+                                )
+                            st.flash_pid = None
+
+                    break
+
             time.sleep(max(0.0, stagger_after))
     _wait_for_game_clients(states, auto_flash_launched=auto_flash)
 

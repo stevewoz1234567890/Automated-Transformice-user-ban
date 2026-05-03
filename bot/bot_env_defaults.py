@@ -163,6 +163,12 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_UI_FLASH_LAUNCH_STAGGER_SEC": "3.5",
     "BOT_UI_SEQUENTIAL_LOGIN": "false",
     "BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC": "120",
+    # After LoginSuccess, hold until MAIN stays OK this long before opening the next Flash (0 = off).
+    # Failed slot: close + relaunch same index up to BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY before advancing.
+    "BOT_UI_SEQUENTIAL_MAIN_STABILIZE_SEC": "5",
+    "BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY": "24",
+    # Pause between sequential slot relaunches (empty = reuse BOT_FLASH_EMBEDDED_IV_RELOAD_PAUSE_SEC in code).
+    "BOT_UI_SEQUENTIAL_RETRY_PAUSE_SEC": "",
     "BOT_FLASH_AUTO_LOGIN_UI": "false",
     # Before Flash session: tfm-secrets / leaker (if BOT_HEADLESS_SECRETS_ALWAYS_REFRESH) + optional TFMProxyLoader.swf fetch.
     "BOT_FLASH_STARTUP_REFRESH_TFM_ASSETS": "true",

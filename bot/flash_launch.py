@@ -1126,6 +1126,20 @@ def launch_one_flash_loader(
                     "Slot %s: Flash HWND=%s — clicked Transformice button at (%.2f, %.2f) +%.2fs after launch",
                     label, hwnd, fx, fy, click_dt,
                 )
+                _raw_tile = (os.environ.get("BOT_FLASH_TILE_AFTER_LOADER_CLICK") or "").strip().lower()
+                if _raw_tile not in ("0", "false", "no", "off"):
+                    try:
+                        if minimize_flash_window(p.pid, label or "?"):
+                            logger.debug(
+                                "Slot %s: BOT_FLASH_TILE_AFTER_LOADER_CLICK tiled projector after loader click.",
+                                label or "?",
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Slot %s: post-loader-click tile skipped",
+                            label or "?",
+                            exc_info=True,
+                        )
             else:
                 logger.warning(
                     "Slot %s: Flash HWND=%s — loader click FAILED; click Transformice manually.",
