@@ -14,6 +14,7 @@ the local proxy ports we already patch.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import lzma
 import os
@@ -25,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 # (resolved_path, mtime, size) -> sha256 hex digest prefix; avoids re-hashing the same file per slot.
 _source_swf_digest_cache: dict[tuple[str, float, int], str] = {}
+
+# Purge legacy patch caches at most once per resolved cache_dir per process (14 slots → 1 scan).
+_legacy_loader_patch_purged: set[str] = set()
 
 _ORIG_MAIN = b"localhost:11801"
 _ORIG_POLICY = b"xmlsocket://localhost:10801"
@@ -99,12 +103,41 @@ def _policy_url_bytes(host: str) -> bytes:
     return s.encode("ascii")
 
 
-def resolve_upstream_ipv4_literal_for_patch() -> str:
+def _server_address_from_tfm_secrets_json(repo_root: Path) -> str:
+    """Read ``server_address`` from repo-root ``tfm-secrets.json`` (same shape as leaker/export)."""
+    path = repo_root / "tfm-secrets.json"
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    sv = data.get("server_address")
+    if not isinstance(sv, str):
+        return ""
+    h = sv.strip()
+    if h and h.lower() not in ("127.0.0.1", "localhost"):
+        return h
+    return ""
+
+
+def resolve_upstream_ipv4_literal_for_patch(*, repo_root_hint: Path | None = None) -> str:
     """Host from secrets/upstream sync (plaintext IPv4 literals only — used for loader neutralization)."""
     for key in ("TFM_SECRETS_SERVER_ADDRESS", "BOT_UPSTREAM_SERVER_ADDRESS"):
         raw = (os.environ.get(key) or "").strip()
         if raw and raw.lower() not in ("127.0.0.1", "localhost"):
             return raw
+    # Some entrypoints merge ``tfm-secrets.json`` after first env read; still neutralize from JSON on disk.
+    if repo_root_hint is not None:
+        from_json = _server_address_from_tfm_secrets_json(repo_root_hint)
+        if from_json:
+            logger.debug(
+                "Loader patch: using upstream IPv4 %r from tfm-secrets.json (env had no TFM/BOT address yet)",
+                from_json,
+            )
+            return from_json
     return ""
 
 
@@ -351,6 +384,10 @@ def purge_all_patched_loader_swfs(repo_root: Path) -> int:
             cache_dir,
         )
         invalidate_source_swf_digest_cache()
+    try:
+        _legacy_loader_patch_purged.discard(str(cache_dir.resolve()))
+    except OSError:
+        _legacy_loader_patch_purged.discard(str(cache_dir))
     return removed
 
 
@@ -367,9 +404,24 @@ def build_patched_loader_swf(
     """
     h9 = nine_char_connect_host(connect_host)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    # Drop legacy ``…_<port>_<16hex>_zwsflen2.swf`` names before cache lookup so mixed upgraded trees
+    # never reuse loaders built without upstream literal neutralization (Flash #2048 / PARTL).
+    raw_purge = (os.environ.get("BOT_PURGE_LEGACY_LOADER_PATCH_CACHE") or "true").strip().lower()
+    if raw_purge not in ("0", "false", "no", "off"):
+        try:
+            key = str(cache_dir.resolve())
+        except OSError:
+            key = str(cache_dir)
+        if key not in _legacy_loader_patch_purged:
+            purge_legacy_loader_patch_cache(cache_dir)
+            _legacy_loader_patch_purged.add(key)
+
     safe_host = h9.replace(":", "_").replace("/", "_")
     src_tag = _source_swf_cache_tag(source_zws)
-    up_lit = resolve_upstream_ipv4_literal_for_patch()
+    repo_root_hint: Path | None = None
+    if cache_dir.name == "loader_patch" and cache_dir.parent.name == "tmp":
+        repo_root_hint = cache_dir.parent.parent.resolve()
+    up_lit = resolve_upstream_ipv4_literal_for_patch(repo_root_hint=repo_root_hint)
     up_slug = _upstream_cache_slug(upstream_for_neutralization=up_lit if up_lit else "127.0.0.1")
     # Bump suffix so caches built with older patchers are ignored. Previous suffix "_zwsflen"
     # left the ZWS CompressedLength field stale, which broke SWFs whose re-compressed body was
