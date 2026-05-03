@@ -11,7 +11,8 @@ Grep defaults (always on unless disabled)::
     issue1_near_as_dismiss=   dismiss_tail=
     ISSUE1_DISMISS_CUE=       ISSUE1_AS_DISMISS_ACTION
     ISSUE1_HANDSHAKE_GV_MISMATCH                   HandshakePacket.game_version ≠ TFM_SECRETS_GAME_VERSION
-    ISSUE1_LOADER_PREFLIGHT                        weak SWF version markers at startup scan (CONTEXT on AS dupes too)
+    ISSUE1_HANDSHAKE_PROBE                        per MAIN TCP: Flash gv vs ``TFM_SECRETS_GAME_VERSION`` (default on)
+    ISSUE1_LOADER_PREFLIGHT                        weak SWF version markers (+ sha16 of on-disk loader when known)
 
 Set ``BOT_ISSUE1_SWEEP_BOUNDARY_LOG=0`` to hide sweep boundary markers.
 Tune ``BOT_ISSUE1_AS_MAIN_CORR_WINDOW_SEC`` (seconds) for MAIN-vs-dismiss proximity on diagnostics.

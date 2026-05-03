@@ -9,6 +9,7 @@ optional strict failure when embedded hints contradict the configured version.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -176,6 +177,7 @@ def issue1_alignment_log_fragment(summary: dict[str, object] | None) -> str | No
     hints = summary.get("url_style_version_hints") or ()
     literal = summary.get("literal_version_bytes_in_swf_payload") is True
     mismatch = summary.get("url_hints_strict_mismatch_vs_config") is True
+    sha16 = (summary.get("loader_sha256_16_prefix") or "").strip()
     tag = []
     if mismatch:
         tag.append("URL_HINTS_CONTRADICT_ENVGV")
@@ -185,10 +187,10 @@ def issue1_alignment_log_fragment(summary: dict[str, object] | None) -> str | No
         tag.append("LITERAL_BYTES_OK")
     if hints:
         tag.append(f"hints={tuple(hints)!r}".replace(" ", ""))
-    return "ISSUE1_LOADER_PREFLIGHT=cfg_gv_%s|%s" % (
-        gv_s,
-        ",".join(tag) if tag else "UNVERIFIED",
-    )
+    mid = ",".join(tag) if tag else "UNVERIFIED"
+    if sha16:
+        mid = f"sha16={sha16}|{mid}"
+    return "ISSUE1_LOADER_PREFLIGHT=cfg_gv_%s|%s" % (gv_s, mid)
 
 
 def _config_game_version_int(raw: str) -> int | None:
@@ -247,8 +249,10 @@ def log_client_asset_alignment(repo_root: Path) -> None:
         }
         return
 
+    sha16_prefix = ""
     try:
         raw = swf.read_bytes()
+        sha16_prefix = hashlib.sha256(raw).hexdigest()[:16]
     except OSError as e:
         logger.error("Client/asset alignment: cannot read %s (%s)", swf, e)
         lines_md.append(f"- **scan**: read error `{e}`\n\n")
@@ -258,6 +262,7 @@ def log_client_asset_alignment(repo_root: Path) -> None:
             "read_error": str(e),
             "swf_path": str(swf),
             "tfm_secrets_game_version": gv_raw or None,
+            "loader_sha256_16_prefix": "",
         }
         return
 
@@ -316,6 +321,7 @@ def log_client_asset_alignment(repo_root: Path) -> None:
         "loader_version_embedding_verifiable": embedding_verifiable,
         "scanner_tag": tag,
         "payload_bytes": len(body),
+        "loader_sha256_16_prefix": sha16_prefix,
     }
 
     if mismatch_url:

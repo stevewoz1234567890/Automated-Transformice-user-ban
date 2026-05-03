@@ -3,6 +3,12 @@ Patch tfm-proxy-loader ZWS SWF so the game connects to ``host:port`` instead of 
 
 Upstream ignores ``loaderInfo.parameters``; the connection string lives in the LZMA-compressed body as
 plain ASCII. We decompress, replace fixed-width strings, and recompress with the same LZMA settings.
+
+Some loader builds also embed ``TFM_SECRETS_SERVER_ADDRESS`` (plain IPv4) elsewhere in the bytecode.
+When Flash runs the patched SWF from ``file://``, those literals can trigger **Error #2048** (security
+sandbox: local SWF cannot ``load`` / open socket to bare game IP). Replacing those host bytes with a
+**same-length** ``127.0.0.1`` + ASCII space padding keeps structs stable while forcing traffic through
+the local proxy ports we already patch.
 """
 
 from __future__ import annotations
@@ -87,7 +93,119 @@ def _policy_url_bytes(host: str) -> bytes:
     return s.encode("ascii")
 
 
-def patch_loader_body(body: bytes, *, port: int, connect_host: str = "127.0.0.1") -> bytes:
+def resolve_upstream_ipv4_literal_for_patch() -> str:
+    """Host from secrets/upstream sync (plaintext IPv4 literals only — used for loader neutralization)."""
+    for key in ("TFM_SECRETS_SERVER_ADDRESS", "BOT_UPSTREAM_SERVER_ADDRESS"):
+        raw = (os.environ.get(key) or "").strip()
+        if raw and raw.lower() not in ("127.0.0.1", "localhost"):
+            return raw
+    return ""
+
+
+def _upstream_neutralization_enabled() -> bool:
+    v = (os.environ.get("BOT_LOADER_NEUTRALIZE_UPSTREAM_IP_LITERALS") or "true").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _is_plausible_ascii_ipv4_dotted_quad(s: str) -> bool:
+    if not s or len(s) < 7 or len(s) > 15:
+        return False
+    if any(ord(ch) > 127 for ch in s):
+        return False
+    parts = s.split(".")
+    if len(parts) != 4:
+        return False
+    for p in parts:
+        if not p.isdigit() or len(p) > 3:
+            return False
+        try:
+            n = int(p, 10)
+        except ValueError:
+            return False
+        if n > 255:
+            return False
+    return True
+
+
+def nine_char_connect_host(connect_host: str) -> str:
+    """SWF string slot is 15 bytes ``host:ppppp`` with ``host`` exactly 9 ASCII chars."""
+    h = connect_host.strip()
+    if len(h) == 9 and h.isascii():
+        return h
+    return "127.0.0.1"
+
+
+def _padded_ipv4_placeholder(target_len: int) -> bytes:
+    """Replace longer upstream IPv4 literals with ``127.0.0.1`` + trailing ASCII spaces."""
+    logical = nine_char_connect_host("127.0.0.1").encode("ascii")
+    if target_len < len(logical):
+        raise ValueError(f"padded_ipv4_placeholder: slot {target_len} < {len(logical)}")
+    return logical + b" " * (target_len - len(logical))
+
+
+def neutralize_upstream_ip_literals(body: bytes, *, upstream_host: str) -> tuple[bytes, int]:
+    """
+    Replace plaintext ``upstream_host`` (IPv4 quad) wherever it sits before ``:PORT`` / NUL-delimited
+    string so Flash stops opening ``file:// → bare game IP`` paths that violate the local sandbox (#2048).
+    """
+    h = upstream_host.strip()
+    if not h or h in ("127.0.0.1", "::1"):
+        return body, 0
+    if not _is_plausible_ascii_ipv4_dotted_quad(h):
+        return body, 0
+    needle = h.encode("ascii")
+    rp = _padded_ipv4_placeholder(len(needle))
+    mv = bytearray(body)
+    n_repl = 0
+    i = 0
+    digits = frozenset(ord(x) for x in "0123456789")
+
+    while True:
+        idx = mv.find(needle, i)
+        if idx < 0:
+            break
+        tail = idx + len(needle)
+        if idx > 0 and mv[idx - 1] in digits:
+            i = idx + 1
+            continue
+        if tail >= len(mv):
+            i = idx + 1
+            continue
+        nxt = mv[tail]
+        ok = False
+        if nxt == ord(":"):
+            pi = tail + 1
+            port_digits = 0
+            while pi < len(mv) and 48 <= mv[pi] <= 57:
+                port_digits += 1
+                pi += 1
+            if 1 <= port_digits <= 5 and tail + 1 + port_digits <= len(mv):
+                try:
+                    pval = int(mv[tail + 1 : tail + 1 + port_digits].decode("ascii"))
+                except ValueError:
+                    pval = -1
+                if 1 <= pval <= 65535:
+                    ok = True
+        elif nxt == 0:
+            ok = True
+        elif nxt in (ord("/"), ord("?"), ord("#"), ord("\\")):
+            ok = True
+        if ok:
+            mv[idx:tail] = rp
+            n_repl += 1
+            i = tail + 1
+        else:
+            i = idx + 1
+    return bytes(mv), n_repl
+
+
+def patch_loader_body(
+    body: bytes,
+    *,
+    port: int,
+    connect_host: str = "127.0.0.1",
+    upstream_server_address: str | None = None,
+) -> bytes:
     main = _main_connect_bytes(connect_host, port)
     pol = _policy_url_bytes(connect_host)
     if body.count(_ORIG_MAIN) != 1:
@@ -100,15 +218,26 @@ def patch_loader_body(body: bytes, *, port: int, connect_host: str = "127.0.0.1"
         )
     body = body.replace(_ORIG_MAIN, main, 1)
     body = body.replace(_ORIG_POLICY, pol, 1)
+    ua = (upstream_server_address or "").strip()
+    if ua and _upstream_neutralization_enabled():
+        body, n_lit = neutralize_upstream_ip_literals(body, upstream_host=ua)
+        if n_lit > 0:
+            logger.info(
+                "SWF bytecode: neutralized %d plaintext %r literal(s) → padded 127.0.0.1 "
+                "(Fixes Flash #2048 sandbox: file:// patched loader touching bare upstream IP)",
+                n_lit,
+                ua,
+            )
     return body
 
 
-def nine_char_connect_host(connect_host: str) -> str:
-    """SWF string slot is 15 bytes ``host:ppppp`` with ``host`` exactly 9 ASCII chars."""
-    h = connect_host.strip()
-    if len(h) == 9 and h.isascii():
-        return h
-    return "127.0.0.1"
+def _upstream_cache_slug(*, upstream_for_neutralization: str) -> str:
+    """Stable short token so patched loaders rebuild when upstream IP/neutralization changes."""
+    stem = upstream_for_neutralization.strip().lower()
+    suffix = "|1" if _upstream_neutralization_enabled() else "|0"
+    if not stem or stem == "127.0.0.1":
+        return hashlib.sha256(("(none)|" + suffix).encode()).hexdigest()[:8]
+    return hashlib.sha256((stem + suffix).encode()).hexdigest()[:8]
 
 
 def _source_swf_cache_tag(source_zws: Path) -> str:
@@ -232,11 +361,14 @@ def build_patched_loader_swf(
     cache_dir.mkdir(parents=True, exist_ok=True)
     safe_host = h9.replace(":", "_").replace("/", "_")
     src_tag = _source_swf_cache_tag(source_zws)
+    up_lit = resolve_upstream_ipv4_literal_for_patch()
+    up_slug = _upstream_cache_slug(upstream_for_neutralization=up_lit if up_lit else "127.0.0.1")
     # Bump suffix so caches built with older patchers are ignored. Previous suffix "_zwsflen"
     # left the ZWS CompressedLength field stale, which broke SWFs whose re-compressed body was
     # shorter than the original compressed stream (Flash would silently show a blank window).
     # ``src_tag`` ties the cache entry to the **current** loader bytes (see ``_source_swf_cache_tag``).
-    out = cache_dir / f"TFMProxyLoader_patched_{safe_host}_{port}_{src_tag}_zwsflen2.swf"
+    # ``up_slug`` forces rebuild when TFM upstream IP literals / neutralization flag change.
+    out = cache_dir / f"TFMProxyLoader_patched_{safe_host}_{port}_{up_slug}_{src_tag}_zwsflen2.swf"
     if out.is_file() and out.stat().st_size > 0:
         logger.debug("Using cached patched loader port %s -> %s", port, out)
         return out
@@ -246,7 +378,12 @@ def build_patched_loader_swf(
         raise ValueError(f"Expected ZWS SWF, got signature {raw[:3]!r}")
 
     body = decompress_zws_body(raw)
-    body = patch_loader_body(body, port=port, connect_host=h9)
+    body = patch_loader_body(
+        body,
+        port=port,
+        connect_host=h9,
+        upstream_server_address=up_lit,
+    )
     patched = recompress_zws_body(raw, body)
 
     # Round-trip check
@@ -254,6 +391,17 @@ def build_patched_loader_swf(
         check = decompress_zws_body(patched)
         if _main_connect_bytes(h9, port) not in check:
             raise ValueError("round-trip verification failed (main string missing)")
+        if (
+            up_lit
+            and _upstream_neutralization_enabled()
+            and _is_plausible_ascii_ipv4_dotted_quad(up_lit)
+            and up_lit.encode("ascii") in check
+        ):
+            logger.warning(
+                "Patched loader LZMA body still contains plaintext upstream %r — "
+                "neutralize may have missed fragmented literals; Flash #2048 risk if file:// hits bare IP.",
+                up_lit,
+            )
     except Exception as e:
         raise ValueError(f"Patched SWF verification failed: {e}") from e
 

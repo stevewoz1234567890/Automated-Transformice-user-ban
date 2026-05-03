@@ -2893,10 +2893,11 @@ def main(argv: list[str] | None = None) -> None:
                 if _rc_deep:
                     _tags.append("BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE")
                 logger.info(
-                    "Deep MAIN teardown logging [%s] — grep ISSUE1_HANDSHAKE / ISSUE1_MAIN_CLOSE / "
-                    "ISSUE1_AS_FIRST_FP / ROOT_CAUSE_MAIN_CLOSE / ISSUE1_DISMISS_CUE / "
+                    "Deep MAIN teardown logging [%s] — grep ISSUE1_HANDSHAKE_PROBE / ISSUE1_HANDSHAKE_GV_MISMATCH / "
+                    "ISSUE1_MAIN_CLOSE / ISSUE1_AS_FIRST_FP / ROOT_CAUSE_MAIN_CLOSE / ISSUE1_DISMISS_CUE / "
                     "ISSUE1_PRIMARY_SUSPECT / ISSUE1_AS_DISMISS_ACTION. With BOT_ISSUE1_FORENSIC, rings and AS "
                     "previews widen automatically; BOT_ISSUE1_AS_DISMISS_LOG defaults on (set false to quiet). "
+                    "ISSUE1_HANDSHAKE_PROBE defaults on — set BOT_ISSUE1_HANDSHAKE_PROBE=false for quieter logs. "
                     "Optional: BOT_PROXY_LOG_ALL_MAIN_PACKETS=true.",
                     "+".join(_tags),
                 )

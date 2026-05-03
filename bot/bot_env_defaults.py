@@ -180,6 +180,9 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_TFM_PROXY_LOADER_DOWNLOAD_URL": "",
     "BOT_TFM_PROXY_LOADER_GITHUB_REPO": "friedkeenan/tfm-proxy-loader",
     "BOT_TFM_PROXY_LOADER_ASSET_NAME": "TFMProxyLoader.swf",
+    # Rewrite plaintext game-server IPv4 in the patched loader LZMA body to space-padded 127.0.0.1
+    # (stops Flash #2048 sandbox: file:// patched SWF touching bare TFM_UPSTREAM_IP:port literals).
+    "BOT_LOADER_NEUTRALIZE_UPSTREAM_IP_LITERALS": "true",
     # After replacing TFMProxyLoader.swf: delete tmp/loader_patch/*.swf so Flash repatches from new source bytes.
     "BOT_PURGE_ALL_LOADER_PATCH_CACHE_ON_LOADER_INSTALL": "true",
     "FLASH_MINIMIZE_AFTER_OPEN": "true",
@@ -215,6 +218,8 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_ISSUE1_AS_DISMISS_LOG": "false",
     # Sweep markers ISSUE1_SWEEP_BEGIN / ISSUE1_SWEEP_END (set false to hide).
     "BOT_ISSUE1_SWEEP_BOUNDARY_LOG": "true",
+    # Per MAIN TCP: INFO ISSUE1_HANDSHAKE_PROBE compares HandshakePacket.game_version vs TFM_SECRETS_GAME_VERSION (set false to quiet).
+    "BOT_ISSUE1_HANDSHAKE_PROBE": "true",
     # Deep clean-eof hunt: WARNING ROOT_CAUSE_MAIN_CLOSE on every MAIN end (Flash TCP, rings, AS-dismiss delta).
     "BOT_PROXY_ROOT_CAUSE_MAIN_CLOSE": "false",
     # Last N packet labels per direction on MAIN (raise during ROOT_CAUSE runs; default 8).

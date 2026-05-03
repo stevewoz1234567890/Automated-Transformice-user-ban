@@ -109,6 +109,15 @@ def ensure_flash_trust_config() -> tuple[Path, list[str]] | None:
         seen.add(bot_root)
         trusted.append(bot_root)
 
+    loader_patch_dir = (bot_root / "tmp" / "loader_patch").resolve()
+    try:
+        loader_patch_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    if loader_patch_dir not in seen:
+        seen.add(loader_patch_dir)
+        trusted.append(loader_patch_dir)
+
     lines: list[str] = []
     if cfg_path.is_file():
         try:
@@ -279,6 +288,12 @@ def _proxy_heartbeat_log_every() -> int:
 
 def _env_truthy(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _issue1_handshake_probe_enabled() -> bool:
+    """One INFO line per MAIN TCP (anchor ``ISSUE1_HANDSHAKE_PROBE``). Off if env is falsey-off."""
+    v = (os.environ.get("BOT_ISSUE1_HANDSHAKE_PROBE") or "").strip().lower()
+    return v not in ("0", "false", "no", "off")
 
 
 def _main_packet_ring_limit() -> int:
@@ -522,6 +537,7 @@ class BanBotProxy(Proxy):
         self._issue1_last_handshake_gv: str | None = None
         self._issue1_last_handshake_lss: object | None = None
         self._issue1_warned_hs_gv_mismatch_tcp_gen: int = -999_999
+        self._issue1_logged_handshake_probe_tcp_gen: int = -999_999
         # Last close summary for slot-status / grep (set in new_main_connection finally).
         self._main_last_close_diag: str | None = None
         # Cumulative (optional): last join seen on this proxy process.
@@ -956,15 +972,15 @@ class BanBotProxy(Proxy):
             self._issue1_last_handshake_gv = None if gv is None else str(gv)
             self._issue1_last_handshake_lss = getattr(packet, "loader_stage_size", None)
             env_gvs = (os.environ.get("TFM_SECRETS_GAME_VERSION") or "").strip()
+            tcpg_hs = getattr(self, "_main_tcp_generation", -1)
+            ok_match_hs: bool | None = None
             if env_gvs and gv is not None:
-                ok_match = False
                 try:
                     fv = int(str(gv).strip(), 0)
-                    ok_match = fv == int(env_gvs, 0)
+                    ok_match_hs = fv == int(env_gvs, 0)
                 except ValueError:
-                    ok_match = str(gv).strip() == env_gvs
-                tcpg_hs = getattr(self, "_main_tcp_generation", -1)
-                if not ok_match and tcpg_hs != self._issue1_warned_hs_gv_mismatch_tcp_gen:
+                    ok_match_hs = str(gv).strip() == env_gvs
+                if not ok_match_hs and tcpg_hs != self._issue1_warned_hs_gv_mismatch_tcp_gen:
                     logger.warning(
                         "ISSUE1_HANDSHAKE_GV_MISMATCH slot=%s main_tcp#=%s TFM_SECRETS_GAME_VERSION=%r "
                         "HandshakePacket.game_version=%r loader_stage_size=%s "
@@ -977,6 +993,25 @@ class BanBotProxy(Proxy):
                         getattr(packet, "loader_stage_size", None),
                     )
                     self._issue1_warned_hs_gv_mismatch_tcp_gen = tcpg_hs
+            if (
+                _issue1_handshake_probe_enabled()
+                and tcpg_hs != getattr(self, "_issue1_logged_handshake_probe_tcp_gen", -999_999)
+            ):
+                self._issue1_logged_handshake_probe_tcp_gen = tcpg_hs
+                if ok_match_hs is None:
+                    match_s = "n/a"
+                else:
+                    match_s = "yes" if ok_match_hs else "no"
+                logger.info(
+                    "ISSUE1_HANDSHAKE_PROBE slot=%s main_tcp#=%s HandshakePacket.game_version=%r "
+                    "TFM_SECRETS_GAME_VERSION=%r match=%s loader_stage_size=%s",
+                    self.slot_label,
+                    tcpg_hs,
+                    gv,
+                    env_gvs or None,
+                    match_s,
+                    getattr(packet, "loader_stage_size", None),
+                )
             try:
                 from .issue1_forensic import maybe_warn_handshake_mismatch
 
@@ -1401,6 +1436,14 @@ class BanBotProxy(Proxy):
         except Exception:
             pass
 
+        joined = "|".join(parts)
+        if (
+            close_reason == "clean-eof"
+            and "ISSUE1_PRIMARY_SUSPECT=" not in joined
+            and "pattern=ChangeSat_" in joined
+            and "_after_JoinRoom" in joined
+        ):
+            parts.append("ISSUE1_PRIMARY_SUSPECT=SAT_REDIRECT_NEAR_MAIN_EOF")
         return " | ".join(parts)
 
     async def new_main_connection(self, client_reader, client_writer):
