@@ -1148,6 +1148,9 @@ def _reset_slot_state_for_retry(st: SlotState) -> None:
                 proxy._handshake_auth_token = None
                 proxy._main_handshake_mono = None
                 proxy._first_main_hook_done = False
+                proxy._main_sess_accept_mono = None
+                proxy._main_sess_handshake_mono = None
+                proxy._main_sess_sysinfo_mono = None
             except Exception:
                 pass
     # Session-level fields populated by ``new_main_connection``'s finally
@@ -1169,6 +1172,9 @@ def _reset_slot_state_for_retry(st: SlotState) -> None:
         proxy._auto_pong_sent_main = 0
         proxy._auto_pong_sent_satellite = 0
         proxy._keepalive_sent_main = 0
+        proxy._main_sess_accept_mono = None
+        proxy._main_sess_handshake_mono = None
+        proxy._main_sess_sysinfo_mono = None
         # ``_main_keepalive_started`` is sticky — once set, ``_start_main_keepalive``
         # short-circuits even if the previous keepalive task exited (its
         # ``_main_keepalive_loop`` returns when MAIN upstream is gone). Clear
@@ -1178,6 +1184,130 @@ def _reset_slot_state_for_retry(st: SlotState) -> None:
         proxy._main_keepalive_task = None
     except Exception:
         logger.debug("Slot %s: proxy state reset hit unexpected attr", st.label, exc_info=True)
+
+
+def _should_reload_flash_embedded_iv_login(
+    *,
+    st: SlotState,
+    cfg: object,
+    now_mono: float,
+) -> tuple[bool, str]:
+    """Heuristic reload when the loader SWF is stuck (e.g. in-SWF incorrect-version banner)."""
+
+    if not bool(getattr(cfg, "FLASH_EMBEDDED_IV_LOGIN_RELOAD", True)):
+        return False, "disabled_cfg"
+    px = st.proxy
+    if (
+        px is None
+        or not st.flash_pid
+        or not st.flash_main_tcp_seen
+        or st.login_success_event.is_set()
+        or st.login_aborted_event.is_set()
+    ):
+        return False, "precheck"
+    try:
+        if not flash_launch.flash_pid_is_alive(st.flash_pid):
+            return False, "flash_dead"
+    except Exception:
+        return False, "flash_liveness_exc"
+    if getattr(px, "_packet_login_sent", False):
+        return False, "LoginPacket_already_sent_upstream"
+
+    hs_mon = getattr(px, "_main_sess_handshake_mono", None)
+    si_mon = getattr(px, "_main_sess_sysinfo_mono", None)
+    acc_mon = getattr(px, "_main_sess_accept_mono", None)
+
+    aft_hs = float(getattr(cfg, "FLASH_EMBEDDED_IV_AFTER_HANDSHAKE_SEC", 38.0))
+    aft_ma = float(getattr(cfg, "FLASH_EMBEDDED_IV_AFTER_MAIN_TCP_SEC", 72.0))
+    aft_hs = max(5.0, min(240.0, aft_hs))
+    aft_ma = max(10.0, min(300.0, aft_ma))
+
+    if hs_mon is not None and si_mon is None and (now_mono - hs_mon) >= aft_hs:
+        return True, "no_SystemInformation_after_Handshake"
+    if acc_mon is not None and hs_mon is None and (now_mono - acc_mon) >= aft_ma:
+        return True, "no_Handshake_after_MAIN_accept"
+
+    return False, "not_stuck"
+
+
+def _embedded_iv_mid_login_relaunch_sequential(
+    *,
+    st: SlotState,
+    flash_row: dict[str, object],
+    cfg: object,
+    args: object,
+    cfg_flash_auto: bool,
+    flash_login_trigger: str,
+) -> None:
+    pause = float(getattr(cfg, "FLASH_EMBEDDED_IV_RELOAD_PAUSE_SEC", 1.25))
+    pause = max(0.0, pause)
+    _close_flash_for_slot_retry(st, cfg)
+    _reset_slot_state_for_retry(st)
+    if pause > 0:
+        time.sleep(pause)
+
+    st.flash_loader_ready_event.clear()
+    try:
+        proc = flash_launch.launch_one_flash_loader(
+            flash_row,
+            root=_repo_root(),
+            click_transformice=not args.launch_flash_no_click,
+            on_flash_pid=lambda pid, _st=st: setattr(_st, "flash_pid", pid),
+            post_open_delay_sec=float(
+                getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
+            ),
+        )
+    finally:
+        st.flash_loader_ready_event.set()
+    if proc is None:
+        st.flash_pid = None
+
+    if (
+        cfg_flash_auto
+        and flash_login_trigger == "main_tcp"
+        and st.flash_pid is not None
+    ):
+        dm = float(getattr(cfg, "FLASH_LOGIN_AFTER_MAIN_DELAY_SEC", 1.0))
+        logger.info(
+            "Slot %s: EMBEDDED_IV_LOGIN_RELOAD relaunch OK — FLASH_LOGIN_TRIGGER=main_tcp "
+            "(FLASH_LOGIN_AFTER_MAIN_DELAY_SEC %.2fs)",
+            st.label,
+            max(0.0, dm),
+        )
+    elif (
+        cfg_flash_auto
+        and flash_login_trigger == "after_launch"
+        and st.flash_pid is not None
+    ):
+        after_launch_sec = float(getattr(cfg, "FLASH_LOGIN_AFTER_LAUNCH_SEC", 12.0))
+
+        def _run_login_ui_later_mid(
+            *,
+            _st: SlotState = st,
+            _cfg: object = cfg,
+            _delay: float = after_launch_sec,
+        ) -> None:
+            time.sleep(max(0.0, _delay))
+            try:
+                flash_launch.run_flash_login_ui(
+                    pid=_st.flash_pid,
+                    username=_st.flash_username,
+                    password=_st.flash_password,
+                    slot_label=_st.label,
+                    cfg=_cfg,
+                    trigger="after_launch",
+                )
+            except Exception:
+                logger.exception(
+                    "Slot %s: FLASH_LOGIN_TRIGGER=after_launch login UI failed (post-IV reload)",
+                    _st.label,
+                )
+
+        threading.Thread(
+            target=_run_login_ui_later_mid,
+            daemon=True,
+            name=f"flash-login-ui-iv-{st.label}",
+        ).start()
 
 
 def _close_flash_for_slot_retry(st: SlotState, cfg: object) -> None:
@@ -3071,6 +3201,10 @@ def main(argv: list[str] | None = None) -> None:
             poll_sec = float(getattr(cfg, "FLASH_LOGIN_WAIT_POLL_SEC", 45.0))
             poll_sec = max(10.0, min(poll_sec, 120.0))
             deadline = time.monotonic() + login_timeout
+            _iv_mr = int(getattr(cfg, "FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT", 20))
+            _iv_mr = max(0, min(200, _iv_mr))
+            embedded_iv_reload_attempts = 0
+            embedded_iv_on = bool(getattr(cfg, "FLASH_EMBEDDED_IV_LOGIN_RELOAD", True))
             got_login = False
             verbose = bool(getattr(cfg, "PROXY_VERBOSE_LOGIN_FLOW", True))
             packet_login = bool(getattr(cfg, "PACKET_AUTO_LOGIN", False))
@@ -3219,6 +3353,38 @@ def main(argv: list[str] | None = None) -> None:
                         st.label,
                     )
                     break
+                if (
+                    embedded_iv_on
+                    and _iv_mr > 0
+                    and embedded_iv_reload_attempts < _iv_mr
+                    and st.flash_pid is not None
+                ):
+                    need_iv, iv_tag = _should_reload_flash_embedded_iv_login(
+                        st=st,
+                        cfg=cfg,
+                        now_mono=time.monotonic(),
+                    )
+                    if need_iv:
+                        embedded_iv_reload_attempts += 1
+                        logger.warning(
+                            "Slot %s: EMBEDDED_IV_LOGIN_RELOAD attempt=%d/%d (%s) — closing Adobe Flash "
+                            "Player and relaunching the loader (in-SWF stall; no modal OK). Each attempt "
+                            "resets BOT_UI_SEQUENTIAL_LOGIN_TIMEOUT_SEC countdown.",
+                            st.label,
+                            embedded_iv_reload_attempts,
+                            _iv_mr,
+                            iv_tag,
+                        )
+                        _embedded_iv_mid_login_relaunch_sequential(
+                            st=st,
+                            flash_row=dict(flash_row),
+                            cfg=cfg,
+                            args=args,
+                            cfg_flash_auto=cfg_flash_auto,
+                            flash_login_trigger=flash_login_trigger,
+                        )
+                        deadline = time.monotonic() + login_timeout
+                        continue
                 if st.flash_main_tcp_seen:
                     extra_verbose = (
                         " With PROXY_VERBOSE_LOGIN_FLOW: expect a [MAIN→srv] LoginPacket after you submit; "
@@ -3239,9 +3405,9 @@ def main(argv: list[str] | None = None) -> None:
                         "MAIN TCP already connected — Flash reached 127.0.0.1:%s but never sent "
                         "SystemInformationPacket. If Flash shows 'incorrect version' or a blank "
                         "screen here, the game server is rate-limiting logins or the loader "
-                        "failed its self-check; increase BOT_UI_FLASH_LAUNCH_STAGGER_SEC (try 3-5s), "
-                        "re-run TFM_SECRETS_GAME_VERSION dump, or re-run the bot so only the "
-                        "failing slots retry.%s",
+                        "failed its self-check; the bot will close+relaunch Flash automatically when "
+                        "stalled (BOT_FLASH_EMBEDDED_IV_*). Otherwise increase BOT_UI_FLASH_LAUNCH_STAGGER_SEC "
+                        "(try 3-5s), re-run TFM_SECRETS_GAME_VERSION dump, or re-run so only failing slots retry.%s",
                         st.label,
                         max(0.0, deadline - time.monotonic()),
                         st.port,

@@ -530,6 +530,12 @@ class BanBotProxy(Proxy):
         self._main_session_join_name: str = ""
         # Monotonic per Flash↔proxy MAIN TCP accept (each reconnect increments). Grep ``main_tcp#7``.
         self._main_tcp_generation: int = 0
+        # Fresh accept + first client packets on MAIN (reset each new_main_connection).
+        # ban_cli probes these to detect loader SWF stuck on embedded "incorrect version"
+        # (no SystemInformationPacket) and relaunch Flash.
+        self._main_sess_accept_mono: float | None = None
+        self._main_sess_handshake_mono: float | None = None
+        self._main_sess_sysinfo_mono: float | None = None
         # Per MAIN session (reset on each new_main_connection): counts for root-cause hints.
         self._main_sess_ping_srv: int = 0
         self._main_sess_pong_cli: int = 0
@@ -555,6 +561,7 @@ class BanBotProxy(Proxy):
         self.register_packet_listener(self._on_update_player_list, clientbound.UpdatePlayerListPacket)
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
         self.register_packet_listener(self._vl_handshake_sb, serverbound.HandshakePacket)
+        self.register_packet_listener(self._mark_main_sess_sysinfo, serverbound.SystemInformationPacket)
         if self._packet_auto_login:
             self.register_packet_listener(
                 self._capture_handshake_auth_token,
@@ -846,6 +853,11 @@ class BanBotProxy(Proxy):
             return
         self._handshake_auth_token = packet.auth_token
 
+    async def _mark_main_sess_sysinfo(self, source, packet):
+        if getattr(source, "is_satellite", False):
+            return
+        self._main_sess_sysinfo_mono = time.monotonic()
+
     async def _schedule_packet_login_after_sysinfo(self, source, packet):
         if not self._packet_auto_login:
             return
@@ -965,6 +977,8 @@ class BanBotProxy(Proxy):
 
     async def _vl_handshake_sb(self, source, packet):
         sat = getattr(source, "is_satellite", False)
+        if not sat:
+            self._main_sess_handshake_mono = time.monotonic()
         if not sat and self._main_handshake_mono is None:
             self._main_handshake_mono = time.monotonic()
         if not sat:
@@ -1265,6 +1279,9 @@ class BanBotProxy(Proxy):
         self._main_handshake_mono = None
         # Allow FLASH main_tcp UI hook to run again on the next first MAIN (non-packet path).
         self._first_main_hook_done = False
+        self._main_sess_accept_mono = None
+        self._main_sess_handshake_mono = None
+        self._main_sess_sysinfo_mono = None
 
     def _tcp_close_side_guess(self) -> str:
         """
@@ -1539,6 +1556,9 @@ class BanBotProxy(Proxy):
         self._main_sess_ping_srv = 0
         self._main_sess_pong_cli = 0
         self._main_sess_anticheat_cli = 0
+        self._main_sess_accept_mono = tcp_accept_mono
+        self._main_sess_handshake_mono = None
+        self._main_sess_sysinfo_mono = None
         self._issue1_last_handshake_gv = None
         self._issue1_last_handshake_lss = None
         close_reason = "clean-eof"

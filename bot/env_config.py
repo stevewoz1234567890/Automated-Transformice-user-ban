@@ -287,6 +287,19 @@ def load_config_from_env(repo_root: Path) -> object:
     close_fail = _bool_from_env(os.environ.get("BOT_FLASH_CLOSE_ON_LOGIN_FAIL"))
     ns.FLASH_CLOSE_ON_LOGIN_FAIL = True if close_fail is None else close_fail
     F("FLASH_CLOSE_GRACE_SEC", "BOT_FLASH_CLOSE_GRACE_SEC", 2.0)
+    # Embedded "incorrect version, reload" pane (no Win32 button): close projector + relaunch during login wait.
+    emb_iv = _bool_from_env(os.environ.get("BOT_FLASH_EMBEDDED_IV_LOGIN_RELOAD"))
+    ns.FLASH_EMBEDDED_IV_LOGIN_RELOAD = True if emb_iv is None else emb_iv
+    F("FLASH_EMBEDDED_IV_AFTER_HANDSHAKE_SEC", "BOT_FLASH_EMBEDDED_IV_AFTER_HANDSHAKE_SEC", 38.0)
+    F("FLASH_EMBEDDED_IV_AFTER_MAIN_TCP_SEC", "BOT_FLASH_EMBEDDED_IV_AFTER_MAIN_TCP_SEC", 72.0)
+    F("FLASH_EMBEDDED_IV_RELOAD_PAUSE_SEC", "BOT_FLASH_EMBEDDED_IV_RELOAD_PAUSE_SEC", 1.25)
+    _ivmx = (os.environ.get("BOT_FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT") or "").strip()
+    try:
+        ns.FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT = int(_ivmx, 0) if _ivmx else 20
+    except ValueError:
+        logger.warning("BOT_FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT invalid %r — using 20", _ivmx)
+        ns.FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT = 20
+    ns.FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT = max(0, min(200, ns.FLASH_EMBEDDED_IV_LOGIN_MAX_RELOAD_PER_SLOT))
 
     try:
         os.environ["BOT_ACCOUNTS_JSON"] = json.dumps(accounts, ensure_ascii=False, separators=(",", ":"))
