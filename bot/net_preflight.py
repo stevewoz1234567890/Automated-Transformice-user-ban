@@ -16,6 +16,7 @@ import time
 from typing import Final
 
 from .upstream_socket_bind import (
+    account_bind_ip_for_socket_enabled,
     env_preflight_try_account_bind_ips,
     unique_account_bind_ipv4s_from_env,
     upstream_local_bind_tuple,
@@ -540,6 +541,19 @@ def log_proxy_listen_vs_upstream(
             rows_with_bind,
             len(raw_accounts),
         )
+        global_bind_raw = (os.environ.get("BOT_UPSTREAM_LOCAL_BIND_IPV4") or "").strip()
+        if (
+            not account_bind_ip_for_socket_enabled()
+            and global_bind_raw.lower() in ("", "none", "false", "0")
+        ):
+            logger.warning(
+                "[preflight] Per-row bind_ip is set on %d row(s) but BOT_UPSTREAM_USE_ACCOUNT_BIND_IP_FOR_SOCKET is off "
+                "(default), so Python upstream TCP is not bound per account — all slots may egress from the OS default "
+                "route unless something like Proxifier routes the process shown earlier as 'Process opening upstream game "
+                "TCP'. Mis-routed or single-egress multi-account sessions often show mass MAIN clean-eof / PARTL during "
+                "the login batch; enable BOT_UPSTREAM_USE_ACCOUNT_BIND_IP_FOR_SOCKET=true for NIC-local addresses.",
+                rows_with_bind,
+            )
     else:
         logger.info("[preflight] No bind_ip in accounts — all outbound game traffic uses the OS default route.")
 

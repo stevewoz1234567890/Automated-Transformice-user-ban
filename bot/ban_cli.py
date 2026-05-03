@@ -3336,11 +3336,9 @@ def main(argv: list[str] | None = None) -> None:
                     # a second line would just double the noise.
                     logger.debug("Slot %s reported login success; proceeding.", st.label)
                     if bool(getattr(cfg, "FLASH_MINIMIZE_AFTER_OPEN", False)) and st.flash_pid:
-                        # NOTE: minimize currently moves the window off-screen instead of
-                        # using SW_MINIMIZE — see minimize_flash_window docstring for why.
-                        # If env var BOT_FLASH_DIAG_KEEP_ONSCREEN=1, skip the hide entirely
-                        # so we can diagnose whether the upstream-drop is caused by window
-                        # throttling or by something else (server idle kick, Flash watchdog).
+                        # FLASH_MINIMIZE_AFTER_OPEN calls minimize_flash_window, which tiles each
+                        # projector into BOT_FLASH_TILE_* on-screen (not SW_MINIMIZE / off-screen,
+                        # which throttle Flash). BOT_FLASH_DIAG_KEEP_ONSCREEN=1 skips this for diagnosis.
                         if os.environ.get("BOT_FLASH_DIAG_KEEP_ONSCREEN", "").strip().lower() in ("1", "true", "yes"):
                             logger.info(
                                 "Slot %s: BOT_FLASH_DIAG_KEEP_ONSCREEN=1 — leaving Flash window visible for diagnosis",

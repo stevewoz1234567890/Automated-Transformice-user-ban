@@ -164,6 +164,8 @@ def _flash_dialog_aggregate_body_text(top_hwnd: int, user32: object) -> str:
     Adobe Flash Player ActionScript error dialogs often put the stack trace in an ``Edit`` or
     ``RichEdit20W`` **nested under child ``#32770`` panels**, not only as direct children.
 
+    Some builds use a ``ListBox`` (call stack list) or ``SysLink``; those are merged here too.
+
     Older code used a single ``EnumChildWindows`` on the top dialog and only read ``Static``,
     so logs showed ``body='Error de ActionScript:'`` (locale header only) — hiding **#2048 / #2044**
     lines needed to fix upstream literals / sandbox issues.
@@ -198,6 +200,34 @@ def _flash_dialog_aggregate_body_text(top_hwnd: int, user32: object) -> str:
                 buf = ctypes.create_unicode_buffer(ln + 4)
                 user32.SendMessageW(ch, WM_GETTEXT, ln + 1, ctypes.addressof(buf))
                 piece = (buf.value or "").strip()
+        elif cls.startswith("listbox"):
+            LB_GETCOUNT = 0x018B
+            LB_GETTEXTLEN = 0x0198
+            LB_GETTEXT = 0x0189
+            row_texts: list[str] = []
+            try:
+                nrows = int(user32.SendMessageW(ch, LB_GETCOUNT, 0, 0))
+            except (TypeError, ValueError, OSError):
+                nrows = 0
+            nrows = max(0, min(nrows, 64))
+            for row_i in range(nrows):
+                try:
+                    ln_r = int(user32.SendMessageW(ch, LB_GETTEXTLEN, row_i, 0))
+                except (TypeError, ValueError, OSError):
+                    ln_r = 0
+                ln_r = max(0, min(ln_r, 8191))
+                if ln_r <= 0:
+                    continue
+                buf_r = ctypes.create_unicode_buffer(ln_r + 4)
+                user32.SendMessageW(ch, LB_GETTEXT, row_i, ctypes.addressof(buf_r))
+                one = (buf_r.value or "").strip()
+                if one:
+                    row_texts.append(one)
+            piece = " | ".join(row_texts)
+        elif cls == "syslink" or cls.startswith("syslink"):
+            tb_sl = ctypes.create_unicode_buffer(16384)
+            user32.GetWindowTextW(ch, tb_sl, 16384)
+            piece = (tb_sl.value or "").strip()
         if piece:
             parts.append(piece)
 

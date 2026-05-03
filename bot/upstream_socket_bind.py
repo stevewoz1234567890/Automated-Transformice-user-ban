@@ -25,6 +25,16 @@ def parse_ipv4_literal(s: str) -> str | None:
     return None
 
 
+def account_bind_ip_for_socket_enabled() -> bool:
+    """True when per-row ``bind_ip`` should set Python upstream ``local_addr`` / ``source_address``."""
+    return (os.environ.get("BOT_UPSTREAM_USE_ACCOUNT_BIND_IP_FOR_SOCKET") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def upstream_local_bind_tuple(
     *,
     account_bind_ip: str = "",
@@ -35,13 +45,7 @@ def upstream_local_bind_tuple(
         ip = parse_ipv4_literal(raw_global)
         return (ip, 0) if ip else None
 
-    use_acc = (os.environ.get("BOT_UPSTREAM_USE_ACCOUNT_BIND_IP_FOR_SOCKET") or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-    if not use_acc:
+    if not account_bind_ip_for_socket_enabled():
         return None
     ip = parse_ipv4_literal(account_bind_ip)
     return (ip, 0) if ip else None
