@@ -624,6 +624,26 @@ def _wait_sequential_upstream_stable(
     return True
 
 
+def _sequential_deferred_flash_tile(st: SlotState, cfg: object) -> None:
+    """
+    After sequential MAIN stabilize, apply tiling that was skipped during launch/login
+    so loader clicks and early login UI see a full-size window.
+    """
+    if st.flash_pid is None or not flash_launch.flash_pid_is_alive(st.flash_pid):
+        return
+    if os.environ.get("BOT_FLASH_DIAG_KEEP_ONSCREEN", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return
+    raw_tile = (os.environ.get("BOT_FLASH_TILE_AFTER_LOADER_CLICK") or "").strip().lower()
+    want_tile = raw_tile not in ("0", "false", "no", "off")
+    want_min_open = bool(getattr(cfg, "FLASH_MINIMIZE_AFTER_OPEN", False))
+    if want_tile or want_min_open:
+        flash_launch.minimize_flash_window(st.flash_pid, st.label)
+
+
 def _effective_flash_stagger_sec(n_slots: int, stagger_from_env: float) -> float:
     """POST-login delay before opening the *next* Flash client (sequential farm launch)."""
     stagger_after = float(stagger_from_env)
@@ -1293,6 +1313,7 @@ def _embedded_iv_mid_login_relaunch_sequential(
     args: object,
     cfg_flash_auto: bool,
     flash_login_trigger: str,
+    skip_post_loader_tile: bool = False,
 ) -> None:
     pause = float(getattr(cfg, "FLASH_EMBEDDED_IV_RELOAD_PAUSE_SEC", 1.25))
     pause = max(0.0, pause)
@@ -1311,6 +1332,7 @@ def _embedded_iv_mid_login_relaunch_sequential(
             post_open_delay_sec=float(
                 getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
             ),
+            skip_post_loader_tile=skip_post_loader_tile,
         )
     finally:
         st.flash_loader_ready_event.set()
@@ -3236,6 +3258,7 @@ def main(argv: list[str] | None = None) -> None:
                         post_open_delay_sec=float(
                             getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
                         ),
+                        skip_post_loader_tile=(stab_sec > 0),
                     )
                 finally:
                     st.flash_loader_ready_event.set()
@@ -3437,6 +3460,13 @@ def main(argv: list[str] | None = None) -> None:
                                     "Slot %s: BOT_FLASH_DIAG_KEEP_ONSCREEN=1 — leaving Flash window visible for diagnosis",
                                     st.label,
                                 )
+                            elif stab_sec > 0:
+                                logger.debug(
+                                    "Slot %s: defer Flash tile/minimize until MAIN stabilize "
+                                    "(BOT_UI_SEQUENTIAL_MAIN_STABILIZE_SEC=%.1fs).",
+                                    st.label,
+                                    stab_sec,
+                                )
                             else:
                                 flash_launch.minimize_flash_window(st.flash_pid, st.label)
                         break
@@ -3467,6 +3497,7 @@ def main(argv: list[str] | None = None) -> None:
                                 args=args,
                                 cfg_flash_auto=cfg_flash_auto,
                                 flash_login_trigger=flash_login_trigger,
+                                skip_post_loader_tile=(stab_sec > 0),
                             )
                             deadline = time.monotonic() + login_timeout
                             continue
@@ -3500,6 +3531,7 @@ def main(argv: list[str] | None = None) -> None:
                                 args=args,
                                 cfg_flash_auto=cfg_flash_auto,
                                 flash_login_trigger=flash_login_trigger,
+                                skip_post_loader_tile=(stab_sec > 0),
                             )
                             deadline = time.monotonic() + login_timeout
                             continue
@@ -3569,6 +3601,7 @@ def main(argv: list[str] | None = None) -> None:
                             st.label,
                             stab_sec,
                         )
+                        _sequential_deferred_flash_tile(st, cfg)
                     sequential_slot_done = True
                     break
 

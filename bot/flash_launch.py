@@ -795,12 +795,25 @@ def _win_click_client_fraction(
             last_fail = "GetClientRect(toplevel) failed"
             time.sleep(0.1)
             continue
-        top_area = max(0, rc_top.right - rc_top.left) * max(0, rc_top.bottom - rc_top.top)
-        # Small popups (ActionScript errors): use toplevel client rect; largest child is often the text view.
-        if top_area < 120_000:
-            target = hwnd_cur
+        top_w = max(0, rc_top.right - rc_top.left)
+        top_h = max(0, rc_top.bottom - rc_top.top)
+        top_area = top_w * top_h
+        best = _win_best_click_hwnd(hwnd_cur)
+        if top_area >= 120_000:
+            target = best
         else:
-            target = _win_best_click_hwnd(hwnd_cur)
+            target = hwnd_cur
+            degenerate = top_h < 8 or top_w < 8
+            compact_for_child = degenerate or top_area < 8_000
+            if compact_for_child and best != hwnd_cur:
+                rc_b = RECT()
+                if user32.GetClientRect(best, ctypes.byref(rc_b)):
+                    bw = max(0, rc_b.right - rc_b.left)
+                    bh = max(0, rc_b.bottom - rc_b.top)
+                    b_area = bw * bh
+                    if bh >= 8 and bw >= 8:
+                        if degenerate or b_area >= top_area * 0.85:
+                            target = best
         rc = RECT()
         if not user32.GetClientRect(target, ctypes.byref(rc)):
             last_fail = "GetClientRect failed"
@@ -1001,6 +1014,7 @@ def launch_one_flash_loader(
     post_open_delay_sec: float = 1.15,
     click_transformice: bool = True,
     on_flash_pid: Callable[[int], None] | None = None,
+    skip_post_loader_tile: bool = False,
 ) -> subprocess.Popen | None:
     """
     Start a single Flash projector + loader for one account row.
@@ -1127,7 +1141,10 @@ def launch_one_flash_loader(
                     label, hwnd, fx, fy, click_dt,
                 )
                 _raw_tile = (os.environ.get("BOT_FLASH_TILE_AFTER_LOADER_CLICK") or "").strip().lower()
-                if _raw_tile not in ("0", "false", "no", "off"):
+                if (
+                    _raw_tile not in ("0", "false", "no", "off")
+                    and not skip_post_loader_tile
+                ):
                     try:
                         if minimize_flash_window(p.pid, label or "?"):
                             logger.debug(
@@ -3009,7 +3026,13 @@ def click_transformice_in_loader(
     _win_force_foreground(hwnd)
     import time as _time
     _time.sleep(0.15)
-    result = _win_click_client_fraction(hwnd, frac_x=frac_x, frac_y=frac_y, debug_label=slot_label)
+    result = _win_click_client_fraction(
+        hwnd,
+        frac_x=frac_x,
+        frac_y=frac_y,
+        debug_label=slot_label,
+        flash_pid=pid,
+    )
     if result:
         logger.debug(
             "Slot %s: retry click sent to HWND=%s (%.2f, %.2f)",
