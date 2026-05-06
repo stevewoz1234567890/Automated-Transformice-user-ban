@@ -118,6 +118,15 @@ def _validate_one_index(
     )
     row_dict["_flash_connect_host"] = state.proxy_bind_host if state.proxy_bind_host else "127.0.0.1"
     state.packet_loader_url = flash_launch.loader_document_url_for_row(row_dict, repo_root()) or ""
+    if bool(getattr(cfg, "PACKET_AUTO_LOGIN", False)) and not (state.packet_loader_url or "").strip():
+        swf = repo_root() / "TFMProxyLoader.swf"
+        logger.error(
+            "PACKET_AUTO_LOGIN is on but LoginPacket.loader_url is empty — place %s in the repo root "
+            "(same as the Flash flow) or bind-mount it into the container at /app/TFMProxyLoader.swf. "
+            "Without it the proxy cannot inject LoginPacket and headless login will hang after handshake.",
+            swf,
+        )
+        return False
 
     base_secrets = load_secrets_base(cfg)
     sync_upstream_cfg_from_secrets(cfg, base_secrets)

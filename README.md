@@ -32,6 +32,8 @@ Docker is useful for making Python/runtime behavior consistent across devices.
 
 Important limitation: the full interactive `python -m bot` flow auto-launches Windows Flash (`flashplayer_32_sa_debug.exe`), which is host-native and not available in the Linux container image. So Docker is provided for **headless parity checks** and **network probes**.
 
+Headless validation uses `BOT_PACKET_AUTO_LOGIN` (default on): the proxy injects `LoginPacket` only if it can build a loader document URL from repo-root **`TFMProxyLoader.swf`**. That file is not shipped in the image; `docker-compose.yml` bind-mounts `./TFMProxyLoader.swf` from your machine. If that file is missing, validation will fail fast with a clear error instead of hanging after handshake.
+
 ### Build image
 
 ```powershell

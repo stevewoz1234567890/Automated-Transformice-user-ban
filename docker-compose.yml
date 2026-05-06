@@ -3,6 +3,12 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      # Avoid auto-creating /app/.env from .env.example inside the container (would override compose env).
+      BOT_HEADLESS_SECRETS_SEED_DOTENV_FROM_EXAMPLE: "false"
+    volumes:
+      # Required for PACKET_AUTO_LOGIN: same patched loader as on the host (excluded from the image by .dockerignore).
+      - ./TFMProxyLoader.swf:/app/TFMProxyLoader.swf:ro
     command: ["python", "-m", "bot.validate_accounts", "--all"]
 
   probe:
