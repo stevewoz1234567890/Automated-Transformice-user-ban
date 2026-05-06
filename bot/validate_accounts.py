@@ -121,9 +121,9 @@ def _validate_one_index(
     if bool(getattr(cfg, "PACKET_AUTO_LOGIN", False)) and not (state.packet_loader_url or "").strip():
         swf = repo_root() / "TFMProxyLoader.swf"
         logger.error(
-            "PACKET_AUTO_LOGIN is on but LoginPacket.loader_url is empty — place %s in the repo root "
-            "(same as the Flash flow) or bind-mount it into the container at /app/TFMProxyLoader.swf. "
-            "Without it the proxy cannot inject LoginPacket and headless login will hang after handshake.",
+            "PACKET_AUTO_LOGIN is on but LoginPacket.loader_url is empty — add %s in the repo root "
+            "(same as the Flash flow). Without it the proxy cannot inject LoginPacket and headless login "
+            "will hang after handshake.",
             swf,
         )
         return False

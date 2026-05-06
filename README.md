@@ -26,36 +26,6 @@ Copy `.env.example` to `.env` (or create `.env` from scratch) and fill in your a
 
 ---
 
-## Docker (cross-device parity)
-
-Docker is useful for making Python/runtime behavior consistent across devices.
-
-Important limitation: the full interactive `python -m bot` flow auto-launches Windows Flash (`flashplayer_32_sa_debug.exe`), which is host-native and not available in the Linux container image. So Docker is provided for **headless parity checks** and **network probes**.
-
-Headless validation uses `BOT_PACKET_AUTO_LOGIN` (default on): the proxy injects `LoginPacket` only if it can build a loader document URL from repo-root **`TFMProxyLoader.swf`**. That file is not shipped in the image; `docker-compose.yml` bind-mounts `./TFMProxyLoader.swf` from your machine. If that file is missing, validation will fail fast with a clear error instead of hanging after handshake.
-
-### Build image
-
-```powershell
-docker compose build
-```
-
-### Validate all accounts headlessly (recommended parity check)
-
-```powershell
-docker compose run --rm bot
-```
-
-### Probe game TCP ports only
-
-```powershell
-docker compose run --rm probe
-```
-
-Use the same `.env` values on both PCs, then compare `validate_accounts` / `probe` results to isolate whether differences come from environment vs. network.
-
----
-
 ## Run
 
 ```powershell
