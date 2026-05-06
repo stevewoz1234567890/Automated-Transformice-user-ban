@@ -608,6 +608,36 @@ def _sequential_retry_pause_sec(cfg: object) -> float:
     return max(0.0, float(getattr(cfg, "FLASH_EMBEDDED_IV_RELOAD_PAUSE_SEC", 1.25) or 0.0))
 
 
+def _sequential_hard_stop_after_failures() -> int:
+    """
+    Hard-stop retries for one slot after N failed sequential attempts.
+    0 disables hard-stop and keeps BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY behavior.
+    """
+    raw = (os.environ.get("BOT_UI_SEQUENTIAL_HARD_STOP_AFTER_FAILS") or "").strip()
+    if not raw:
+        return 0
+    try:
+        n = int(raw)
+    except ValueError:
+        return 0
+    return max(0, min(n, 200))
+
+
+def _sequential_transient_drop_grace_sec() -> float:
+    """
+    Allow short upstream gaps during login->satellite transition before declaring
+    sequential MAIN stabilization failed.
+    """
+    raw = (os.environ.get("BOT_UI_SEQUENTIAL_TRANSIENT_DROP_GRACE_SEC") or "").strip()
+    if not raw:
+        return 2.5
+    try:
+        v = float(raw)
+    except ValueError:
+        return 2.5
+    return max(0.0, min(v, 30.0))
+
+
 def _wait_sequential_upstream_stable(
     st: SlotState,
     *,
@@ -616,10 +646,18 @@ def _wait_sequential_upstream_stable(
 ) -> bool:
     if seconds <= 0:
         return True
+    transient_grace = _sequential_transient_drop_grace_sec()
+    first_bad_at: float | None = None
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        if not _slot_upstream_ok_for_sequential(st):
-            return False
+        now = time.monotonic()
+        if _slot_upstream_ok_for_sequential(st):
+            first_bad_at = None
+        else:
+            if first_bad_at is None:
+                first_bad_at = now
+            elif now - first_bad_at >= transient_grace:
+                return False
         time.sleep(poll)
     return True
 
@@ -3201,16 +3239,28 @@ def main(argv: list[str] | None = None) -> None:
 
         stab_sec = _sequential_main_stabilize_sec()
         seq_slot_max_retry = _sequential_slot_max_retry_passes()
+        seq_hard_stop_after = _sequential_hard_stop_after_failures()
         seq_retry_pause = _sequential_retry_pause_sec(cfg)
+        seq_drop_grace = _sequential_transient_drop_grace_sec()
+        seq_effective_max_retry = (
+            min(seq_slot_max_retry, seq_hard_stop_after)
+            if seq_hard_stop_after > 0
+            else seq_slot_max_retry
+        )
         if stab_sec > 0:
             logger.info(
                 "Sequential login: BOT_UI_SEQUENTIAL_MAIN_STABILIZE_SEC=%.1fs — next Flash opens only "
                 "after MAIN stays OK that long on the current slot. BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY=%d "
+                "BOT_UI_SEQUENTIAL_HARD_STOP_AFTER_FAILS=%d (0=disabled; effective per-slot cap=%d). "
                 "(close failed slot + relaunch before advancing). BOT_UI_SEQUENTIAL_RETRY_PAUSE_SEC=%.2fs "
-                "(pause between sequential relaunches).",
+                "(pause between sequential relaunches). BOT_UI_SEQUENTIAL_TRANSIENT_DROP_GRACE_SEC=%.1fs "
+                "(allow short upstream dips before relaunch).",
                 stab_sec,
                 seq_slot_max_retry,
+                seq_hard_stop_after,
+                seq_effective_max_retry,
                 seq_retry_pause,
+                seq_drop_grace,
             )
 
         for idx, (flash_row0, st) in enumerate(zip(flash_accounts, states), start=1):
@@ -3218,7 +3268,7 @@ def main(argv: list[str] | None = None) -> None:
             seq_attempt = 0
             flash_row_cur = flash_row0
 
-            while seq_attempt < seq_slot_max_retry and not sequential_slot_done:
+            while seq_attempt < seq_effective_max_retry and not sequential_slot_done:
                 seq_attempt += 1
                 if seq_attempt > 1:
                     logger.warning(
@@ -3226,7 +3276,7 @@ def main(argv: list[str] | None = None) -> None:
                         "failed; closing this Flash tab and reopening before any later slot proceeds.",
                         st.label,
                         seq_attempt,
-                        seq_slot_max_retry,
+                        seq_effective_max_retry,
                     )
                     if seq_retry_pause > 0:
                         time.sleep(seq_retry_pause)
@@ -3613,10 +3663,13 @@ def main(argv: list[str] | None = None) -> None:
                         st.label,
                         stab_sec,
                         seq_attempt,
-                        seq_slot_max_retry,
+                        seq_effective_max_retry,
                     )
 
-                if seq_attempt >= seq_slot_max_retry:
+                if seq_attempt >= seq_effective_max_retry:
+                    hard_stopped = (
+                        seq_hard_stop_after > 0 and seq_effective_max_retry == seq_hard_stop_after
+                    )
                     if not got_login:
                         if st.login_aborted_event.is_set():
                             logger.warning(
@@ -3632,9 +3685,12 @@ def main(argv: list[str] | None = None) -> None:
                                 login_timeout,
                             )
                         if (
+                            not hard_stopped
+                            and (
                             bool(getattr(cfg, "FLASH_CLOSE_ON_LOGIN_FAIL", True))
                             and st.flash_pid
                             and flash_launch.flash_pid_is_alive(st.flash_pid)
+                            )
                         ):
                             logger.info(
                                 "Slot %s: closing stale Flash window PID=%s "
@@ -3653,19 +3709,38 @@ def main(argv: list[str] | None = None) -> None:
                                     "Slot %s: close_flash_window raised", st.label,
                                 )
                             st.flash_pid = None
+                        elif hard_stopped:
+                            logger.warning(
+                                "Slot %s: hard-stop hit after %d sequential failures; "
+                                "continuing to next slot without auto-closing this Flash window.",
+                                st.label,
+                                seq_effective_max_retry,
+                            )
                         if st.error is None:
                             st.error = f"no login within {login_timeout}s"
                     else:
-                        logger.warning(
-                            "Slot %s: exhausted BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY=%d "
-                            "— MAIN still unstable after LoginSuccess.",
-                            st.label,
-                            seq_slot_max_retry,
-                        )
+                        if hard_stopped:
+                            logger.warning(
+                                "Slot %s: hard-stop hit after %d sequential failures "
+                                "(MAIN unstable after LoginSuccess) — continuing to next slot "
+                                "without auto-closing this Flash window.",
+                                st.label,
+                                seq_effective_max_retry,
+                            )
+                        else:
+                            logger.warning(
+                                "Slot %s: exhausted BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY=%d "
+                                "— MAIN still unstable after LoginSuccess.",
+                                st.label,
+                                seq_slot_max_retry,
+                            )
                         if (
+                            not hard_stopped
+                            and (
                             bool(getattr(cfg, "FLASH_CLOSE_ON_LOGIN_FAIL", True))
                             and st.flash_pid
                             and flash_launch.flash_pid_is_alive(st.flash_pid)
+                            )
                         ):
                             logger.info(
                                 "Slot %s: closing stale Flash window PID=%s "

@@ -167,8 +167,14 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     # Failed slot: close + relaunch same index up to BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY before advancing.
     "BOT_UI_SEQUENTIAL_MAIN_STABILIZE_SEC": "5",
     "BOT_UI_SEQUENTIAL_SLOT_MAX_RETRY": "24",
+    # Hard stop for per-slot sequential relaunch loop. 0 disables (use SLOT_MAX_RETRY only).
+    # When hit, bot advances to next slot without auto-closing current Flash window.
+    "BOT_UI_SEQUENTIAL_HARD_STOP_AFTER_FAILS": "0",
     # Pause between sequential slot relaunches (empty = reuse BOT_FLASH_EMBEDDED_IV_RELOAD_PAUSE_SEC in code).
     "BOT_UI_SEQUENTIAL_RETRY_PAUSE_SEC": "",
+    # During sequential stabilize, tolerate brief upstream dips (main->sat migration / transient reconnect)
+    # before forcing a slot relaunch.
+    "BOT_UI_SEQUENTIAL_TRANSIENT_DROP_GRACE_SEC": "2.5",
     "BOT_FLASH_AUTO_LOGIN_UI": "false",
     # Before Flash session: tfm-secrets / leaker (if BOT_HEADLESS_SECRETS_ALWAYS_REFRESH) + optional TFMProxyLoader.swf fetch.
     "BOT_FLASH_STARTUP_REFRESH_TFM_ASSETS": "true",
