@@ -26,6 +26,34 @@ Copy `.env.example` to `.env` (or create `.env` from scratch) and fill in your a
 
 ---
 
+## Docker (cross-device parity)
+
+Docker is useful for making Python/runtime behavior consistent across devices.
+
+Important limitation: the full interactive `python -m bot` flow auto-launches Windows Flash (`flashplayer_32_sa_debug.exe`), which is host-native and not available in the Linux container image. So Docker is provided for **headless parity checks** and **network probes**.
+
+### Build image
+
+```powershell
+docker compose build
+```
+
+### Validate all accounts headlessly (recommended parity check)
+
+```powershell
+docker compose run --rm bot
+```
+
+### Probe game TCP ports only
+
+```powershell
+docker compose run --rm probe
+```
+
+Use the same `.env` values on both PCs, then compare `validate_accounts` / `probe` results to isolate whether differences come from environment vs. network.
+
+---
+
 ## Run
 
 ```powershell
