@@ -138,22 +138,13 @@ def _validate_one_index(
                 )
                 return False
 
-    auth_key_fallback: int | None = None
-    packet_key_sources_fallback: list | tuple | None = None
-    if base_secrets is not None:
-        auth_key_fallback = getattr(base_secrets, "auth_key", None)
-        packet_key_sources_fallback = getattr(base_secrets, "packet_key_sources", None)
-
     start_all_slots(
         [state],
         this_exe=this_exe,
         allow_kill=allow_kill,
         cfg=cfg,
-        main_server_address=upstream_addr,
-        main_server_ports=upstream_ports,
-        packet_login_auth_key_fallback=auth_key_fallback,
-        packet_login_packet_key_sources_fallback=packet_key_sources_fallback,
-        bootstrap_secrets=base_secrets,
+        flash_auto_login_ui=False,
+        flash_login_main_tcp_hook=False,
     )
 
     start_headless_client_threads([state], [row_dict], cfg, base_secrets=base_secrets)
