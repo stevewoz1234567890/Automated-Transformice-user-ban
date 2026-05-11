@@ -84,62 +84,15 @@ RUFFLE_PROJECT_URL = "https://github.com/ruffle-rs/ruffle"
 TFM_BROWSER_PROJECT_URL = "https://github.com/extremq/tfm-browser"
 
 
-def _steam_install_path() -> Path | None:
-    """Try common Steam library locations for the Transformice app."""
-    if os.name != "nt":
-        candidates = [
-            Path.home() / ".steam" / "steam" / "steamapps" / "common" / "Transformice",
-            Path.home() / ".local" / "share" / "Steam" / "steamapps" / "common" / "Transformice",
-        ]
-    else:
-        candidates = [
-            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
-            / "Steam" / "steamapps" / "common" / "Transformice",
-            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-            / "Steam" / "steamapps" / "common" / "Transformice",
-        ]
-    env = (os.environ.get("TFM_STEAM_DIR") or "").strip()
-    if env:
-        candidates.insert(0, Path(env).expanduser())
-    for p in candidates:
-        if p.is_dir():
-            return p
-    return None
-
-
-def _standalone_exe_local_path(repo_root: Path) -> Path | None:
-    """Check for a local ``Transformice.exe`` in the repo root or ``tmp/``."""
-    for cand in (repo_root / "Transformice.exe", repo_root / "tmp" / "Transformice.exe"):
-        if cand.is_file():
-            return cand
-    return None
-
-
-def _ruffle_binary() -> Path | None:
-    """Look for a ``ruffle`` binary on PATH or common install locations."""
-    import shutil
-
-    found = shutil.which("ruffle")
-    if found:
-        return Path(found)
-    home_ruffle = Path.home() / ".ruffle" / "ruffle"
-    if home_ruffle.is_file():
-        return home_ruffle
-    if os.name == "nt":
-        for d in (Path.home() / "ruffle", Path(r"C:\ruffle")):
-            exe = d / "ruffle.exe"
-            if exe.is_file():
-                return exe
-    return None
-
-
 def discover_available_methods(repo_root: Path) -> list[ClientMethod]:
     """Return a list of every known access method with ``available`` pre-filled where detectable locally."""
     from .flash_launch import resolve_flash_paths
+    from .standalone_client import find_standalone_exe
+    from .steam_client import find_steam_tfm_dir
+    from .ruffle_client import find_ruffle_binary
 
     methods: list[ClientMethod] = []
 
-    # 1. Flash projector (current approach)
     flash_exe, proxy_swf = resolve_flash_paths(repo_root)
     flash_ok = flash_exe.is_file() and proxy_swf.is_file()
     methods.append(
@@ -161,7 +114,6 @@ def discover_available_methods(repo_root: Path) -> list[ClientMethod]:
         )
     )
 
-    # 2. Official SWF endpoints (need HTTP probe — marked None for now)
     methods.append(
         ClientMethod(
             kind=ClientKind.OFFICIAL_SWF_LOADER,
@@ -175,8 +127,7 @@ def discover_available_methods(repo_root: Path) -> list[ClientMethod]:
         )
     )
 
-    # 3. Standalone EXE
-    local_exe = _standalone_exe_local_path(repo_root)
+    local_exe = find_standalone_exe(repo_root)
     methods.append(
         ClientMethod(
             kind=ClientKind.STANDALONE_EXE,
@@ -194,8 +145,7 @@ def discover_available_methods(repo_root: Path) -> list[ClientMethod]:
         )
     )
 
-    # 4. Steam
-    steam_dir = _steam_install_path()
+    steam_dir = find_steam_tfm_dir()
     methods.append(
         ClientMethod(
             kind=ClientKind.STEAM,
@@ -215,8 +165,7 @@ def discover_available_methods(repo_root: Path) -> list[ClientMethod]:
         )
     )
 
-    # 5. Ruffle
-    ruffle_bin = _ruffle_binary()
+    ruffle_bin = find_ruffle_binary()
     methods.append(
         ClientMethod(
             kind=ClientKind.RUFFLE,

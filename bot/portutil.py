@@ -25,14 +25,6 @@ def tcp_port_is_free(port: int, host: str = "") -> bool:
             return False
 
 
-def find_free_tcp_port(start: int, *, max_offset: int = 100) -> int:
-    """Return the first free TCP port in ``[start, start + max_offset)``."""
-    for p in range(start, start + max_offset):
-        if tcp_port_is_free(p):
-            return p
-    raise RuntimeError(f"No free TCP port in [{start}, {start + max_offset})")
-
-
 def _local_endpoint_port(local_addr: str) -> str | None:
     """Extract port from netstat local address (e.g. ``0.0.0.0:11801``, ``[::]:11801``)."""
     if ":" not in local_addr:

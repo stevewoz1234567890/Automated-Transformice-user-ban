@@ -1,28 +1,16 @@
 """
-Standalone ``Transformice.exe`` client integration.
+Standalone ``Transformice.exe`` client detection.
 
 The official standalone is an Adobe AIR wrapper that bundles Flash and
-the game SWF.  It can be downloaded from:
-
-    http://www.transformice.com/Transformice.exe
-
-The standalone connects to the same game servers as the browser/Steam
-versions.  For proxy injection, the same ``TFMProxyLoader.swf`` trick
-works — replace the bundled ``Transformice.swf`` inside the AIR app
-directory.
-
-This module can:
-  - Download the official standalone EXE.
-  - Locate an existing copy.
-  - Launch it (optionally injecting the proxy loader).
+the game SWF, downloadable from ``transformice.com/Transformice.exe``.
+This module provides helpers to locate, download, and gather diagnostic
+info about the standalone client.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import shutil
-import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -105,27 +93,6 @@ def ensure_standalone(repo_root: Path) -> Path | None:
     if download_standalone(dest):
         return dest
     return None
-
-
-def launch_standalone(
-    exe_path: Path,
-    *,
-    cwd: Path | None = None,
-) -> subprocess.Popen | None:
-    """Launch the standalone Transformice EXE."""
-    if not exe_path.is_file():
-        logger.error("Standalone EXE not found: %s", exe_path)
-        return None
-
-    cmd = [str(exe_path)]
-    work_dir = str(cwd or exe_path.parent)
-
-    logger.info("Launching standalone: %s (cwd=%s)", exe_path, work_dir)
-    try:
-        return subprocess.Popen(cmd, cwd=work_dir)
-    except OSError as e:
-        logger.error("Standalone launch failed: %s", e)
-        return None
 
 
 def describe_standalone_setup(repo_root: Path) -> dict:
