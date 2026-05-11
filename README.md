@@ -1,16 +1,21 @@
 # Automated Transformice user ban
 
-Multi-slot Transformice ban bot. Each account runs behind a **local TCP proxy** (via [caseus](https://github.com/friedkeenan/caseus)). The bot auto-launches Flash Player, auto-logs every slot in via packet injection, then guides you through picking a room and a player before sending `/ban` from all accounts simultaneously.
+Multi-slot Transformice ban bot. Supports two modes:
+
+- **Headless mode** (`--headless-keepalive`, recommended) — each account connects **directly** to the game server via a Python TCP client ([caseus](https://github.com/friedkeenan/caseus)). No Flash Player, no local proxy, no UI automation.
+- **Flash mode** (legacy) — each account runs behind a local TCP proxy; Flash Player windows are auto-launched and login is injected via packet interception.
 
 ---
 
 ## What you need
 
 - **Python 3.10+**
+- **`TFM_SECRETS_*`** values in `.env` — game crypto used for login (see [`.env` reference](#env-reference) below)
+- **One unique outbound IP per account** if the game server rate-limits by IP — assign them in Proxifier or equivalent; the `bind_ip` field in `BOT_ACCOUNTS_JSON` is for your reference only
+
+**Flash mode only** (not needed for headless):
 - **Flash Player standalone debug projector** (`flashplayer_32_sa_debug.exe`) in the repo root (or set `BOT_UI_FLASH_PLAYER_PATH` in `.env`)
 - **`TFMProxyLoader.swf`** in the repo root — the patched loader that points Flash at the local proxy
-- **`TFM_SECRETS_*`** values in `.env` — game crypto used for packet-based auto-login (see [`.env` reference](#env-reference) below)
-- **One unique outbound IP per account** if the game server rate-limits by IP — assign them in Proxifier or equivalent; the `bind_ip` field in `BOT_ACCOUNTS_JSON` is for your reference only
 
 ---
 
@@ -28,13 +33,37 @@ Copy `.env.example` to `.env` (or create `.env` from scratch) and fill in your a
 
 ## Run
 
+### Headless mode (recommended)
+
+```powershell
+.\venv\Scripts\python.exe -m bot --headless-keepalive --skip-net-check
+```
+
+Each account connects directly to the Transformice server — no Flash Player windows, no proxy needed. After all slots log in, you get an interactive prompt to pick a room and send `/ban`.
+
+### Flash mode (legacy)
+
 ```powershell
 .\venv\Scripts\python.exe -m bot
 ```
 
 Or use the frozen build: `ban_bot.exe` (`.env` must be in the same folder).
 
+> **Note:** Flash mode requires `flashplayer_32_sa_debug.exe` and `TFMProxyLoader.swf`. If the Flash client crashes after login (`clean-eof` ~5s), the SWF loader is likely out of date — use headless mode instead.
+
 ### What happens automatically
+
+#### Headless mode (`--headless-keepalive`)
+
+1. **Secrets refreshed** — `TFMSecretsLeaker.swf` or `tfm-secrets` CLI fetches fresh game crypto.
+2. **Direct TCP connections** — each slot opens a `caseus.Client` connection straight to the game server.
+3. **Auto-login** — credentials from `BOT_ACCOUNTS_JSON` are sent directly. The log prints `DIRECT LOGIN SUCCESS as Username#XXXX`.
+4. **All slots logged-in detection** — the bot waits up to 5 minutes for all slots.
+5. **You pick a room** by typing the name (e.g. `*racing1`). All slots join via `JoinRoomPacket`.
+6. **You pick a target** by typing the nickname. `/ban` is sent from every slot.
+7. **"Ban someone else? (y/n)"** — answer `y` to pick another room; `n` exits.
+
+#### Flash mode (legacy)
 
 1. **Proxy listeners start** — one main port + satellite port per slot.
 2. **Flash Player windows open** one at a time (controlled by `BOT_UI_AUTO_LAUNCH_FLASH`).
@@ -47,7 +76,27 @@ Or use the frozen build: `ban_bot.exe` (`.env` must be in the same folder).
 9. **`/ban` sent** from every slot with a random 1–2 s gap between accounts (tunable in `.env`). In-game room bans normally need **[11 distinct `/ban` reports](docs/BAN_QUORUM_TRANSFORMICE.md)** (configurable via `BOT_BAN_QUORUM_REPORTS`). The CLI warns if too few slots succeed in one round.
 10. **"Ban someone else? (y/n)"** — answer `y` to start a new room selection; `n` exits.
 
-### What you see in the console
+### Example console output (headless)
+
+```
+08:11:49 [INFO] Slot 1: direct headless started → 51.38.60.113:(11801, ...)
+08:11:50 [INFO] Slot 1: DIRECT LOGIN SUCCESS as Thuglifex#3946
+08:11:52 [INFO] Slot 2: DIRECT LOGIN SUCCESS as Doni#8783
+...
+08:12:23 [INFO] Headless-keepalive login complete: 14/14 slots logged in.
+08:12:23 [INFO] All 14 slot(s) logged in — proceeding.
+
+==================================================
+  HEADLESS MODE — 14 slots logged in
+==================================================
+
+Enter room name (or 'q' to quit): *racing1
+Enter player name to /ban (or 'skip'): Zizao#0000
+08:12:45 [INFO] /ban Zizao#0000 complete: 14 ok, 0 fail in 3.2s
+Ban someone else? (y/n):
+```
+
+### Example console output (Flash, legacy)
 
 ```
 04:25:26 [INFO] OK  [slot 1] logged in as Husarz#3007
@@ -82,6 +131,10 @@ Ban someone else? (y/n):
 
 | Flag | Effect |
 |------|--------|
+| `--headless-keepalive` | **Direct headless mode** — connect to the game server with Python TCP clients, no Flash or proxy needed |
+| `--skip-net-check` | Skip the DNS/multi-port/HTTP preflight probe (useful with `--headless-keepalive`) |
+| `--probe-clients` | Probe all known game-client access methods (SWF URLs, Steam, TCP, etc.) and exit with a report |
+| `--client-mode MODE` | Override `BOT_GAME_CLIENT_MODE` (`flash_projector`, `standalone_exe`, `steam`, `ruffle`) |
 | `--no-kill-stale` | Do not kill processes already occupying configured proxy ports |
 | `--launch-flash-no-click` | Open Flash windows but skip the automated Transformice button click (click manually) |
 | `--no-flash-auto-login` | Disable the auto-dismiss + auto-login UI (login manually in each window) |
@@ -163,6 +216,14 @@ TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE=aabbccdd...
 | `BOT_UI_FLASH_LAUNCH_STAGGER_SEC` | `2.5` | Pause between opening successive Flash windows (auto floor may apply for many slots) |
 | `BOT_ALL_SLOTS_LOGIN_TIMEOUT_SEC` | `900` | Per-slot login wait timeout (seconds) |
 
+### Headless mode
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `BOT_GAME_CLIENT_MODE` | `flash_projector` | Active client mode (`flash_projector`, `standalone_exe`, `steam`, `ruffle`) |
+| `BOT_PROBE_GAME_CLIENTS_AT_STARTUP` | `false` | Run client availability probe on startup |
+| `HEADLESS_LOGIN_STAGGER_SEC` | `2.5` | Delay between starting successive direct headless slots |
+
 ### Ban timing
 
 | Key | Default | Description |
@@ -226,19 +287,27 @@ Writes `ban_bot.exe` to the repo root. Run it from that folder so `.env` is next
 | Path | Role |
 |------|------|
 | `bot/` | Main Python package (`python -m bot`) |
-| `bot/ban_cli.py` | CLI entry point — proxy setup, Flash launch, room/player menus, ban loop |
-| `bot/ban_proxy.py` | `BanBotProxy` — packet interception, auto-login, room list, player list |
+| `bot/ban_cli.py` | CLI entry point — proxy setup, headless/Flash launch, room/player menus, ban loop |
+| `bot/ban_proxy.py` | `BanBotProxy` — packet interception, auto-login, room list, player list (Flash mode) |
+| `bot/direct_headless.py` | `BanBotDirectClient` + `DirectHeadlessSlot` — direct TCP to game server (headless mode) |
+| `bot/headless_client.py` | `HeadlessProxyClient` — headless login through the local proxy |
 | `bot/env_config.py` | Loads `.env` → config namespace |
-| `bot/flash_launch.py` | Flash Player auto-launch and UI automation |
+| `bot/flash_launch.py` | Flash Player auto-launch and UI automation (Flash mode) |
+| `bot/game_client_registry.py` | Enumerate known game-client access methods (SWF, Steam, Ruffle, etc.) |
+| `bot/client_probe.py` | Probe SWF endpoints, TCP servers, and standalone EXE downloads |
+| `bot/client_mode.py` | Resolve and validate the active game client mode |
+| `bot/probe_clients_cli.py` | CLI diagnostic tool — `--probe-clients` report |
+| `bot/steam_client.py` | Detect and launch the Steam Transformice client |
+| `bot/ruffle_client.py` | Detect and launch Ruffle (Rust Flash emulator) |
+| `bot/standalone_client.py` | Detect, download, and launch the standalone `Transformice.exe` |
 | `docs/BAN_QUORUM_TRANSFORMICE.md` | How the ~11-report quorum relates to multi-slot `/ban` |
 | `.env` | Your accounts + secrets + settings (gitignored) |
-| `flashplayer_32_sa_debug.exe` | Flash standalone debug projector |
-| `TFMProxyLoader.swf` | Patched loader SWF that connects Flash to the local proxy |
+| `flashplayer_32_sa_debug.exe` | Flash standalone debug projector (Flash mode only) |
+| `TFMProxyLoader.swf` | Patched loader SWF that connects Flash to the local proxy (Flash mode only) |
 | `ban_bot.spec`, `build_exe.py` | Build config for `ban_bot.exe` |
 | `requirements.txt` | Python dependencies |
 | `log.txt` | Session log (append each run; repo root next to `.env`) |
-| `logs/` | Markdown **reports** only (`yyyy-mm-dd-HH-mm_HH-mm.md`; session `log.txt` stays in repo root) |
-| `logs/2026-04-28-11-08_11-25.md` | Example log report (filename = **yyyy-mm-dd-HH-mm** start → **_HH-mm** end) |
+| `logs/` | Markdown session reports |
 
 ---
 
