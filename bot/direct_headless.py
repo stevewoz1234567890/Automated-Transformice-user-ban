@@ -272,14 +272,13 @@ class BanBotDirectClient(caseus.Client):
         self._satellite_ready.set()
 
     async def send_command(self, cmd: str) -> bool:
-        """Send a ``/command`` to the server (used for /ban, /room, etc.)."""
+        """Send a ``/command`` to the server via MAIN (Transformice processes
+        commands like /ban on the main connection, not satellite)."""
         try:
-            use_satellite = self.satellite is not self.main
-            conn = self.satellite if use_satellite else self.main
+            conn = self.main
             logger.info(
-                "Slot %s: send_command(%r) via %s (room=%r, satellite_failed=%s)",
-                self._label, cmd, "SATELLITE" if use_satellite else "MAIN",
-                self.current_room, self._satellite_failed,
+                "Slot %s: send_command(%r) via MAIN (room=%r, satellite_failed=%s)",
+                self._label, cmd, self.current_room, self._satellite_failed,
             )
             await conn.write_packet(serverbound.CommandPacket, command=cmd)
             self._packets_sent += 1
