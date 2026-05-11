@@ -145,6 +145,7 @@ class SlotState:
     attempts_used: int = 0
     bind_ip_pool: list[str] = field(default_factory=list)
     current_bind_ip: str = ""
+    headless_slot: object | None = None
 
 
 def _assign_listen_ports(
@@ -537,6 +538,16 @@ def _slot_status_label(s: SlotState) -> tuple[str, str]:
       CRASH — slot thread raised an exception
       DOWN  — proxy never started
     """
+    hs = s.headless_slot
+    if hs is not None:
+        if getattr(hs, "login_failed", False):
+            err = getattr(hs, "login_error", None) or "connection died"
+            return ("CRASH", f"headless login failed: {str(err)[:50]}")
+        if getattr(hs, "logged_in", False):
+            room = getattr(getattr(hs, "_client", None), "current_room", None) or "?"
+            return ("OK   ", f"headless OK (room={room})")
+        return ("NO_LG", "headless: connecting / awaiting login")
+
     if s.error:
         return ("CRASH", s.error[:60])
     if s.proxy is None:
@@ -546,11 +557,6 @@ def _slot_status_label(s: SlotState) -> tuple[str, str]:
     if not s.login_success_event.is_set():
         return ("NO_LG", "MAIN TCP ok but no LoginSuccessPacket")
     if s.proxy._main_write_conn() is None:
-        # Pull the last-close summary off the proxy if available — gives
-        # PARTL rows a per-slot cause (clean-eof, ConnectionResetError, ...)
-        # plus how long the slot survived after login. Avoids forcing the
-        # operator to scroll through the WARNING stream to figure out what
-        # happened to which slot.
         reason = getattr(s.proxy, "_main_last_close_reason", None)
         since_login = getattr(s.proxy, "_main_last_close_since_login_sec", None)
         if reason and since_login is not None:
@@ -837,8 +843,21 @@ def _slot_status_lines(states: list[SlotState], *, title: str = "SLOT STATUS") -
         conn = "-"
         liveness = "-"
         age = ""
-        proxy = s.proxy
-        if proxy is not None:
+        hs = s.headless_slot
+        if hs is not None:
+            nick = (getattr(hs, "username", None) or "").strip() or "-"
+            client = getattr(hs, "_client", None)
+            if client is not None:
+                m_alive = client.main is not None and not getattr(client.main, "_closing", False)
+                s_alive = client.satellite is not None and not getattr(client.satellite, "_closing", False)
+                conn = f"m={'1' if m_alive else '0'} s={'1' if s_alive else '0'}"
+                room = client.current_room or "-"
+                liveness = f"room={room}"
+            else:
+                conn = "m=0 s=0"
+                liveness = "starting"
+        elif s.proxy is not None:
+            proxy = s.proxy
             nick = (getattr(proxy, "_own_username", None) or "").strip() or "-"
             n_main = len(proxy.main_clients or [])
             n_sat = len(getattr(proxy, "satellite_clients", None) or [])
@@ -862,8 +881,13 @@ def _slot_status_lines(states: list[SlotState], *, title: str = "SLOT STATUS") -
     lines.append(banner)
     nicks: list[str] = []
     for s in states:
-        proxy = s.proxy
-        n = (getattr(proxy, "_own_username", None) or "").strip() if proxy else ""
+        hs = s.headless_slot
+        if hs is not None:
+            n = (getattr(hs, "username", None) or "").strip()
+        elif s.proxy is not None:
+            n = (getattr(s.proxy, "_own_username", None) or "").strip()
+        else:
+            n = ""
         if n:
             nicks.append(f"slot{s.label}={n}")
     if nicks:
@@ -3338,8 +3362,11 @@ def main(argv: list[str] | None = None) -> None:
                     )
         # Map login success events back to states so the ban flow sees them as logged in.
         for i, dslot in enumerate(direct_headless_slots):
-            if i < len(states) and dslot.logged_in:
-                states[i].login_success_event.set()
+            if i < len(states):
+                states[i].headless_slot = dslot
+                if dslot.logged_in:
+                    states[i].login_success_event.set()
+                    states[i].flash_main_tcp_seen = True
         auto_flash = False
 
     if not use_headless_keepalive:
