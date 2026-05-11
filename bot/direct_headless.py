@@ -290,6 +290,16 @@ class BanBotDirectClient(caseus.Client):
 
     async def join_room_async(self, room_name: str, *, community: str = "") -> bool:
         """Send JoinRoomPacket via the MAIN connection (room changes go through main)."""
+        target = room_name.strip()
+        already_here = self.current_room is not None and self.current_room == target
+        if already_here:
+            logger.info(
+                "Slot %s: already in room %r — skipping JoinRoomPacket (keeping player list)",
+                self._label, target,
+            )
+            self._joined_room_event.set()
+            return True
+
         self._player_list_ready.clear()
         self._joined_room_event.clear()
         self._joined_room_name = None
@@ -300,23 +310,23 @@ class BanBotDirectClient(caseus.Client):
             logger.info(
                 "Slot %s: sending JoinRoomPacket for %r via MAIN (main_alive=%s, "
                 "current_room=%r, satellite_is_main=%s)",
-                self._label, room_name, main_alive,
+                self._label, target, main_alive,
                 self.current_room, self.satellite is self.main,
             )
             await conn.write_packet_instance(
                 serverbound.JoinRoomPacket(
                     community=community,
-                    name=room_name.strip(),
+                    name=target,
                     password="",
                     auto=False,
                     customization=None,
                 )
             )
             self._packets_sent += 1
-            logger.info("Slot %s: JoinRoomPacket sent for %r (total_sent=%d)", self._label, room_name, self._packets_sent)
+            logger.info("Slot %s: JoinRoomPacket sent for %r (total_sent=%d)", self._label, target, self._packets_sent)
             return True
         except Exception as exc:
-            logger.error("Slot %s: join_room(%r) FAILED: %s", self._label, room_name, exc)
+            logger.error("Slot %s: join_room(%r) FAILED: %s", self._label, target, exc)
             return False
 
     async def wait_joined_room(self, timeout: float = 15.0) -> bool:
