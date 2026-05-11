@@ -2866,6 +2866,19 @@ def _headless_ban_loop(
             "time_sec": dt,
         })
 
+        time.sleep(1.5)
+        logger.info("=== POST-BAN CONNECTION HEALTH ===")
+        for slot in live:
+            client = getattr(slot, "_client", None)
+            if client is not None and hasattr(client, "connection_health_summary"):
+                logger.info("  Slot %s: %s", slot.label, client.connection_health_summary())
+            else:
+                logger.info(
+                    "  Slot %s: room=%r logged_in=%s failed=%s",
+                    slot.label, slot.current_room, slot.logged_in, slot.login_failed,
+                )
+        logger.info("=== END POST-BAN HEALTH ===")
+
         _flush_log_handlers()
         with _quiet_console():
             again = input("Ban someone else? (y/n): ").strip().lower()

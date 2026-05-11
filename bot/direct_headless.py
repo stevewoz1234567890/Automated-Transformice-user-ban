@@ -33,6 +33,7 @@ class BanBotDirectClient(caseus.Client):
       - Graceful satellite connection handling with retry
       - Room list and player list collection
       - Room join confirmation via JoinedRoomPacket
+      - Diagnostic listeners for server messages (ban feedback, errors)
     """
 
     SATELLITE_CONNECT_TIMEOUT = 8.0
@@ -68,6 +69,14 @@ class BanBotDirectClient(caseus.Client):
             self._on_joined_room,
             clientbound.JoinedRoomPacket,
         )
+        self.register_packet_listener(
+            self._on_server_message,
+            clientbound.ServerMessagePacket,
+        )
+        self.register_packet_listener(
+            self._on_general_message,
+            clientbound.GeneralMessagePacket,
+        )
         self._login_success_event = login_success_event
         self._login_failed_event: threading.Event | None = None
         self._label = label
@@ -87,15 +96,19 @@ class BanBotDirectClient(caseus.Client):
         self._player_list_ready = asyncio.Event()
         self._packets_sent: int = 0
         self._packets_recv: int = 0
+        self._last_main_recv: float = 0.0
+        self._last_satellite_recv: float = 0.0
+        self._last_server_msg: str | None = None
+        self._ban_commands_sent: int = 0
 
     @pak.packet_listener(clientbound.LoginSuccessPacket)
     async def _on_login_success_direct(self, server, packet):
         self._logged_in = True
         self._own_username = getattr(packet, "username", None) or self.username
+        sid = getattr(packet, "session_id", None)
         logger.info(
-            "Slot %s: DIRECT LOGIN SUCCESS as %s",
-            self._label,
-            self._own_username,
+            "Slot %s: DIRECT LOGIN SUCCESS as %s (session_id=%s)",
+            self._label, self._own_username, sid,
         )
         if self._login_success_event is not None:
             self._login_success_event.set()
@@ -120,6 +133,26 @@ class BanBotDirectClient(caseus.Client):
             "Slot %s: SERVER CONFIRMED room entry → %r (official=%s)",
             self._label, raw, official,
         )
+
+    async def _on_server_message(self, server, packet):
+        """Log any ServerMessagePacket (ban feedback, errors, notices)."""
+        tmpl = getattr(packet, "template", "") or ""
+        args = getattr(packet, "template_args", []) or []
+        ch = getattr(packet, "general_channel", None)
+        self._last_server_msg = f"{tmpl} {args}"
+        logger.info(
+            "Slot %s: [SERVER MSG] template=%r args=%r channel=%s (room=%r)",
+            self._label, tmpl, args, ch, self.current_room,
+        )
+
+    async def _on_general_message(self, server, packet):
+        """Log any GeneralMessagePacket (server announcements, command responses)."""
+        msg = getattr(packet, "message", "") or ""
+        if msg:
+            logger.info(
+                "Slot %s: [GENERAL MSG] %s (room=%r)",
+                self._label, msg[:200], self.current_room,
+            )
 
     async def _on_room_list(self, server, packet):
         """Collect rooms from every ``RoomListPacket`` the server sends."""
@@ -271,20 +304,48 @@ class BanBotDirectClient(caseus.Client):
         )
         self._satellite_ready.set()
 
+    def _conn_diag(self, conn, name: str) -> str:
+        """One-line diagnostic for a connection object."""
+        if conn is None:
+            return f"{name}=None"
+        closing = getattr(conn, '_closing', False) or getattr(conn, 'is_closing', lambda: False)()
+        writer = getattr(conn, 'writer', None)
+        remote = None
+        if writer is not None:
+            try:
+                transport = writer.transport if hasattr(writer, 'transport') else getattr(writer, '_transport', None)
+                if transport is not None:
+                    peername = transport.get_extra_info('peername')
+                    if peername:
+                        remote = f"{peername[0]}:{peername[1]}"
+            except Exception:
+                pass
+        return f"{name}={'CLOSING' if closing else 'alive'} remote={remote or '?'}"
+
     async def send_command(self, cmd: str) -> bool:
         """Send a ``/command`` to the server via MAIN (Transformice processes
         commands like /ban on the main connection, not satellite)."""
         try:
             conn = self.main
+            main_diag = self._conn_diag(conn, "main")
+            sat_diag = self._conn_diag(self.satellite, "sat")
+            is_ban = cmd.lower().startswith("ban ")
             logger.info(
-                "Slot %s: send_command(%r) via MAIN (room=%r, satellite_failed=%s)",
-                self._label, cmd, self.current_room, self._satellite_failed,
+                "Slot %s: send_command(%r) via MAIN "
+                "(%s | %s | room=%r, own_nick=%r)",
+                self._label, cmd, main_diag, sat_diag,
+                self.current_room, self._own_username,
             )
             await conn.write_packet(serverbound.CommandPacket, command=cmd)
             self._packets_sent += 1
+            if is_ban:
+                self._ban_commands_sent += 1
             return True
         except Exception as exc:
-            logger.error("Slot %s: send_command(%r) FAILED: %s", self._label, cmd, exc)
+            logger.error(
+                "Slot %s: send_command(%r) FAILED: %s (%s)",
+                self._label, cmd, exc, self._conn_diag(self.main, "main"),
+            )
             return False
 
     async def join_room_async(self, room_name: str, *, community: str = "") -> bool:
@@ -352,6 +413,17 @@ class BanBotDirectClient(caseus.Client):
             return True
         except asyncio.TimeoutError:
             return self._satellite_failed is False and self.satellite is not self.main
+
+    def connection_health_summary(self) -> str:
+        """One-line health summary for logging after ban rounds."""
+        m = self._conn_diag(self.main, "main")
+        s = self._conn_diag(self.satellite, "sat")
+        return (
+            f"room={self.current_room!r} nick={self._own_username!r} "
+            f"{m} | {s} | "
+            f"pkts_sent={self._packets_sent} bans_sent={self._ban_commands_sent} "
+            f"last_srv_msg={self._last_server_msg!r}"
+        )
 
     async def run_forever(self) -> None:
         """Connect, login, and stay connected — handling pings automatically."""
