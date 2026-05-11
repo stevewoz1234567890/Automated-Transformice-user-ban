@@ -32,6 +32,7 @@ class BanBotDirectClient(caseus.Client):
       - Exposes ``send_command(cmd)`` for /ban, /room, etc.
       - Graceful satellite connection handling with retry
       - Room list and player list collection
+      - Room join confirmation via JoinedRoomPacket
     """
 
     SATELLITE_CONNECT_TIMEOUT = 8.0
@@ -63,6 +64,10 @@ class BanBotDirectClient(caseus.Client):
             self._on_update_player_list,
             clientbound.UpdatePlayerListPacket,
         )
+        self.register_packet_listener(
+            self._on_joined_room,
+            clientbound.JoinedRoomPacket,
+        )
         self._login_success_event = login_success_event
         self._label = label
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -70,10 +75,15 @@ class BanBotDirectClient(caseus.Client):
         self._own_username: str | None = None
         self._satellite_ready = asyncio.Event()
         self._satellite_failed = False
+        self._joined_room_event = asyncio.Event()
+        self._joined_room_name: str | None = None
+        self.current_room: str | None = None
         self.known_rooms: dict[str, int] = {}
         self._room_list_ready = asyncio.Event()
         self.known_players: dict[str, int] = {}
         self._player_list_ready = asyncio.Event()
+        self._packets_sent: int = 0
+        self._packets_recv: int = 0
 
     @pak.packet_listener(clientbound.LoginSuccessPacket)
     async def _on_login_success_direct(self, server, packet):
@@ -91,6 +101,18 @@ class BanBotDirectClient(caseus.Client):
     async def _on_account_error(self, server, packet):
         ec = getattr(packet, "error_code", None)
         logger.error("Slot %s: AccountError error_code=%s", self._label, ec)
+
+    async def _on_joined_room(self, server, packet):
+        """Server confirms we entered a room."""
+        raw = getattr(packet, "raw_name", "") or ""
+        official = getattr(packet, "official", False)
+        self.current_room = raw
+        self._joined_room_name = raw
+        self._joined_room_event.set()
+        logger.info(
+            "Slot %s: SERVER CONFIRMED room entry → %r (official=%s)",
+            self._label, raw, official,
+        )
 
     async def _on_room_list(self, server, packet):
         """Collect rooms from every ``RoomListPacket`` the server sends."""
@@ -113,7 +135,11 @@ class BanBotDirectClient(caseus.Client):
             username = (getattr(p, "username", "") or "").strip()
             if username:
                 self.known_players[username] = getattr(p, "session_id", 0) or 0
-        logger.info("Slot %s: player list set (%d players)", self._label, len(self.known_players))
+        own_in_list = self._own_username in self.known_players if self._own_username else False
+        logger.info(
+            "Slot %s: player list set (%d players) room=%r self_present=%s",
+            self._label, len(self.known_players), self.current_room, own_in_list,
+        )
         self._player_list_ready.set()
 
     async def _on_update_player_list(self, server, packet):
@@ -124,6 +150,10 @@ class BanBotDirectClient(caseus.Client):
         username = (getattr(p, "username", "") or "").strip()
         if username:
             self.known_players[username] = getattr(p, "session_id", 0) or 0
+            logger.debug(
+                "Slot %s: player joined room: %s (room=%r)",
+                self._label, username, self.current_room,
+            )
 
     async def request_room_list(self, game_mode_int: int = 1) -> bool:
         """Ask the server for the room list. Response arrives via ``_on_room_list``."""
@@ -196,11 +226,15 @@ class BanBotDirectClient(caseus.Client):
 
         addr = getattr(packet, "address", None)
         ports = getattr(packet, "ports", None)
-        logger.info("Slot %s: satellite redirect → %s:%s", self._label, addr, ports)
+        logger.info(
+            "Slot %s: satellite redirect → %s:%s (current_room=%r)",
+            self._label, addr, ports, self.current_room,
+        )
         self._satellite_ready.clear()
         self._satellite_failed = False
 
         if self.satellite is not self.main:
+            logger.debug("Slot %s: closing old satellite connection", self._label)
             self.satellite.close()
             await self.satellite.wait_closed()
 
@@ -224,27 +258,44 @@ class BanBotDirectClient(caseus.Client):
             global_id=packet.global_id,
             auth_id=packet.auth_id,
         )
-        logger.info("Slot %s: satellite ready (%s)", self._label, addr)
+        logger.info(
+            "Slot %s: satellite ready (%s) — room=%r satellite≠main=%s",
+            self._label, addr, self.current_room, self.satellite is not self.main,
+        )
         self._satellite_ready.set()
 
     async def send_command(self, cmd: str) -> bool:
         """Send a ``/command`` to the server (used for /ban, /room, etc.)."""
         try:
-            if self.satellite is not self.main:
-                conn = self.satellite
-            else:
-                conn = self.main
+            use_satellite = self.satellite is not self.main
+            conn = self.satellite if use_satellite else self.main
+            logger.info(
+                "Slot %s: send_command(%r) via %s (room=%r, satellite_failed=%s)",
+                self._label, cmd, "SATELLITE" if use_satellite else "MAIN",
+                self.current_room, self._satellite_failed,
+            )
             await conn.write_packet(serverbound.CommandPacket, command=cmd)
+            self._packets_sent += 1
             return True
         except Exception as exc:
-            logger.error("Slot %s: send_command(%r) failed: %s", self._label, cmd, exc)
+            logger.error("Slot %s: send_command(%r) FAILED: %s", self._label, cmd, exc)
             return False
 
     async def join_room_async(self, room_name: str, *, community: str = "") -> bool:
+        """Send JoinRoomPacket via the MAIN connection (room changes go through main)."""
         self._player_list_ready.clear()
+        self._joined_room_event.clear()
+        self._joined_room_name = None
         self.known_players.clear()
         try:
-            conn = self.satellite if self.satellite is not self.main else self.main
+            conn = self.main
+            main_alive = conn is not None and not getattr(conn, '_closing', False)
+            logger.info(
+                "Slot %s: sending JoinRoomPacket for %r via MAIN (main_alive=%s, "
+                "current_room=%r, satellite_is_main=%s)",
+                self._label, room_name, main_alive,
+                self.current_room, self.satellite is self.main,
+            )
             await conn.write_packet_instance(
                 serverbound.JoinRoomPacket(
                     community=community,
@@ -254,10 +305,28 @@ class BanBotDirectClient(caseus.Client):
                     customization=None,
                 )
             )
-            logger.info("Slot %s: JoinRoomPacket sent for %r", self._label, room_name)
+            self._packets_sent += 1
+            logger.info("Slot %s: JoinRoomPacket sent for %r (total_sent=%d)", self._label, room_name, self._packets_sent)
             return True
         except Exception as exc:
-            logger.error("Slot %s: join_room(%r) failed: %s", self._label, room_name, exc)
+            logger.error("Slot %s: join_room(%r) FAILED: %s", self._label, room_name, exc)
+            return False
+
+    async def wait_joined_room(self, timeout: float = 15.0) -> bool:
+        """Wait for the server to confirm room entry via JoinedRoomPacket."""
+        try:
+            await asyncio.wait_for(self._joined_room_event.wait(), timeout=timeout)
+            logger.info(
+                "Slot %s: room join CONFIRMED by server → %r",
+                self._label, self._joined_room_name,
+            )
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Slot %s: JoinedRoomPacket NOT received within %.1fs "
+                "(server did not confirm room entry — join may have failed)",
+                self._label, timeout,
+            )
             return False
 
     async def wait_satellite_ready(self, timeout: float = 15.0) -> bool:
@@ -337,6 +406,14 @@ class DirectHeadlessSlot:
 
     def wait_satellite(self, *, timeout: float = 10.0) -> bool:
         return self._run_async(self._client.wait_satellite_ready(timeout=timeout), timeout=timeout + 2)
+
+    def wait_joined_room(self, *, timeout: float = 15.0) -> bool:
+        """Block until the server confirms room entry (JoinedRoomPacket)."""
+        return self._run_async(self._client.wait_joined_room(timeout=timeout), timeout=timeout + 2)
+
+    @property
+    def current_room(self) -> str | None:
+        return self._client.current_room
 
     def fetch_room_list(self, game_modes: list[int] | None = None, *, timeout: float = 10.0) -> dict[str, int]:
         """Request room list(s) from the server and return ``{name: player_count}``."""

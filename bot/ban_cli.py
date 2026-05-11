@@ -2816,7 +2816,11 @@ def _headless_ban_loop(
         if target is None:
             continue
 
-        logger.info("Sending /ban %s from %d slots", target, len(live))
+        scout_room = live[0].current_room if live else None
+        logger.info(
+            "Sending /ban %s from %d slots (room=%r)",
+            target, len(live), scout_room,
+        )
         ban_ok = 0
         ban_fail = 0
         t0 = time.time()
@@ -2826,7 +2830,10 @@ def _headless_ban_loop(
             else:
                 ban_fail += 1
         dt = time.time() - t0
-        logger.info("/ban %s complete: %d ok, %d fail in %.1fs", target, ban_ok, ban_fail, dt)
+        logger.info(
+            "/ban %s complete: %d ok, %d fail in %.1fs (room=%r)",
+            target, ban_ok, ban_fail, dt, scout_room,
+        )
         ban_summaries.append({
             "target": target,
             "room": room,
@@ -2898,21 +2905,41 @@ def _headless_join_and_pick_player(live: list, room: str) -> str | None:
         if slot.join_room(room, timeout=10.0):
             ok_count += 1
         else:
-            logger.warning("Slot %s: failed to join room %r", slot.label, room)
+            logger.warning("Slot %s: FAILED to send JoinRoomPacket for %r", slot.label, room)
         time.sleep(0.3)
     logger.info("Room join: %d/%d slots sent JoinRoomPacket for %r", ok_count, len(live), room)
 
     scout = live[0]
-    logger.info("Waiting for player list (up to 35s — module rooms send on round change)...")
+
+    logger.info("Waiting for server to confirm room entry (JoinedRoomPacket)...")
+    confirmed = scout.wait_joined_room(timeout=15.0)
+    if confirmed:
+        logger.info(
+            "Scout (slot %s) CONFIRMED in room %r by server",
+            scout.label, scout.current_room,
+        )
+    else:
+        logger.warning(
+            "Scout (slot %s) did NOT receive JoinedRoomPacket — "
+            "accounts may not actually be in the room!",
+            scout.label,
+        )
+
+    logger.info("Waiting for satellite + player list (up to 35s — module rooms send on round change)...")
     got_list = scout.wait_player_list(timeout=35.0)
     players_dict = scout.get_known_players()
     if not players_dict and not got_list:
         logger.info("Primary wait timed out — checking other slots...")
         for s in live[1:]:
+            alt_confirmed = s.wait_joined_room(timeout=3.0)
             players_dict = s.get_known_players()
             if players_dict:
+                logger.info("Got player list from slot %s (confirmed=%s)", s.label, alt_confirmed)
                 break
-    logger.info("Player list collected: %d players", len(players_dict))
+    logger.info(
+        "Player list collected: %d players (scout_room=%r, confirmed=%s)",
+        len(players_dict), scout.current_room, confirmed,
+    )
 
     own_username = getattr(scout._client, "_own_username", None)
     players = sorted(
