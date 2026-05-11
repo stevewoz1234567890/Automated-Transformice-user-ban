@@ -160,11 +160,12 @@ BOT_ACCOUNTS_JSON = [
 
 | Key | Required | Notes |
 |-----|----------|-------|
-| `proxy_port` | ✔ | Unique TCP port the proxy listens on (Flash connects here) |
+| `proxy_port` | ✔ (Flash) | Unique TCP port the proxy listens on (Flash connects here). Not needed for headless mode. |
 | `username` | ✔ | Email or `Nickname#tag` |
 | `password` | ✔ | Plain-text password (used to compute the login hash) |
 | `label` | — | Human-readable slot name shown in logs |
 | `bind_ip` | — | Reference only — which outbound IP you assigned in Proxifier |
+| `proxy` | — | SOCKS5/SOCKS4/HTTP proxy URL for this account (headless mode). See [Proxy setup](#proxy-setup-per-account-ip). |
 
 ### Crypto secrets (packet auto-login)
 
@@ -223,6 +224,38 @@ TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE=aabbccdd...
 | `BOT_GAME_CLIENT_MODE` | `flash_projector` | Active client mode (`flash_projector`, `standalone_exe`, `steam`, `ruffle`) |
 | `BOT_PROBE_GAME_CLIENTS_AT_STARTUP` | `false` | Run client availability probe on startup |
 | `HEADLESS_LOGIN_STAGGER_SEC` | `2.5` | Delay between starting successive direct headless slots |
+
+### Proxy setup (per-account IP)
+
+Transformice's vote-ban system counts only **one vote per unique IP address** (10 unique IPs trigger a ban). To make each account's vote count, assign a different SOCKS5 proxy to each account so every connection exits from a distinct IP.
+
+Add an optional `"proxy"` field to each account row in `BOT_ACCOUNTS_JSON`:
+
+```ini
+BOT_ACCOUNTS_JSON = [
+    {"label":"1", "username":"acc1@mail.com", "password":"pw1", "proxy":"socks5://user:pass@1.2.3.4:1080"},
+    {"label":"2", "username":"acc2@mail.com", "password":"pw2", "proxy":"socks5://user:pass@5.6.7.8:1080"},
+    {"label":"3", "username":"acc3@mail.com", "password":"pw3"}
+]
+```
+
+| Detail | Value |
+|--------|-------|
+| Supported protocols | `socks5://`, `socks4://`, `http://` (CONNECT tunnel) |
+| URL format | `protocol://[user:password@]host:port` |
+| Dependency | `pip install 'python-socks[asyncio]>=2.6.0'` (already in `requirements.txt`) |
+| Backwards-compatible | Accounts **without** a `proxy` field connect directly (no proxy) |
+| Scope | Both main-server and satellite connections are routed through the proxy |
+
+The proxy is used for **all** TCP connections that account makes (initial login to the main server and the satellite server for room interactions), so the game server sees the proxy's IP for that account.
+
+Logs show which proxy each slot uses:
+
+```
+Slot 1: connected to 51.38.60.113:11801 via socks5://user:***@1.2.3.4:1080 (attempt 1)
+Slot 2: connected to 51.38.60.113:11801 via socks5://user:***@5.6.7.8:1080 (attempt 1)
+Slot 3: connected to 51.38.60.113:11801 via (direct) (attempt 1)
+```
 
 ### Ban timing
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from typing import Any
@@ -21,7 +22,19 @@ from caseus.secrets import Secrets
 from caseus.util.crypto import shakikoo
 from caseus.packets import serverbound, clientbound
 
+try:
+    from python_socks.async_.asyncio import Proxy as SocksProxy
+except ImportError:
+    SocksProxy = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
+
+
+def _mask_proxy_url(url: str | None) -> str:
+    """Return a log-safe version of a proxy URL with the password masked."""
+    if not url:
+        return "(direct)"
+    return re.sub(r"(://[^:]+:)[^@]+(@)", r"\1***\2", url)
 
 
 class BanBotDirectClient(caseus.Client):
@@ -45,10 +58,12 @@ class BanBotDirectClient(caseus.Client):
         *,
         login_success_event: threading.Event | None = None,
         label: str = "?",
+        proxy_url: str | None = None,
         **kwargs: Any,
     ) -> None:
         kwargs["connect_to_satellite"] = False
         super().__init__(**kwargs)
+        self._proxy_url = proxy_url
         self.register_packet_listener(
             self._on_change_satellite_server,
             clientbound.ChangeSatelliteServerPacket,
@@ -232,31 +247,53 @@ class BanBotDirectClient(caseus.Client):
         except asyncio.TimeoutError:
             return False
 
+    async def _open_via_proxy(self, address: str, port: int) -> tuple:
+        """Establish a connection through the configured SOCKS proxy."""
+        if SocksProxy is None:
+            raise ImportError(
+                "python-socks is required for proxy support. "
+                "Install it with: pip install 'python-socks[asyncio]>=2.6.0'"
+            )
+        proxy = SocksProxy.from_url(self._proxy_url)
+        sock = await proxy.connect(dest_host=address, dest_port=port)
+        reader, writer = await asyncio.open_connection(
+            host=None, port=None, sock=sock,
+        )
+        return reader, writer
+
     async def open_streams(self, address, ports):
-        """Override to add timeout and retry logic for connections."""
+        """Override to add timeout, retry logic, and optional SOCKS proxy for connections."""
+        via = _mask_proxy_url(self._proxy_url)
         last_exc = None
         for attempt in range(1, self.SATELLITE_CONNECT_RETRIES + 1):
             for port in ports:
                 try:
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(address, port),
-                        timeout=self.SATELLITE_CONNECT_TIMEOUT,
-                    )
+                    if self._proxy_url:
+                        reader, writer = await asyncio.wait_for(
+                            self._open_via_proxy(address, port),
+                            timeout=self.SATELLITE_CONNECT_TIMEOUT,
+                        )
+                    else:
+                        reader, writer = await asyncio.wait_for(
+                            asyncio.open_connection(address, port),
+                            timeout=self.SATELLITE_CONNECT_TIMEOUT,
+                        )
                     logger.info(
-                        "Slot %s: connected to %s:%d (attempt %d)",
-                        self._label, address, port, attempt,
+                        "Slot %s: connected to %s:%d via %s (attempt %d)",
+                        self._label, address, port, via, attempt,
                     )
                     return reader, writer
                 except (OSError, asyncio.TimeoutError) as exc:
                     last_exc = exc
                     logger.debug(
-                        "Slot %s: %s:%d attempt %d failed: %s",
-                        self._label, address, port, attempt, exc,
+                        "Slot %s: %s:%d via %s attempt %d failed: %s",
+                        self._label, address, port, via, attempt, exc,
                     )
             if attempt < self.SATELLITE_CONNECT_RETRIES:
                 await asyncio.sleep(self.SATELLITE_RETRY_DELAY)
         raise ValueError(
-            f"Unable to connect to address '{address}' on ports {list(ports)}: {last_exc}"
+            f"Unable to connect to address '{address}' on ports {list(ports)} "
+            f"via {via}: {last_exc}"
         )
 
     async def _on_change_satellite_server(self, server, packet):
@@ -418,8 +455,10 @@ class BanBotDirectClient(caseus.Client):
         """One-line health summary for logging after ban rounds."""
         m = self._conn_diag(self.main, "main")
         s = self._conn_diag(self.satellite, "sat")
+        via = _mask_proxy_url(self._proxy_url)
         return (
             f"room={self.current_room!r} nick={self._own_username!r} "
+            f"proxy={via} "
             f"{m} | {s} | "
             f"pkts_sent={self._packets_sent} bans_sent={self._ban_commands_sent} "
             f"last_srv_msg={self._last_server_msg!r}"
@@ -446,9 +485,11 @@ class DirectHeadlessSlot:
         label: str,
         start_room: str = "",
         login_success_event: threading.Event | None = None,
+        proxy_url: str | None = None,
     ) -> None:
         self.label = label
         self.username = username
+        self.proxy_url = proxy_url
         self._login_success_event = login_success_event or threading.Event()
         self._login_failed_event = threading.Event()
 
@@ -459,6 +500,7 @@ class DirectHeadlessSlot:
             start_room=start_room,
             login_success_event=self._login_success_event,
             label=label,
+            proxy_url=proxy_url,
         )
         self._client._login_failed_event = self._login_failed_event
         self._thread: threading.Thread | None = None
@@ -569,6 +611,7 @@ def start_direct_headless_slots(
         label = str(row.get("label", i + 1))
         username = str(row.get("username", "")).strip()
         password = str(row.get("password", ""))
+        proxy_url = row.get("proxy") or None
         if not username or not password.strip():
             logger.error("Slot %s: needs username and password in BOT_ACCOUNTS_JSON", label)
             continue
@@ -581,10 +624,12 @@ def start_direct_headless_slots(
             label=label,
             start_room=start_room,
             login_success_event=login_event,
+            proxy_url=proxy_url,
         )
         slot.start()
-        logger.info("Slot %s: direct headless started → %s:%s",
-                     label, secrets.server_address, secrets.server_ports)
+        logger.info("Slot %s: direct headless started → %s:%s via %s",
+                     label, secrets.server_address, secrets.server_ports,
+                     _mask_proxy_url(proxy_url))
         slots.append(slot)
 
         if stagger_sec > 0 and i < len(raw_accounts) - 1:
