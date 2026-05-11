@@ -73,12 +73,12 @@ class BanBotDirectClient(caseus.Client):
             logger.error("Slot %s: send_command(%r) failed: %s", self._label, cmd, exc)
             return False
 
-    async def join_room_async(self, room_name: str, *, community: int = 0) -> bool:
+    async def join_room_async(self, room_name: str, *, community: str = "") -> bool:
         try:
             conn = self.satellite if self.satellite is not self.main else self.main
             await conn.write_packet_instance(
                 serverbound.JoinRoomPacket(
-                    community=caseus.enums.Community(community),
+                    community=community,
                     name=room_name.strip(),
                     password="",
                     auto=False,
