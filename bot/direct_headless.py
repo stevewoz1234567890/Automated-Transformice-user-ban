@@ -69,9 +69,12 @@ class BanBotDirectClient(caseus.Client):
             clientbound.JoinedRoomPacket,
         )
         self._login_success_event = login_success_event
+        self._login_failed_event: threading.Event | None = None
         self._label = label
         self._loop: asyncio.AbstractEventLoop | None = None
         self._logged_in = False
+        self._login_failed = False
+        self._login_error: str | None = None
         self._own_username: str | None = None
         self._satellite_ready = asyncio.Event()
         self._satellite_failed = False
@@ -100,7 +103,11 @@ class BanBotDirectClient(caseus.Client):
     @pak.packet_listener(clientbound.AccountErrorPacket)
     async def _on_account_error(self, server, packet):
         ec = getattr(packet, "error_code", None)
+        self._login_failed = True
+        self._login_error = f"AccountError error_code={ec}"
         logger.error("Slot %s: AccountError error_code=%s", self._label, ec)
+        if self._login_failed_event is not None:
+            self._login_failed_event.set()
 
     async def _on_joined_room(self, server, packet):
         """Server confirms we entered a room."""
@@ -362,6 +369,7 @@ class DirectHeadlessSlot:
         self.label = label
         self.username = username
         self._login_success_event = login_success_event or threading.Event()
+        self._login_failed_event = threading.Event()
 
         self._client = BanBotDirectClient(
             secrets=secrets,
@@ -371,12 +379,26 @@ class DirectHeadlessSlot:
             login_success_event=self._login_success_event,
             label=label,
         )
+        self._client._login_failed_event = self._login_failed_event
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def logged_in(self) -> bool:
         return self._login_success_event.is_set()
+
+    @property
+    def login_failed(self) -> bool:
+        """True if the slot permanently failed (AccountError or connection died before login)."""
+        if self._login_failed_event.is_set():
+            return True
+        if self._thread is not None and not self._thread.is_alive() and not self.logged_in:
+            return True
+        return False
+
+    @property
+    def login_error(self) -> str | None:
+        return self._client._login_error
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -392,9 +414,13 @@ class DirectHeadlessSlot:
         try:
             loop.run_until_complete(self._client.run_forever())
         except Exception as exc:
+            self._client._login_failed = True
+            self._client._login_error = f"crashed: {exc}"
             logger.error("Slot %s: direct headless client crashed: %s", self.label, exc, exc_info=True)
         finally:
             loop.close()
+            if not self.logged_in:
+                self._login_failed_event.set()
             logger.warning("Slot %s: direct headless connection ended", self.label)
 
     def send_ban(self, target: str, *, timeout: float = 5.0) -> bool:

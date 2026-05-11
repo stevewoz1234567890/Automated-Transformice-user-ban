@@ -3311,22 +3311,31 @@ def main(argv: list[str] | None = None) -> None:
         direct_headless_slots = start_direct_headless_slots(
             raw_accounts, base_secrets, stagger_sec=stagger, start_room=start_room,
         )
-        # Wait for all slots to log in (with a timeout).
         login_deadline = time.time() + 300.0
         while time.time() < login_deadline:
             logged = sum(1 for s in direct_headless_slots if s.logged_in)
-            if logged >= len(direct_headless_slots):
+            failed = sum(1 for s in direct_headless_slots if s.login_failed)
+            if logged + failed >= len(direct_headless_slots):
                 break
             time.sleep(1.0)
             if int(time.time()) % 10 == 0:
-                logger.info(
-                    "Headless-keepalive: %d/%d slots logged in...", logged, len(direct_headless_slots)
-                )
+                msg = f"Headless-keepalive: {logged}/{len(direct_headless_slots)} slots logged in"
+                if failed:
+                    msg += f" ({failed} permanently failed)"
+                logger.info("%s...", msg)
         logged_final = sum(1 for s in direct_headless_slots if s.logged_in)
+        failed_final = sum(1 for s in direct_headless_slots if s.login_failed)
         logger.info(
             "Headless-keepalive login complete: %d/%d slots logged in.",
             logged_final, len(direct_headless_slots),
         )
+        if failed_final:
+            for s in direct_headless_slots:
+                if s.login_failed:
+                    logger.warning(
+                        "  Slot %s (%s): LOGIN FAILED — %s",
+                        s.label, s.username, s.login_error or "connection ended before login",
+                    )
         # Map login success events back to states so the ban flow sees them as logged in.
         for i, dslot in enumerate(direct_headless_slots):
             if i < len(states) and dslot.logged_in:
