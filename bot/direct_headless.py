@@ -31,6 +31,7 @@ class BanBotDirectClient(caseus.Client):
       - Stays connected after login (keepalive)
       - Exposes ``send_command(cmd)`` for /ban, /room, etc.
       - Graceful satellite connection handling with retry
+      - Room list and player list collection
     """
 
     SATELLITE_CONNECT_TIMEOUT = 8.0
@@ -50,6 +51,18 @@ class BanBotDirectClient(caseus.Client):
             self._on_change_satellite_server,
             clientbound.ChangeSatelliteServerPacket,
         )
+        self.register_packet_listener(
+            self._on_room_list,
+            clientbound.RoomListPacket,
+        )
+        self.register_packet_listener(
+            self._on_set_player_list,
+            clientbound.SetPlayerListPacket,
+        )
+        self.register_packet_listener(
+            self._on_update_player_list,
+            clientbound.UpdatePlayerListPacket,
+        )
         self._login_success_event = login_success_event
         self._label = label
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -57,6 +70,10 @@ class BanBotDirectClient(caseus.Client):
         self._own_username: str | None = None
         self._satellite_ready = asyncio.Event()
         self._satellite_failed = False
+        self.known_rooms: dict[str, int] = {}
+        self._room_list_ready = asyncio.Event()
+        self.known_players: dict[str, int] = {}
+        self._player_list_ready = asyncio.Event()
 
     @pak.packet_listener(clientbound.LoginSuccessPacket)
     async def _on_login_success_direct(self, server, packet):
@@ -74,6 +91,76 @@ class BanBotDirectClient(caseus.Client):
     async def _on_account_error(self, server, packet):
         ec = getattr(packet, "error_code", None)
         logger.error("Slot %s: AccountError error_code=%s", self._label, ec)
+
+    async def _on_room_list(self, server, packet):
+        """Collect rooms from every ``RoomListPacket`` the server sends."""
+        for r in (getattr(packet, "rooms", None) or []):
+            name = (getattr(r, "name", "") or "").strip()
+            if not name:
+                continue
+            try:
+                num = int(getattr(r, "num_players", 0) or 0)
+            except (TypeError, ValueError):
+                num = 0
+            self.known_rooms[name] = num
+        logger.info("Slot %s: room list received (%d rooms)", self._label, len(self.known_rooms))
+        self._room_list_ready.set()
+
+    async def _on_set_player_list(self, server, packet):
+        """Full player list sent when we join a room."""
+        self.known_players.clear()
+        for p in (getattr(packet, "players", None) or []):
+            username = (getattr(p, "username", "") or "").strip()
+            if username:
+                self.known_players[username] = getattr(p, "session_id", 0) or 0
+        logger.info("Slot %s: player list set (%d players)", self._label, len(self.known_players))
+        self._player_list_ready.set()
+
+    async def _on_update_player_list(self, server, packet):
+        """Single player joining the room after us."""
+        p = getattr(packet, "player", None)
+        if p is None:
+            return
+        username = (getattr(p, "username", "") or "").strip()
+        if username:
+            self.known_players[username] = getattr(p, "session_id", 0) or 0
+
+    async def request_room_list(self, game_mode_int: int = 1) -> bool:
+        """Ask the server for the room list. Response arrives via ``_on_room_list``."""
+        from caseus import enums as _enums
+        try:
+            gm = _enums.GameMode(game_mode_int)
+        except (ValueError, KeyError):
+            gm = _enums.GameMode.NONE
+        try:
+            conn = self.main
+            await conn.write_packet_instance(
+                serverbound.RoomListPacket(game_mode=gm)
+            )
+            logger.info("Slot %s: RoomListPacket sent (game_mode=%s)", self._label, game_mode_int)
+            return True
+        except Exception as exc:
+            logger.error("Slot %s: request_room_list failed: %s", self._label, exc)
+            return False
+
+    async def reset_room_list(self) -> bool:
+        self.known_rooms.clear()
+        self._room_list_ready.clear()
+        return True
+
+    async def wait_room_list(self, timeout: float = 10.0) -> bool:
+        try:
+            await asyncio.wait_for(self._room_list_ready.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def wait_player_list(self, timeout: float = 12.0) -> bool:
+        try:
+            await asyncio.wait_for(self._player_list_ready.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def open_streams(self, address, ports):
         """Override to add timeout and retry logic for connections."""
@@ -154,8 +241,8 @@ class BanBotDirectClient(caseus.Client):
             return False
 
     async def join_room_async(self, room_name: str, *, community: str = "") -> bool:
-        self._satellite_ready.clear()
-        self._satellite_failed = False
+        self._player_list_ready.clear()
+        self.known_players.clear()
         try:
             conn = self.satellite if self.satellite is not self.main else self.main
             await conn.write_packet_instance(
@@ -251,7 +338,25 @@ class DirectHeadlessSlot:
     def wait_satellite(self, *, timeout: float = 10.0) -> bool:
         return self._run_async(self._client.wait_satellite_ready(timeout=timeout), timeout=timeout + 2)
 
-    def _run_async(self, coro, *, timeout: float = 5.0) -> bool:
+    def fetch_room_list(self, game_modes: list[int] | None = None, *, timeout: float = 10.0) -> dict[str, int]:
+        """Request room list(s) from the server and return ``{name: player_count}``."""
+        if game_modes is None:
+            game_modes = [1, 2, 8, 9, 18]
+        self._run_async(self._client.reset_room_list(), timeout=3.0)
+        for gm in game_modes:
+            self._run_async(self._client.request_room_list(gm), timeout=5.0)
+            time.sleep(0.3)
+        self._run_async(self._client.wait_room_list(timeout=timeout), timeout=timeout + 2)
+        time.sleep(1.5)
+        return dict(self._client.known_rooms)
+
+    def wait_player_list(self, *, timeout: float = 12.0) -> bool:
+        return self._run_async(self._client.wait_player_list(timeout=timeout), timeout=timeout + 2)
+
+    def get_known_players(self) -> dict[str, int]:
+        return dict(self._client.known_players)
+
+    def _run_async(self, coro, *, timeout: float = 5.0):
         loop = self._loop
         if loop is None or loop.is_closed():
             logger.error("Slot %s: event loop not ready", self.label)

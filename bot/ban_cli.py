@@ -2791,8 +2791,9 @@ def _headless_ban_loop(
     ban_summaries: list[dict[str, object]],
 ) -> None:
     """
-    Simplified ban loop for ``--headless-keepalive`` (direct connection).
-    No Flash, no proxy — rooms and /ban go through the direct caseus clients.
+    Ban loop for ``--headless-keepalive`` (direct connection).
+    Fetches room list from the server, shows a numbered menu, then after
+    joining the selected room fetches the player list and shows it.
     """
     from .direct_headless import DirectHeadlessSlot
 
@@ -2806,29 +2807,13 @@ def _headless_ban_loop(
         print(f"\n{'='*50}", flush=True)
         print(f"  HEADLESS MODE — {len(live)} slots logged in", flush=True)
         print(f"{'='*50}", flush=True)
-        with _quiet_console():
-            room = input("\nEnter room name (or 'q' to quit): ").strip()
-        if room.lower() in ("q", "quit", "exit", ""):
+
+        room = _headless_pick_room(live)
+        if room is None:
             break
-        logger.info("Joining room: %r with %d slots", room, len(live))
 
-        ok_count = 0
-        for slot in live:
-            if slot.join_room(room, timeout=10.0):
-                ok_count += 1
-            else:
-                logger.warning("Slot %s: failed to join room %r", slot.label, room)
-            time.sleep(0.3)
-        logger.info("Room join: %d/%d slots sent JoinRoomPacket for %r", ok_count, len(live), room)
-
-        logger.info("Waiting for satellite connections (room server)...")
-        time.sleep(5.0)
-        sat_ready = sum(1 for s in live if s.wait_satellite(timeout=10.0))
-        logger.info("Satellite connections: %d/%d ready", sat_ready, len(live))
-
-        with _quiet_console():
-            target = input("Enter player name to /ban (or 'skip' to pick another room): ").strip()
-        if not target or target.lower() in ("skip", "s"):
+        target = _headless_join_and_pick_player(live, room)
+        if target is None:
             continue
 
         logger.info("Sending /ban %s from %d slots", target, len(live))
@@ -2855,6 +2840,118 @@ def _headless_ban_loop(
             again = input("Ban someone else? (y/n): ").strip().lower()
         if again not in ("y", "yes"):
             break
+
+
+def _headless_pick_room(live: list) -> str | None:
+    """Fetch the room list from the game server and let the user pick one."""
+    _flush_log_handlers()
+    logger.info("Fetching room list from game server...")
+    scout = live[0]
+    rooms_dict = scout.fetch_room_list(timeout=10.0)
+
+    if rooms_dict:
+        rooms = sorted(rooms_dict.items(), key=lambda x: x[0].lower())
+        print(f"\nAvailable rooms ({len(rooms)} total):", flush=True)
+        for i, (name, players) in enumerate(rooms, 1):
+            print(f"  {i:3d}. {name:<30s}  [{players} players]", flush=True)
+        print(flush=True)
+        _flush_log_handlers()
+        while True:
+            with _quiet_console():
+                choice = input("Enter room number or room name (or 'q' to quit): ").strip()
+            if not choice:
+                continue
+            if choice.lower() in ("q", "quit", "exit"):
+                return None
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(rooms):
+                    chosen = rooms[idx][0]
+                    logger.info("Room selected by number %s: %r", choice, chosen)
+                    return chosen
+                print(f"  Invalid number. Enter 1–{len(rooms)} or a room name.", flush=True)
+                continue
+            logger.info("Room entered directly: %r", choice)
+            return choice
+    else:
+        logger.info("No room list received — enter room name manually.")
+        while True:
+            with _quiet_console():
+                room = input("\nEnter room name (or 'q' to quit): ").strip()
+            if not room:
+                continue
+            if room.lower() in ("q", "quit", "exit"):
+                return None
+            return room
+
+
+def _headless_join_and_pick_player(live: list, room: str) -> str | None:
+    """
+    Join *room* with all slots, wait for satellite + player list from the
+    first slot, then display a numbered player list.
+    Returns the chosen nickname, or ``None`` to skip back to room selection.
+    """
+    logger.info("Joining room: %r with %d slots", room, len(live))
+
+    ok_count = 0
+    for slot in live:
+        if slot.join_room(room, timeout=10.0):
+            ok_count += 1
+        else:
+            logger.warning("Slot %s: failed to join room %r", slot.label, room)
+        time.sleep(0.3)
+    logger.info("Room join: %d/%d slots sent JoinRoomPacket for %r", ok_count, len(live), room)
+
+    scout = live[0]
+    logger.info("Waiting for player list (up to 35s — module rooms send on round change)...")
+    got_list = scout.wait_player_list(timeout=35.0)
+    players_dict = scout.get_known_players()
+    if not players_dict and not got_list:
+        logger.info("Primary wait timed out — checking other slots...")
+        for s in live[1:]:
+            players_dict = s.get_known_players()
+            if players_dict:
+                break
+    logger.info("Player list collected: %d players", len(players_dict))
+
+    own_username = getattr(scout._client, "_own_username", None)
+    players = sorted(
+        (name for name in players_dict if name != own_username),
+        key=str.lower,
+    )
+
+    if players:
+        print(f"\nPlayers in {room!r} ({len(players)} total):", flush=True)
+        for i, name in enumerate(players, 1):
+            print(f"  {i:3d}. {name}", flush=True)
+        print(flush=True)
+        _flush_log_handlers()
+        while True:
+            with _quiet_console():
+                choice = input("Enter player number or nickname (or 'skip' to pick another room): ").strip()
+            if not choice or choice.lower() in ("skip", "s"):
+                return None
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(players):
+                    chosen = players[idx]
+                    logger.info("Player selected by number %s: %r", choice, chosen)
+                    return chosen
+                print(f"  Invalid number. Enter 1–{len(players)} or a nickname.", flush=True)
+                continue
+            logger.info("Player entered directly: %r", choice)
+            return choice
+    else:
+        logger.info("No player list received — enter nickname manually.")
+        _flush_log_handlers()
+        while True:
+            with _quiet_console():
+                target = input("Enter player name to /ban (or 'skip' to pick another room): ").strip()
+            if not target:
+                continue
+            if target.lower() in ("skip", "s"):
+                return None
+            return target
 
 
 def main(argv: list[str] | None = None) -> None:
