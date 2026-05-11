@@ -176,17 +176,23 @@ def _secrets_to_tfm_env_updates(secrets: Secrets, prefix: str) -> dict[str, str]
         cvt_s = bytes(cvt).hex()
     else:
         cvt_s = str(cvt)
-    ports = secrets.server_ports
-    pks = secrets.packet_key_sources
-    return {
-        f"{p}SERVER_ADDRESS": str(secrets.server_address),
-        f"{p}SERVER_PORTS": ",".join(str(int(x)) for x in ports),
-        f"{p}GAME_VERSION": str(int(secrets.game_version)),
-        f"{p}CONNECTION_TOKEN": str(secrets.connection_token),
-        f"{p}AUTH_KEY": str(int(secrets.auth_key)),
-        f"{p}PACKET_KEY_SOURCES": ",".join(str(int(x)) for x in pks),
-        f"{p}CLIENT_VERIFICATION_TEMPLATE": cvt_s,
-    }
+    ports = secrets.server_ports or ()
+    pks = secrets.packet_key_sources or ()
+    d: dict[str, str] = {}
+    if secrets.server_address is not None:
+        d[f"{p}SERVER_ADDRESS"] = str(secrets.server_address)
+    if ports:
+        d[f"{p}SERVER_PORTS"] = ",".join(str(int(x)) for x in ports)
+    if secrets.game_version is not None:
+        d[f"{p}GAME_VERSION"] = str(int(secrets.game_version))
+    if secrets.connection_token is not None:
+        d[f"{p}CONNECTION_TOKEN"] = str(secrets.connection_token)
+    if secrets.auth_key is not None:
+        d[f"{p}AUTH_KEY"] = str(int(secrets.auth_key))
+    if pks:
+        d[f"{p}PACKET_KEY_SOURCES"] = ",".join(str(int(x)) for x in pks)
+    d[f"{p}CLIENT_VERIFICATION_TEMPLATE"] = cvt_s
+    return d
 
 
 def _persist_secrets_to_dotenv(sec: Secrets, cfg: object, dot: Path) -> None:
@@ -636,7 +642,12 @@ async def _run_one_client(
         connect_to_satellite=connect_to_satellite,
         exit_after_login_success=exit_after_login_success,
     )
-    await client.start()
+    logger.info("Headless _run_one_client: calling client.start() for %s (exit_after=%s)", username, exit_after_login_success)
+    try:
+        await client.start()
+        logger.info("Headless _run_one_client: client.start() returned for %s", username)
+    except Exception as exc:
+        logger.error("Headless _run_one_client: client.start() raised %s: %s", type(exc).__name__, exc, exc_info=True)
 
 
 def _run_one_slot_headless(
@@ -645,6 +656,7 @@ def _run_one_slot_headless(
     row: dict[str, object],
     cfg: object,
     base_secrets: Secrets,
+    keepalive: bool = False,
 ) -> None:
     label = state.label
     main_port = state.port
@@ -662,11 +674,16 @@ def _run_one_slot_headless(
 
     start_room = str(getattr(cfg, "PACKET_LOGIN_START_ROOM", "") or "")
 
+    exit_after = not keepalive and bool(
+        getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True)
+    )
+    mode = "keepalive" if keepalive else "exit-after-login"
     logger.info(
-        "Slot %s: starting headless caseus.Client → %s:%s",
+        "Slot %s: starting headless caseus.Client → %s:%s (mode=%s)",
         label,
         connect_host,
         main_port,
+        mode,
     )
     try:
         asyncio.run(
@@ -677,9 +694,7 @@ def _run_one_slot_headless(
                 start_room=start_room,
                 login_success_event=state.login_success_event,
                 connect_to_satellite=bool(getattr(cfg, "HEADLESS_CONNECT_TO_SATELLITE", True)),
-                exit_after_login_success=bool(
-                    getattr(cfg, "HEADLESS_EXIT_AFTER_LOGIN_SUCCESS", True)
-                ),
+                exit_after_login_success=exit_after,
             )
         )
         if not state.login_success_event.is_set():
@@ -688,13 +703,66 @@ def _run_one_slot_headless(
                 label,
             )
         else:
-            logger.debug("Slot %s: headless session ended (connection closed)", label)
+            if keepalive:
+                logger.warning(
+                    "Slot %s: headless-keepalive session ended (connection closed by server or network)",
+                    label,
+                )
+            else:
+                logger.debug("Slot %s: headless session ended (connection closed)", label)
     except AccountError as e:
         logger.error("Slot %s: [login] AccountError from server error_code=%s", label, e.error_code)
     except OSError as e:
         logger.error("Slot %s: [login] cannot reach proxy (check port): %s", label, e)
     except Exception:
         logger.exception("Slot %s: headless client failed", label)
+
+
+def start_headless_keepalive_threads(
+    states: list[Any],
+    raw_accounts: list[dict[str, object]],
+    cfg: object,
+    *,
+    base_secrets: Secrets | None = None,
+) -> list[threading.Thread]:
+    """
+    Launch one background daemon thread per slot running a ``HeadlessProxyClient``
+    with ``exit_after_login_success=False``.  Each client stays connected to the
+    local proxy after login, keeping the proxy's upstream TCP alive so /room and
+    /ban commands work without Flash.
+
+    Returns the list of launched threads.  The caller should wait on each slot's
+    ``login_success_event`` to know when login completed.
+    """
+    base = base_secrets if base_secrets is not None else load_secrets_base(cfg)
+    stagger = max(0.0, float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 2.5) or 0.0))
+    threads: list[threading.Thread] = []
+
+    for i, (state, row) in enumerate(zip(states, raw_accounts)):
+        def _target(st=state, r=row, idx=i):
+            if idx > 0 and stagger > 0:
+                time.sleep(stagger * idx)
+            _run_one_slot_headless(
+                state=st,
+                row=r,
+                cfg=cfg,
+                base_secrets=base,
+                keepalive=True,
+            )
+
+        t = threading.Thread(
+            target=_target,
+            name=f"headless-keepalive-{state.label}",
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        logger.info(
+            "Slot %s: headless-keepalive thread started (will stay connected after login)",
+            state.label,
+        )
+
+    return threads
 
 
 def start_headless_client_threads(

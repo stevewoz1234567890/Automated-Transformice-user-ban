@@ -2708,6 +2708,30 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "Not recommended for diagnosing PC vs mobile / hotspot differences."
         ),
     )
+    p.add_argument(
+        "--probe-clients",
+        action="store_true",
+        help=(
+            "Probe all known Transformice game-client access methods (SWF URLs, Steam, "
+            "Ruffle, standalone EXE, TCP) and exit with a report."
+        ),
+    )
+    p.add_argument(
+        "--client-mode",
+        choices=["flash_projector", "standalone_exe", "steam", "ruffle"],
+        default=None,
+        help="Override BOT_GAME_CLIENT_MODE for this run.",
+    )
+    p.add_argument(
+        "--headless-keepalive",
+        action="store_true",
+        help=(
+            "Use headless caseus.Client connections instead of Flash Player. "
+            "Each slot runs a Python TCP client that stays connected after login, "
+            "keeping the proxy's upstream alive for /room and /ban without Flash. "
+            "Fixes the ~5s Flash crash (Issue 1) by removing Flash from the loop entirely."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -2762,6 +2786,73 @@ def _cfg_shared_flash_policy_port(cfg) -> int | None:
     return p if p > 0 else None
 
 
+def _headless_ban_loop(
+    direct_slots: list,
+    ban_summaries: list[dict[str, object]],
+) -> None:
+    """
+    Simplified ban loop for ``--headless-keepalive`` (direct connection).
+    No Flash, no proxy — rooms and /ban go through the direct caseus clients.
+    """
+    from .direct_headless import DirectHeadlessSlot
+
+    live = [s for s in direct_slots if s.logged_in]
+    if not live:
+        logger.error("No slots logged in — cannot proceed with ban.")
+        return
+
+    while True:
+        _flush_log_handlers()
+        print(f"\n{'='*50}", flush=True)
+        print(f"  HEADLESS MODE — {len(live)} slots logged in", flush=True)
+        print(f"{'='*50}", flush=True)
+        with _quiet_console():
+            room = input("\nEnter room name (or 'q' to quit): ").strip()
+        if room.lower() in ("q", "quit", "exit", ""):
+            break
+        logger.info("Joining room: %r with %d slots", room, len(live))
+
+        ok_count = 0
+        for slot in live:
+            if slot.join_room(room, timeout=10.0):
+                ok_count += 1
+            else:
+                logger.warning("Slot %s: failed to join room %r", slot.label, room)
+            time.sleep(0.3)
+        logger.info("Room join: %d/%d slots sent JoinRoomPacket for %r", ok_count, len(live), room)
+        time.sleep(2.0)
+
+        with _quiet_console():
+            target = input("Enter player name to /ban (or 'skip' to pick another room): ").strip()
+        if not target or target.lower() in ("skip", "s"):
+            continue
+
+        logger.info("Sending /ban %s from %d slots", target, len(live))
+        ban_ok = 0
+        ban_fail = 0
+        t0 = time.time()
+        for slot in live:
+            if slot.send_ban(target, timeout=5.0):
+                ban_ok += 1
+            else:
+                ban_fail += 1
+        dt = time.time() - t0
+        logger.info("/ban %s complete: %d ok, %d fail in %.1fs", target, ban_ok, ban_fail, dt)
+        ban_summaries.append({
+            "target": target,
+            "room": room,
+            "ok": ban_ok,
+            "fail": ban_fail,
+            "time_sec": dt,
+        })
+
+        _flush_log_handlers()
+        with _quiet_console():
+            again = input("Ban someone else? (y/n): ").strip().lower()
+        if again not in ("y", "yes"):
+            break
+
+
 def main(argv: list[str] | None = None) -> None:
     colorama_init()
     if sys.platform == "win32":
@@ -2780,6 +2871,15 @@ def main(argv: list[str] | None = None) -> None:
     issue1_forensic.apply_env_overrides()
     reset_trace_session()
     trace_step(logger, "main", "CLI session begin argv_summary skip_net_check=%s", args.skip_net_check)
+    if getattr(args, "client_mode", None):
+        os.environ["BOT_GAME_CLIENT_MODE"] = args.client_mode
+    from .client_mode import maybe_run_startup_probe, resolve_client_mode
+    if getattr(args, "probe_clients", False):
+        from .probe_clients_cli import run_probe
+        sys.exit(run_probe(_repo_root()))
+    maybe_run_startup_probe(_repo_root())
+    client_kind = resolve_client_mode()
+    trace_step(logger, "main", "game_client_mode=%s", client_kind.value)
     tfm_startup_refresh.run_flash_startup_refresh(_repo_root())
     session_wall_start = time.time()
     log_txt_path = _repo_root() / "log.txt"
@@ -2787,7 +2887,10 @@ def main(argv: list[str] | None = None) -> None:
     session_exit_reason = "finished"
     from .run_checklist import prompt_run_checklist
 
-    prompt_run_checklist()
+    if not getattr(args, "headless_keepalive", False):
+        prompt_run_checklist()
+    else:
+        logger.info("Headless-keepalive mode — skipping interactive pre-run checklist.")
     if not args.skip_net_check:
         trace_step(logger, "main", "run_network_preflight() starting")
         from .net_preflight import run_network_preflight
@@ -3060,15 +3163,60 @@ def main(argv: list[str] | None = None) -> None:
     )
     trace_step(logger, "main", "proxy listener threads spawned (asyncio.run per slot thread)")
 
-    auto_flash = (
-        sys.platform == "win32"
-        and bool(getattr(cfg, "UI_AUTO_LAUNCH_FLASH", True))
-        and flash_launch.flash_launch_files_present(_repo_root())
-    )
-    if sys.platform == "win32" and not getattr(cfg, "UI_AUTO_LAUNCH_FLASH", True):
+    # --headless-keepalive: use Python caseus.Client instead of Flash Player.
+    use_headless_keepalive = getattr(args, "headless_keepalive", False)
+    direct_headless_slots = None
+    if use_headless_keepalive:
+        logger.info(
+            "=== HEADLESS-KEEPALIVE MODE ===\n"
+            "Connecting directly to the game server with Python caseus.Client.\n"
+            "No Flash Player or local proxy needed."
+        )
+        for s in states:
+            s.flash_loader_ready_event.set()
+        from .headless_client import load_secrets_base, sync_upstream_cfg_from_secrets
+        from .direct_headless import start_direct_headless_slots
+        base_secrets = load_secrets_base(cfg)
+        sync_upstream_cfg_from_secrets(cfg, base_secrets)
+        start_room = str(getattr(cfg, "PACKET_LOGIN_START_ROOM", "") or "")
+        stagger = max(0.5, float(getattr(cfg, "HEADLESS_LOGIN_STAGGER_SEC", 2.5) or 2.5))
+        direct_headless_slots = start_direct_headless_slots(
+            raw_accounts, base_secrets, stagger_sec=stagger, start_room=start_room,
+        )
+        # Wait for all slots to log in (with a timeout).
+        login_deadline = time.time() + 300.0
+        while time.time() < login_deadline:
+            logged = sum(1 for s in direct_headless_slots if s.logged_in)
+            if logged >= len(direct_headless_slots):
+                break
+            time.sleep(1.0)
+            if int(time.time()) % 10 == 0:
+                logger.info(
+                    "Headless-keepalive: %d/%d slots logged in...", logged, len(direct_headless_slots)
+                )
+        logged_final = sum(1 for s in direct_headless_slots if s.logged_in)
+        logger.info(
+            "Headless-keepalive login complete: %d/%d slots logged in.",
+            logged_final, len(direct_headless_slots),
+        )
+        # Map login success events back to states so the ban flow sees them as logged in.
+        for i, dslot in enumerate(direct_headless_slots):
+            if i < len(states) and dslot.logged_in:
+                states[i].login_success_event.set()
+        auto_flash = False
+
+    if not use_headless_keepalive:
+        auto_flash = (
+            sys.platform == "win32"
+            and bool(getattr(cfg, "UI_AUTO_LAUNCH_FLASH", True))
+            and flash_launch.flash_launch_files_present(_repo_root())
+        )
+    else:
+        auto_flash = False
+
+    if not use_headless_keepalive and sys.platform == "win32" and not getattr(cfg, "UI_AUTO_LAUNCH_FLASH", True):
         logger.info("BOT_UI_AUTO_LAUNCH_FLASH=false — skipping Flash auto-launch; start game clients manually.")
         _flush_log_handlers()
-    # main_tcp auto-login waits on flash_loader_ready_event; without auto-launch there is no loader phase.
     if not auto_flash:
         for s in states:
             s.flash_loader_ready_event.set()
@@ -3839,28 +3987,32 @@ def main(argv: list[str] | None = None) -> None:
     # Ctrl-C, or an uncaught exception. Without this the user ends up with
     # ~14 Flash windows to hand-close every session.
     try:
-        while True:
-            pre_ban_dismiss_flash_dialogs(states, cfg)
-            room = _pick_room(states, cfg)
-            logger.info("Target room: %r", room)
-            if not room:
-                logger.info("Empty room; try again.")
-                continue
+        if direct_headless_slots is not None:
+            # Direct headless mode: use direct_headless_slots for room/ban.
+            _headless_ban_loop(direct_headless_slots, ban_summaries)
+        else:
+            while True:
+                pre_ban_dismiss_flash_dialogs(states, cfg)
+                room = _pick_room(states, cfg)
+                logger.info("Target room: %r", room)
+                if not room:
+                    logger.info("Empty room; try again.")
+                    continue
 
-            target = _show_and_pick_player(states, room, cfg)
-            logger.info("Target user: %r", target)
-            if not target:
-                logger.info("Empty user; try again.")
-                continue
+                target = _show_and_pick_player(states, room, cfg)
+                logger.info("Target user: %r", target)
+                if not target:
+                    logger.info("Empty user; try again.")
+                    continue
 
-            ban_summaries.append(send_ban_to_all(states, target, cfg))
+                ban_summaries.append(send_ban_to_all(states, target, cfg))
 
-            _flush_log_handlers()
-            with _quiet_console():
-                again = input('Ban someone else? (y/n): ').strip().lower()
-            logger.info("Ban someone else? answered: %r", again)
-            if again not in ("y", "yes"):
-                break
+                _flush_log_handlers()
+                with _quiet_console():
+                    again = input('Ban someone else? (y/n): ').strip().lower()
+                logger.info("Ban someone else? answered: %r", again)
+                if again not in ("y", "yes"):
+                    break
 
         logger.info("Exiting (proxy threads stop when you close this process).")
     except KeyboardInterrupt:

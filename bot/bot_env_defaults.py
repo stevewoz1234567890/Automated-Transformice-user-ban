@@ -258,6 +258,25 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "FLASH_ERROR_FIRST_FP_PREVIEW_CHARS": "1400",
     # Log a second WARNING line with remaining body after preview (same first fingerprint only).
     "FLASH_ERROR_LOG_FULL_BODY_FIRST_FP": "false",
+    # --- Alternative game-client access ---
+    # Which client to use: flash_projector (default), standalone_exe, steam, ruffle.
+    "BOT_GAME_CLIENT_MODE": "flash_projector",
+    # Steam: path to Transformice install (auto-detected if empty).
+    "BOT_STEAM_GAME_DIR": "",
+    # Steam Electron: remote-debugging-port for Selenium/Puppeteer automation.
+    "BOT_STEAM_ELECTRON_DEBUG_PORT": "9222",
+    # Standalone: local path to Transformice.exe (auto-detected in repo root / tmp/).
+    "BOT_STANDALONE_EXE_PATH": "",
+    # Standalone: download from official URL if not present locally.
+    "BOT_STANDALONE_AUTO_DOWNLOAD": "false",
+    # Ruffle: path to ruffle binary (auto-detected on PATH).
+    "BOT_RUFFLE_BINARY_PATH": "",
+    # Ruffle: port for the websockify TCP→WS bridge.
+    "BOT_RUFFLE_WEBSOCKIFY_PORT": "8080",
+    # SWF URL to load in Ruffle or standalone — uses first reachable official endpoint by default.
+    "BOT_GAME_SWF_URL": "",
+    # Run the client access probe at startup (logs which methods are available).
+    "BOT_PROBE_GAME_CLIENTS_AT_STARTUP": "false",
 }
 
 
