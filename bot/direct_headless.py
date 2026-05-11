@@ -30,7 +30,12 @@ class BanBotDirectClient(caseus.Client):
       - No proxy needed (connects directly to the game server)
       - Stays connected after login (keepalive)
       - Exposes ``send_command(cmd)`` for /ban, /room, etc.
+      - Graceful satellite connection handling with retry
     """
+
+    SATELLITE_CONNECT_TIMEOUT = 8.0
+    SATELLITE_CONNECT_RETRIES = 2
+    SATELLITE_RETRY_DELAY = 1.5
 
     def __init__(
         self,
@@ -39,12 +44,19 @@ class BanBotDirectClient(caseus.Client):
         label: str = "?",
         **kwargs: Any,
     ) -> None:
+        kwargs["connect_to_satellite"] = False
         super().__init__(**kwargs)
+        self.register_packet_listener(
+            self._on_change_satellite_server,
+            clientbound.ChangeSatelliteServerPacket,
+        )
         self._login_success_event = login_success_event
         self._label = label
         self._loop: asyncio.AbstractEventLoop | None = None
         self._logged_in = False
         self._own_username: str | None = None
+        self._satellite_ready = asyncio.Event()
+        self._satellite_failed = False
 
     @pak.packet_listener(clientbound.LoginSuccessPacket)
     async def _on_login_success_direct(self, server, packet):
@@ -63,10 +75,78 @@ class BanBotDirectClient(caseus.Client):
         ec = getattr(packet, "error_code", None)
         logger.error("Slot %s: AccountError error_code=%s", self._label, ec)
 
+    async def open_streams(self, address, ports):
+        """Override to add timeout and retry logic for connections."""
+        last_exc = None
+        for attempt in range(1, self.SATELLITE_CONNECT_RETRIES + 1):
+            for port in ports:
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(address, port),
+                        timeout=self.SATELLITE_CONNECT_TIMEOUT,
+                    )
+                    logger.info(
+                        "Slot %s: connected to %s:%d (attempt %d)",
+                        self._label, address, port, attempt,
+                    )
+                    return reader, writer
+                except (OSError, asyncio.TimeoutError) as exc:
+                    last_exc = exc
+                    logger.debug(
+                        "Slot %s: %s:%d attempt %d failed: %s",
+                        self._label, address, port, attempt, exc,
+                    )
+            if attempt < self.SATELLITE_CONNECT_RETRIES:
+                await asyncio.sleep(self.SATELLITE_RETRY_DELAY)
+        raise ValueError(
+            f"Unable to connect to address '{address}' on ports {list(ports)}: {last_exc}"
+        )
+
+    async def _on_change_satellite_server(self, server, packet):
+        """Override caseus default to add graceful error handling and readiness signaling."""
+        if packet.should_ignore:
+            return
+
+        addr = getattr(packet, "address", None)
+        ports = getattr(packet, "ports", None)
+        logger.info("Slot %s: satellite redirect → %s:%s", self._label, addr, ports)
+        self._satellite_ready.clear()
+        self._satellite_failed = False
+
+        if self.satellite is not self.main:
+            self.satellite.close()
+            await self.satellite.wait_closed()
+
+        try:
+            reader, writer = await self.open_streams(packet.address, packet.ports)
+        except (ValueError, OSError) as exc:
+            logger.error(
+                "Slot %s: satellite connection FAILED (%s:%s): %s  "
+                "— /ban will use main connection as fallback. "
+                "Ensure Proxifier routes python.exe to this IP.",
+                self._label, addr, ports, exc,
+            )
+            self._satellite_failed = True
+            self._satellite_ready.set()
+            return
+
+        self.satellite = self.Connection(self, reader=reader, writer=writer)
+        await self.satellite.write_packet(
+            serverbound.SatelliteDelayedIdentificationPacket,
+            timestamp=packet.timestamp,
+            global_id=packet.global_id,
+            auth_id=packet.auth_id,
+        )
+        logger.info("Slot %s: satellite ready (%s)", self._label, addr)
+        self._satellite_ready.set()
+
     async def send_command(self, cmd: str) -> bool:
         """Send a ``/command`` to the server (used for /ban, /room, etc.)."""
         try:
-            conn = self.satellite if self.satellite is not self.main else self.main
+            if self.satellite is not self.main:
+                conn = self.satellite
+            else:
+                conn = self.main
             await conn.write_packet(serverbound.CommandPacket, command=cmd)
             return True
         except Exception as exc:
@@ -74,6 +154,8 @@ class BanBotDirectClient(caseus.Client):
             return False
 
     async def join_room_async(self, room_name: str, *, community: str = "") -> bool:
+        self._satellite_ready.clear()
+        self._satellite_failed = False
         try:
             conn = self.satellite if self.satellite is not self.main else self.main
             await conn.write_packet_instance(
@@ -90,6 +172,14 @@ class BanBotDirectClient(caseus.Client):
         except Exception as exc:
             logger.error("Slot %s: join_room(%r) failed: %s", self._label, room_name, exc)
             return False
+
+    async def wait_satellite_ready(self, timeout: float = 15.0) -> bool:
+        """Wait for the satellite connection to be established after a room join."""
+        try:
+            await asyncio.wait_for(self._satellite_ready.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return self._satellite_failed is False and self.satellite is not self.main
 
     async def run_forever(self) -> None:
         """Connect, login, and stay connected — handling pings automatically."""
@@ -157,6 +247,9 @@ class DirectHeadlessSlot:
 
     def join_room(self, room_name: str, *, timeout: float = 5.0) -> bool:
         return self._run_async(self._client.join_room_async(room_name), timeout=timeout)
+
+    def wait_satellite(self, *, timeout: float = 10.0) -> bool:
+        return self._run_async(self._client.wait_satellite_ready(timeout=timeout), timeout=timeout + 2)
 
     def _run_async(self, coro, *, timeout: float = 5.0) -> bool:
         loop = self._loop

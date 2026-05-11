@@ -2820,7 +2820,11 @@ def _headless_ban_loop(
                 logger.warning("Slot %s: failed to join room %r", slot.label, room)
             time.sleep(0.3)
         logger.info("Room join: %d/%d slots sent JoinRoomPacket for %r", ok_count, len(live), room)
-        time.sleep(2.0)
+
+        logger.info("Waiting for satellite connections (room server)...")
+        time.sleep(5.0)
+        sat_ready = sum(1 for s in live if s.wait_satellite(timeout=10.0))
+        logger.info("Satellite connections: %d/%d ready", sat_ready, len(live))
 
         with _quiet_console():
             target = input("Enter player name to /ban (or 'skip' to pick another room): ").strip()
