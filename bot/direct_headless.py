@@ -21,6 +21,7 @@ import caseus
 from caseus.secrets import Secrets
 from caseus.util.crypto import shakikoo
 from caseus.packets import serverbound, clientbound
+from caseus.packets.packet import ClientboundPacket, ClientboundLegacyPacket
 
 try:
     from python_socks.async_.asyncio import Proxy as SocksProxy
@@ -92,6 +93,14 @@ class BanBotDirectClient(caseus.Client):
             self._on_general_message,
             clientbound.GeneralMessagePacket,
         )
+        self.register_packet_listener(
+            self._on_ban_message,
+            clientbound.BanMessagePacket,
+        )
+        self.register_packet_listener(
+            self._on_legacy_packet,
+            ClientboundLegacyPacket,
+        )
         self._login_success_event = login_success_event
         self._login_failed_event: threading.Event | None = None
         self._label = label
@@ -115,6 +124,73 @@ class BanBotDirectClient(caseus.Client):
         self._last_satellite_recv: float = 0.0
         self._last_server_msg: str | None = None
         self._ban_commands_sent: int = 0
+        self._ban_votes_acknowledged: int = 0
+        self._ban_result: str | None = None
+        self._last_ban_send_time: float = 0.0
+        self._last_ban_response_time: float = 0.0
+        self._ban_response_event = asyncio.Event()
+        self._raw_packet_log: list[tuple[float, str]] = []
+
+    async def _listen_to_packet(self, server, packet, *, outgoing):
+        """Intercept ALL packets for raw audit logging before normal dispatch."""
+        if not outgoing:
+            self._packets_recv += 1
+            now = time.time()
+            try:
+                pkt_id = packet.id(ctx=server.ctx)
+                C, CC = pkt_id
+            except Exception:
+                C, CC = "?", "?"
+            pkt_name = type(packet).__qualname__
+            entry = f"({C},{CC}) {pkt_name}"
+            self._raw_packet_log.append((now, entry))
+            if len(self._raw_packet_log) > 200:
+                self._raw_packet_log = self._raw_packet_log[-100:]
+
+            is_noisy = pkt_name in (
+                "PingPacket", "ObjectSyncPacket", "PlayerMovementPacket",
+                "MapTimerPacket",
+            )
+            if not is_noisy:
+                logger.debug(
+                    "Slot %s: [PKT IN] (%s,%s) %s",
+                    self._label, C, CC, pkt_name,
+                )
+
+            if isinstance(C, int) and isinstance(CC, int):
+                if C in (6, 26, 28, 29):
+                    logger.info(
+                        "Slot %s: [PKT IN] (%s,%s) %s  ← chat/moderation/system packet",
+                        self._label, C, CC, pkt_name,
+                    )
+
+                if (C, CC) == (26, 9):
+                    self._handle_ban_consideration(now, packet)
+
+        await super()._listen_to_packet(server, packet, outgoing=outgoing)
+
+    def _handle_ban_consideration(self, now: float, packet) -> None:
+        """Handle (26,9) ban-consideration / vote-ack regardless of packet class."""
+        self._ban_votes_acknowledged += 1
+        self._last_ban_response_time = now
+        self._ban_response_event.set()
+        latency = ""
+        if self._last_ban_send_time > 0:
+            latency = f" latency={now - self._last_ban_send_time:.3f}s"
+
+        raw_body = ""
+        for attr in ("body", "data", "session_id"):
+            val = getattr(packet, attr, None)
+            if val is not None:
+                raw_body = f" {attr}={val!r}"
+                break
+
+        logger.warning(
+            "Slot %s: [VOTE ACK] (26,9) ban consideration received — "
+            "vote #%d acknowledged%s%s (room=%r, bans_sent=%d)",
+            self._label, self._ban_votes_acknowledged, latency, raw_body,
+            self.current_room, self._ban_commands_sent,
+        )
 
     @pak.packet_listener(clientbound.LoginSuccessPacket)
     async def _on_login_success_direct(self, server, packet):
@@ -167,6 +243,41 @@ class BanBotDirectClient(caseus.Client):
             logger.info(
                 "Slot %s: [GENERAL MSG] %s (room=%r)",
                 self._label, msg[:200], self.current_room,
+            )
+
+    async def _on_ban_message(self, server, packet):
+        """Legacy BanMessagePacket (26,18) — the target was actually banned."""
+        reason = getattr(packet, "reason_template", "")
+        duration = getattr(packet, "duration", None)
+        perm = getattr(packet, "is_permanent", False)
+        self._ban_result = f"BANNED reason={reason} duration={duration}ms perm={perm}"
+        self._last_ban_response_time = time.time()
+        self._ban_response_event.set()
+        logger.warning(
+            "Slot %s: [BAN RESULT] TARGET BANNED — reason=%r duration=%sms permanent=%s "
+            "(room=%r, bans_sent=%d)",
+            self._label, reason, duration, perm,
+            self.current_room, self._ban_commands_sent,
+        )
+
+    async def _on_legacy_packet(self, server, packet):
+        """Catch-all for legacy packets — log any we haven't specifically handled."""
+        try:
+            pkt_id = packet.id(ctx=server.ctx)
+            C, CC = pkt_id
+        except Exception:
+            C, CC = "?", "?"
+        pkt_name = type(packet).__qualname__
+        body_parts = []
+        for attr in ("reason_template", "duration", "body", "data", "message"):
+            val = getattr(packet, attr, None)
+            if val is not None:
+                body_parts.append(f"{attr}={val!r}")
+        body_str = " ".join(body_parts[:3]) if body_parts else ""
+        if (C, CC) != (26, 9):
+            logger.info(
+                "Slot %s: [LEGACY PKT] (%s,%s) %s %s",
+                self._label, C, CC, pkt_name, body_str,
             )
 
     async def _on_room_list(self, server, packet):
@@ -373,15 +484,36 @@ class BanBotDirectClient(caseus.Client):
                 self._label, cmd, main_diag, sat_diag,
                 self.current_room, self._own_username,
             )
+            if is_ban:
+                self._ban_response_event.clear()
+                self._last_ban_send_time = time.time()
             await conn.write_packet(serverbound.CommandPacket, command=cmd)
             self._packets_sent += 1
             if is_ban:
                 self._ban_commands_sent += 1
+                logger.info(
+                    "Slot %s: /ban #%d sent at %.3f — waiting for server response...",
+                    self._label, self._ban_commands_sent, self._last_ban_send_time,
+                )
             return True
         except Exception as exc:
             logger.error(
                 "Slot %s: send_command(%r) FAILED: %s (%s)",
                 self._label, cmd, exc, self._conn_diag(self.main, "main"),
+            )
+            return False
+
+    async def wait_ban_response(self, timeout: float = 5.0) -> bool:
+        """Wait for the server to acknowledge a /ban command (vote ack or ban result)."""
+        try:
+            await asyncio.wait_for(self._ban_response_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Slot %s: NO server response to /ban within %.1fs "
+                "(votes_acked=%d, ban_result=%r, pkts_recv=%d)",
+                self._label, timeout,
+                self._ban_votes_acknowledged, self._ban_result, self._packets_recv,
             )
             return False
 
@@ -460,9 +592,22 @@ class BanBotDirectClient(caseus.Client):
             f"room={self.current_room!r} nick={self._own_username!r} "
             f"proxy={via} "
             f"{m} | {s} | "
-            f"pkts_sent={self._packets_sent} bans_sent={self._ban_commands_sent} "
+            f"pkts_sent={self._packets_sent} pkts_recv={self._packets_recv} "
+            f"bans_sent={self._ban_commands_sent} votes_acked={self._ban_votes_acknowledged} "
+            f"ban_result={self._ban_result!r} "
             f"last_srv_msg={self._last_server_msg!r}"
         )
+
+    def recent_packets_summary(self, last_n: int = 20) -> str:
+        """Return the last N raw packet (C,CC) entries for diagnostics."""
+        entries = self._raw_packet_log[-last_n:]
+        if not entries:
+            return "(no packets received)"
+        lines = []
+        for ts, entry in entries:
+            t = time.strftime("%H:%M:%S", time.localtime(ts))
+            lines.append(f"  {t} {entry}")
+        return "\n".join(lines)
 
     async def run_forever(self) -> None:
         """Connect, login, and stay connected — handling pings automatically."""
@@ -549,6 +694,10 @@ class DirectHeadlessSlot:
     def send_ban(self, target: str, *, timeout: float = 5.0) -> bool:
         cmd = f"ban {target}"
         return self._run_async(self._client.send_command(cmd), timeout=timeout)
+
+    def wait_ban_response(self, *, timeout: float = 5.0) -> bool:
+        """Block until the server acknowledges this slot's /ban vote."""
+        return self._run_async(self._client.wait_ban_response(timeout=timeout), timeout=timeout + 2)
 
     def join_room(self, room_name: str, *, timeout: float = 5.0) -> bool:
         return self._run_async(self._client.join_room_async(room_name), timeout=timeout)

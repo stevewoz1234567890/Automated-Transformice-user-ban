@@ -2842,31 +2842,90 @@ def _headless_ban_loop(
 
         scout_room = live[0].current_room if live else None
         logger.info(
-            "Sending /ban %s from %d slots (room=%r)",
+            "=== SENDING /ban %s from %d slots (room=%r) ===",
             target, len(live), scout_room,
         )
         ban_ok = 0
         ban_fail = 0
+        ban_skipped = 0
         t0 = time.time()
         for slot in live:
+            slot_room = slot.current_room
+            if slot_room != scout_room:
+                logger.warning(
+                    "Slot %s: SKIPPING /ban — still in room %r, not target %r",
+                    slot.label, slot_room, scout_room,
+                )
+                ban_skipped += 1
+                continue
             if slot.send_ban(target, timeout=5.0):
                 ban_ok += 1
             else:
                 ban_fail += 1
         dt = time.time() - t0
         logger.info(
-            "/ban %s complete: %d ok, %d fail in %.1fs (room=%r)",
-            target, ban_ok, ban_fail, dt, scout_room,
+            "/ban %s sent: %d ok, %d fail, %d skipped(wrong room) in %.1fs (room=%r) "
+            "— waiting for server responses...",
+            target, ban_ok, ban_fail, ban_skipped, dt, scout_room,
         )
+        if ban_skipped > 0:
+            logger.warning(
+                "%d slot(s) skipped because they were not in the target room yet. "
+                "This should not happen now — check logs above.",
+                ban_skipped,
+            )
+
+        time.sleep(3.0)
+
+        logger.info("=== SERVER RESPONSE AUDIT ===")
+        votes_received = 0
+        no_response = 0
+        for slot in live:
+            client = getattr(slot, "_client", None)
+            if client is None:
+                continue
+            acked = getattr(client, "_ban_votes_acknowledged", 0)
+            result = getattr(client, "_ban_result", None)
+            resp_time = getattr(client, "_last_ban_response_time", 0.0)
+            send_time = getattr(client, "_last_ban_send_time", 0.0)
+            latency_str = ""
+            if resp_time > 0 and send_time > 0:
+                latency_str = f" latency={resp_time - send_time:.3f}s"
+            if acked > 0 or result:
+                votes_received += 1
+                logger.info(
+                    "  Slot %s: RESPONSE RECEIVED — votes_acked=%d ban_result=%r%s",
+                    slot.label, acked, result, latency_str,
+                )
+            else:
+                no_response += 1
+                logger.warning(
+                    "  Slot %s: NO RESPONSE from server (votes_acked=0, ban_result=None) "
+                    "— vote likely ignored (same IP?)",
+                    slot.label,
+                )
+        logger.info(
+            "=== RESPONSE SUMMARY: %d/%d slots got server response, "
+            "%d silent (room=%r) ===",
+            votes_received, len(live), no_response, scout_room,
+        )
+        if no_response == len(live):
+            logger.warning(
+                "ALL slots got NO server response — this strongly suggests "
+                "all accounts are connecting from the same IP. "
+                "Configure per-account proxies in BOT_ACCOUNTS_JSON to fix this."
+            )
+
         ban_summaries.append({
             "target": target,
             "room": room,
             "ok": ban_ok,
             "fail": ban_fail,
             "time_sec": dt,
+            "votes_received": votes_received,
+            "no_response": no_response,
         })
 
-        time.sleep(1.5)
         logger.info("=== POST-BAN CONNECTION HEALTH ===")
         for slot in live:
             client = getattr(slot, "_client", None)
@@ -2878,6 +2937,11 @@ def _headless_ban_loop(
                     slot.label, slot.current_room, slot.logged_in, slot.login_failed,
                 )
         logger.info("=== END POST-BAN HEALTH ===")
+
+        if live and hasattr(live[0], "_client") and hasattr(live[0]._client, "recent_packets_summary"):
+            logger.info("=== RECENT PACKETS (slot %s, last 20) ===", live[0].label)
+            logger.info(live[0]._client.recent_packets_summary(20))
+            logger.info("=== END RECENT PACKETS ===")
 
         _flush_log_handlers()
         with _quiet_console():
@@ -2948,19 +3012,24 @@ def _headless_join_and_pick_player(live: list, room: str) -> str | None:
 
     scout = live[0]
 
-    logger.info("Waiting for server to confirm room entry (JoinedRoomPacket)...")
-    confirmed = scout.wait_joined_room(timeout=15.0)
-    if confirmed:
-        logger.info(
-            "Scout (slot %s) CONFIRMED in room %r by server",
-            scout.label, scout.current_room,
-        )
-    else:
-        logger.warning(
-            "Scout (slot %s) did NOT receive JoinedRoomPacket — "
-            "accounts may not actually be in the room!",
-            scout.label,
-        )
+    logger.info("Waiting for ALL slots to confirm room entry (JoinedRoomPacket)...")
+    confirmed_count = 0
+    failed_slots = []
+    for slot in live:
+        if slot.wait_joined_room(timeout=15.0):
+            confirmed_count += 1
+        else:
+            failed_slots.append(slot.label)
+            logger.warning(
+                "Slot %s: did NOT receive JoinedRoomPacket within timeout "
+                "(current_room=%r, target=%r)",
+                slot.label, slot.current_room, room,
+            )
+    logger.info(
+        "Room entry confirmed: %d/%d slots in %r%s",
+        confirmed_count, len(live), room,
+        f" (failed: {failed_slots})" if failed_slots else "",
+    )
 
     logger.info("Waiting for satellite + player list (up to 35s — module rooms send on round change)...")
     got_list = scout.wait_player_list(timeout=35.0)
@@ -2968,14 +3037,14 @@ def _headless_join_and_pick_player(live: list, room: str) -> str | None:
     if not players_dict and not got_list:
         logger.info("Primary wait timed out — checking other slots...")
         for s in live[1:]:
-            alt_confirmed = s.wait_joined_room(timeout=3.0)
+            s.wait_joined_room(timeout=3.0)
             players_dict = s.get_known_players()
             if players_dict:
-                logger.info("Got player list from slot %s (confirmed=%s)", s.label, alt_confirmed)
+                logger.info("Got player list from slot %s", s.label)
                 break
     logger.info(
-        "Player list collected: %d players (scout_room=%r, confirmed=%s)",
-        len(players_dict), scout.current_room, confirmed,
+        "Player list collected: %d players (scout_room=%r, confirmed=%d/%d)",
+        len(players_dict), scout.current_room, confirmed_count, len(live),
     )
 
     own_username = getattr(scout._client, "_own_username", None)
