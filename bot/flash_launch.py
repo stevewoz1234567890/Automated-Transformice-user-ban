@@ -175,6 +175,10 @@ def _flash_dialog_aggregate_body_text(top_hwnd: int, user32: object) -> str:
 
     WM_GETTEXT = 0x000D
     WM_GETTEXTLENGTH = 0x000E
+
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = wintypes.LPARAM
+
     parts: list[str] = []
 
     def _maybe_append_piece_for_hwnd(ch: int) -> None:
@@ -1651,6 +1655,9 @@ def _win_button_caption_utf16(hwnd: int, user32: object) -> str:
     ln = max(0, min(int(ln), 512))
     if ln <= 0:
         return ""
+    from ctypes import wintypes as _wt
+    user32.SendMessageW.argtypes = [_wt.HWND, _wt.UINT, _wt.WPARAM, _wt.LPARAM]
+    user32.SendMessageW.restype = _wt.LPARAM
     buf2 = ctypes.create_unicode_buffer(ln + 4)
     try:
         user32.SendMessageW(hwnd, WM_GETTEXT, ln + 1, ctypes.addressof(buf2))

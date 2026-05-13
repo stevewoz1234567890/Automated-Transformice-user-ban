@@ -228,12 +228,12 @@ def _bootstrap_dotenv_path() -> Path:
 
 def require_source_runtime_imports() -> None:
     """
-    Exit with a clear ``pip install`` hint if running from source without ``requirements.txt`` deps.
-    Skipped for PyInstaller builds (``sys.frozen``) where packages are bundled.
+    Ensure critical packages are importable. If any are missing, attempt automatic
+    ``pip install -r requirements.txt``. Skipped for PyInstaller builds.
     """
     if getattr(sys, "frozen", False):
         return
-    need = ("pak", "caseus")
+    need = ("pak", "caseus", "colorama")
     missing: list[str] = []
     for name in need:
         try:
@@ -243,6 +243,28 @@ def require_source_runtime_imports() -> None:
     if not missing:
         return
     root = repo_root()
+    req = root / "requirements.txt"
+    if req.is_file():
+        import subprocess as _sp
+        print(
+            f"[auto-setup] Missing package(s): {', '.join(missing)}\n"
+            f"[auto-setup] Running: {sys.executable} -m pip install -r {req}\n",
+            file=sys.stderr,
+        )
+        _sp.run(
+            [sys.executable, "-m", "pip", "install", "-r", str(req)],
+            check=False,
+        )
+        still_missing: list[str] = []
+        for name in need:
+            try:
+                __import__(name)
+            except ModuleNotFoundError:
+                still_missing.append(name)
+        if not still_missing:
+            print("[auto-setup] All packages installed successfully.\n", file=sys.stderr)
+            return
+        missing = still_missing
     print(
         "Missing Python package(s): "
         + ", ".join(missing)
@@ -384,10 +406,46 @@ def prepare_runtime_environment() -> None:
             logger.info("Created %s from .env.example", dot)
         except OSError as e:
             logger.warning("Could not copy .env.example to %s: %s", dot, e)
+    if not dot.is_file():
+        logger.warning(
+            ".env file not found at %s — bot will use coded defaults. "
+            "Copy .env.example to .env and configure BOT_ACCOUNTS_JSON.",
+            dot,
+        )
     load_dotenv_file(dot)
     merge_repo_tfm_secrets_json(root, prefix=os.environ.get("BOT_HEADLESS_SECRETS_ENV_PREFIX", "TFM_SECRETS_") or "TFM_SECRETS_")
     apply_process_env_defaults()
     sync_upstream_env_with_tfm_secrets()
+    _warn_if_accounts_unconfigured()
+
+
+def _warn_if_accounts_unconfigured() -> None:
+    """Log a warning if BOT_ACCOUNTS_JSON has no real credentials (first-run hint)."""
+    raw = (os.environ.get("BOT_ACCOUNTS_JSON") or "").strip()
+    if not raw or raw == "[]":
+        logger.warning(
+            "BOT_ACCOUNTS_JSON is empty — edit .env and add your Transformice account credentials."
+        )
+        return
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            data = _parse_accounts_list(raw)
+        except ValueError:
+            return
+    if not isinstance(data, list) or not data:
+        return
+    empty = sum(
+        1 for r in data
+        if not str(r.get("username", "")).strip() or not str(r.get("password", "")).strip()
+    )
+    if empty == len(data):
+        logger.warning(
+            "All %d account(s) in BOT_ACCOUNTS_JSON have empty username or password. "
+            "Edit .env and fill in your Transformice credentials before running.",
+            len(data),
+        )
 
 
 def _truthy(key: str, default: bool = False) -> bool:

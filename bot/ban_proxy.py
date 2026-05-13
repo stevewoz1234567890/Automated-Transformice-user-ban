@@ -557,6 +557,7 @@ class BanBotProxy(Proxy):
         # Player list collected after joining a room; key = username, value = session_id.
         self.known_players: dict[str, int] = {}
         self._player_list_version: int = 0
+        self._player_list_refreshed = threading.Event()
         self.register_packet_listener(self._on_set_player_list, clientbound.SetPlayerListPacket)
         self.register_packet_listener(self._on_update_player_list, clientbound.UpdatePlayerListPacket)
         self.register_packet_listener(self._vl_account_error_cb, clientbound.AccountErrorPacket)
@@ -1858,6 +1859,7 @@ class BanBotProxy(Proxy):
             if username:
                 self.known_players[username] = getattr(p, "session_id", 0) or 0
         self._player_list_version += 1
+        self._player_list_refreshed.set()
 
     async def _on_update_player_list(self, source, packet):
         """Single player joining the room after us (arrives via satellite)."""
@@ -1901,6 +1903,30 @@ class BanBotProxy(Proxy):
         logger.info("Slot %s: sent JoinRoomPacket %r", self.slot_label, name)
         return True
 
+    def wait_for_player_list_refresh(self, timeout: float = 10.0) -> bool:
+        """Block until ``_on_set_player_list`` fires (or *timeout* expires).
+
+        Returns ``True`` if a fresh ``SetPlayerListPacket`` arrived, ``False``
+        on timeout.  Thread-safe — intended to be called from the CLI thread.
+        """
+        self._player_list_refreshed.clear()
+        return self._player_list_refreshed.wait(timeout=timeout)
+
+    async def send_room_command(self, room_name: str) -> bool:
+        """Send ``/room <room_name>`` as a ``CommandPacket`` upstream."""
+        main_conn = self._main_write_conn()
+        if main_conn is None:
+            logger.warning(
+                "Slot %s: send_room_command — no upstream write path",
+                self.slot_label,
+            )
+            return False
+        await main_conn.write_packet_instance(
+            serverbound.CommandPacket(command=f"room {room_name}")
+        )
+        logger.debug("Slot %s: sent /room %r command", self.slot_label, room_name)
+        return True
+
     async def request_room_list(self, game_mode_int: int = 1) -> bool:
         """
         Ask the server for the room list for *game_mode_int*.
@@ -1933,8 +1959,22 @@ class BanBotProxy(Proxy):
             )
         return True
 
-    async def send_ban_command(self, nickname: str) -> bool:
-        """Send /ban nickname#tag."""
+    async def send_ban_command(
+        self,
+        nickname: str,
+        *,
+        round_id: str = "",
+        room: str = "",
+    ) -> dict:
+        """Send /ban nickname#tag.
+
+        Returns a result dict with ``ok``, ``conn_type``, ``latency_ms``,
+        ``account``, ``target``, ``error``, and ``wall_ts`` for audit logging.
+        """
+        from datetime import datetime
+
+        wall_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        account = self._own_username or "?"
         main_conn = self._main_write_conn()
         n_main = len(self.main_clients or [])
         n_sat = len(getattr(self, "satellite_clients", None) or [])
@@ -1948,7 +1988,15 @@ class BanBotProxy(Proxy):
                 "(main_clients=%d satellite_clients=%d)%s",
                 self.slot_label, n_main, n_sat, extra,
             )
-            return False
+            return {
+                "ok": False,
+                "conn_type": "none",
+                "latency_ms": 0.0,
+                "account": account,
+                "target": normalize_nickname_tag(nickname),
+                "error": f"no upstream (main={n_main} sat={n_sat})",
+                "wall_ts": wall_ts,
+            }
         if self.main_clients:
             conn_type = "main"
         elif getattr(self, "satellite_clients", None):
@@ -1962,16 +2010,34 @@ class BanBotProxy(Proxy):
             await main_conn.write_packet_instance(serverbound.CommandPacket(command=cmd))
             dt = (time.monotonic() - t0) * 1000.0
             logger.info(
-                "Slot %s: /ban %s sent via %s in %.1fms (as nick=%r)",
-                self.slot_label, target, conn_type, dt, self._own_username or "?",
+                "BAN_SENT slot=%s target=%s account=%s conn=%s latency=%.1fms wall=%s",
+                self.slot_label, target, account, conn_type, dt, wall_ts,
             )
-            return True
+            return {
+                "ok": True,
+                "conn_type": conn_type,
+                "latency_ms": dt,
+                "account": account,
+                "target": target,
+                "error": "",
+                "wall_ts": wall_ts,
+            }
         except Exception as e:
-            logger.exception(
-                "Slot %s: /ban %s failed via %s: %s",
-                self.slot_label, target, conn_type, e,
+            dt = (time.monotonic() - t0) * 1000.0
+            logger.error(
+                "BAN_FAIL slot=%s target=%s account=%s conn=%s error=%s latency=%.1fms wall=%s",
+                self.slot_label, target, account, conn_type, e, dt, wall_ts,
             )
-            return False
+            logger.debug("BAN_FAIL traceback slot=%s", self.slot_label, exc_info=True)
+            return {
+                "ok": False,
+                "conn_type": conn_type,
+                "latency_ms": dt,
+                "account": account,
+                "target": target,
+                "error": f"{type(e).__name__}: {e}",
+                "wall_ts": wall_ts,
+            }
 
     async def _main_keepalive_loop(self) -> None:
         """Periodically send serverbound KeepAlivePacket on the main connection.
