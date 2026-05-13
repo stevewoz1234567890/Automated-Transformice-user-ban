@@ -65,7 +65,7 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_PACKET_LOGIN_DELAY_SEC": "0.35",
     "BOT_PACKET_AUTO_LOGIN": "true",
     "BOT_MAIN_KEEPALIVE_INTERVAL_SEC": "15.0",
-    "BOT_PACKET_LOGIN_START_ROOM": "",
+    "BOT_PACKET_LOGIN_START_ROOM": "1",
     "BOT_PROXY_UPSTREAM_CONNECT_DIAG": "true",
     "BOT_UPSTREAM_CONNECT_SHUFFLE_PORTS": "false",
     "BOT_PROXY_BIND_HOST": "",
@@ -135,10 +135,13 @@ DEFAULT_PROCESS_ENV: dict[str, str] = {
     "BOT_CASEUS_GIT_PIP_SPEC": "caseus @ git+https://github.com/friedkeenan/caseus.git",
     "BOT_PIP_INSTALL_TFM_SECRETS_CLI": "false",
     "BOT_TFM_SECRETS_PIP_INSTALL_SPEC": "",
-    # Typical in-game quorum for a room ban (distinct reports); warn when live sends drop below — docs/BAN_QUORUM_TRANSFORMICE.md
+    # Typical in-game quorum for a room ban (distinct reports); warn when live sends drop below — GitHub #7
     "BOT_BAN_QUORUM_REPORTS": "11",
+    "BOT_BAN_VERIFY_ENABLED": "true",
+    "BOT_BAN_VERIFY_DELAY_SEC": "3.0",
+    "BOT_JIT_PARALLEL_BATCH_SIZE": "5",
     "BOT_RETRY_FAILED_SLOTS": "true",
-    "BOT_RETRY_MAX_ATTEMPTS": "3",
+    "BOT_RETRY_MAX_ATTEMPTS": "1",
     # Shorter waits = snappier PARTL recovery (was 3.0 / 2.0; raise slightly if retries stampede OK slots).
     "BOT_RETRY_DELAY_SEC": "1.25",
     "BOT_RETRY_LOGIN_TIMEOUT_SEC": "120.0",

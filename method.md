@@ -48,4 +48,4 @@ Flags:
 ## See also
 
 - Root **`README.md`** — install and Option A expectations.
-- **`docs/TRANSFORMICE_LOGIN_ANALYSIS.md`** — packet sequence and proxy login behavior.
+- **[GitHub #8](https://github.com/stevewoz1234567890/Automated-Transformice-user-ban/issues/8)** — packet sequence and proxy login behavior (archived doc).

@@ -248,6 +248,10 @@ def _configure_logging() -> None:
         logging.getLogger("asyncio").setLevel(logging.DEBUG)
 
     logging.info("Logging to %s", log_path)
+    from .ban_audit import audit_log_path
+    _apath = audit_log_path()
+    if _apath:
+        logging.info("Ban audit trail (JSONL): %s", _apath)
     if debug_trace:
         logging.info(
             "BOT_DEBUG_TRACE=true — session timeline uses [trace #N | phase | slot]; "
@@ -977,26 +981,58 @@ def _write_session_report_markdown(
         lines.append("*(no ban rounds completed this session)*\n\n")
     else:
         lines.append(
-            "| # | Target | OK | Send failed | Skipped | Live @ send | Round s | Quorum |\n"
-            "|---|--------|----|-------------|---------|-------------|---------|--------|\n"
+            "| # | Target | Room | OK | Fail | Skip | Live | Round s | Quorum | Round ID |\n"
+            "|---|--------|------|----|------|------|------|---------|--------|----------|\n"
         )
         for i, br in enumerate(ban_rounds, 1):
             q_rep = br.get("quorum_reports", 11)
             q_ok = br.get("quorum_met", False)
-            q_cell = f"{'met' if q_ok else 'not met'} ({q_rep} typical)"
+            q_cell = f"{'met' if q_ok else 'NOT MET'} ({q_rep})"
+            br_room = br.get("room", "")
+            br_rid = br.get("round_id", "")
             lines.append(
-                f"| {i} | `{br.get('target_user', '')}` | {br.get('ok_count', '')} | "
+                f"| {i} | `{br.get('target_user', '')}` | `{br_room}` | "
+                f"{br.get('ok_count', '')} | "
                 f"{br.get('fail_send', '')} | {br.get('skip_count', '')} | "
                 f"{br.get('live_slots_at_send', '')} | "
-                f"{float(br.get('round_seconds', 0) or 0):.1f} | {q_cell} |\n"
+                f"{float(br.get('round_seconds', 0) or 0):.1f} | {q_cell} | "
+                f"`{br_rid}` |\n"
             )
         lines.append("\n")
+
+        for i, br in enumerate(ban_rounds, 1):
+            slot_details = br.get("slot_details") or []
+            if not slot_details:
+                continue
+            lines.append(f"### Round {i} — per-slot detail (`{br.get('target_user', '')}`)\n\n")
+            lines.append(
+                "| Slot | Account | Status | Latency | Connection | Timestamp | Error |\n"
+                "|------|---------|--------|---------|------------|-----------|-------|\n"
+            )
+            for sd in slot_details:
+                status = "OK" if sd.get("ok") else "FAIL"
+                lat_s = f"{sd.get('latency_ms', 0):.1f}ms"
+                err = sd.get("error", "") or ""
+                err_cell = f"`{err[:60]}`" if err else ""
+                lines.append(
+                    f"| {sd.get('slot', '')} | `{sd.get('account', '?')}` | "
+                    f"**{status}** | {lat_s} | {sd.get('conn', '?')} | "
+                    f"{sd.get('wall_ts', '')} | {err_cell} |\n"
+                )
+            lines.append("\n")
+
+    from .ban_audit import audit_log_path
+    _audit_path = audit_log_path()
+    if _audit_path:
+        lines.append(f"- **Ban audit log (JSONL)**: `{_audit_path}`\n\n")
+
     lines.append("## Final slot status\n\n")
     lines.append("```text\n")
     lines.extend(line + "\n" for line in _slot_status_lines(states, title="SLOT STATUS AT SESSION END"))
     lines.append("```\n")
     lines.append(
         "\n*Session reports go under `logs/session_report_*.md`. "
+        "Ban audit trail: `logs/ban_audit.jsonl`. "
         "Set `BOT_SESSION_REPORT=0` to disable.*\n"
     )
     try:
@@ -1684,6 +1720,133 @@ def _retry_partl_slots(
         logger.debug("PARTL retry diagnostics log failed", exc_info=True)
 
 
+def _parallel_retry_partl_slots(
+    states: list[SlotState],
+    raw_accounts: list[dict],
+    cfg: object,
+    args,
+    *,
+    shared_flash_policy_port: int | None,
+    batch_size: int | None = None,
+) -> None:
+    """Relaunch PARTL slots in parallel batches so all connections are fresh at ban time.
+
+    Unlike ``_retry_partl_slots`` (which relaunches one slot at a time, taking
+    ~10 s each and totalling ~130 s for 13 slots), this function uses a
+    ``ThreadPoolExecutor`` so an entire batch starts simultaneously.  With a
+    batch size of 5 the 13-slot case completes in ~30 s — well within the
+    7–69 s connection survival window.
+    """
+    if batch_size is None:
+        try:
+            batch_size = int(os.environ.get("BOT_JIT_PARALLEL_BATCH_SIZE", "5"))
+        except ValueError:
+            batch_size = 5
+    batch_size = max(1, min(batch_size, 20))
+
+    try:
+        retry_login_timeout = float(os.environ.get("BOT_RETRY_LOGIN_TIMEOUT_SEC", "120.0"))
+    except ValueError:
+        retry_login_timeout = 120.0
+    retry_login_timeout = max(15.0, min(retry_login_timeout, 600.0))
+
+    row_by_label: dict[str, dict] = {}
+    for row in raw_accounts:
+        lbl = str(row.get("label", "") or "").strip()
+        if lbl:
+            row_by_label[lbl] = row
+
+    partl = [s for s in states if _slot_status_label(s)[0] == "PARTL"]
+    if not partl:
+        logger.info("Parallel JIT: no PARTL slots — nothing to do.")
+        return
+
+    logger.info(
+        "Parallel JIT: relaunching %d PARTL slot(s) in batches of %d: %s",
+        len(partl), batch_size, [s.label for s in partl],
+    )
+
+    set_operator_phase("partl_retry")
+    results: dict[str, str] = {}
+
+    def _relaunch_one(st: SlotState) -> tuple[str, bool]:
+        """Close Flash, reset state, relaunch, wait for login. Thread-safe per slot."""
+        label = st.label
+        row = row_by_label.get(label)
+        if row is None:
+            logger.warning("Parallel JIT: slot %s has no matching account row — skipping.", label)
+            return (label, False)
+
+        _close_flash_for_slot_retry(st, cfg)
+        _reset_slot_state_for_retry(st)
+
+        flash_row = _build_flash_row_for_retry(
+            raw_row=row, st=st,
+            shared_flash_policy_port=shared_flash_policy_port,
+        )
+        try:
+            proc = flash_launch.launch_one_flash_loader(
+                flash_row,
+                root=_repo_root(),
+                click_transformice=not args.launch_flash_no_click,
+                on_flash_pid=lambda pid, _st=st: setattr(_st, "flash_pid", pid),
+                post_open_delay_sec=float(
+                    getattr(cfg, "FLASH_LOADER_POST_OPEN_DELAY_SEC", 1.15)
+                ),
+            )
+        except Exception:
+            logger.exception("Parallel JIT: slot %s — launch raised; skipping.", label)
+            st.attempts_used += 1
+            return (label, False)
+
+        if proc is None:
+            logger.warning("Parallel JIT: slot %s — Flash launcher returned no process.", label)
+            st.attempts_used += 1
+            return (label, False)
+
+        st.flash_loader_ready_event.set()
+        ok = _wait_for_login_simple(st, retry_login_timeout)
+        st.attempts_used += 1
+        if ok:
+            tag, _ = _slot_status_label(st)
+            logger.info(
+                "Parallel JIT: slot %s — login %s (status=%s)",
+                label,
+                "succeeded" if tag == "OK   " else "succeeded (still PARTL)",
+                tag.strip(),
+            )
+        else:
+            logger.warning(
+                "Parallel JIT: slot %s — no LoginSuccess within %.0fs.", label, retry_login_timeout,
+            )
+            _close_flash_for_slot_retry(st, cfg)
+        return (label, ok)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as pool:
+            futures = {pool.submit(_relaunch_one, s): s for s in partl}
+            for fut in concurrent.futures.as_completed(futures):
+                slot = futures[fut]
+                try:
+                    label, ok = fut.result()
+                    results[label] = "ok" if ok else "fail"
+                except Exception:
+                    logger.exception(
+                        "Parallel JIT: slot %s — thread raised unexpectedly.", slot.label,
+                    )
+                    results[slot.label] = "error"
+    finally:
+        set_operator_phase("idle")
+
+    ok_count = sum(1 for v in results.values() if v == "ok")
+    fail_count = len(results) - ok_count
+    logger.info(
+        "Parallel JIT complete: %d/%d relaunched OK, %d failed. %s",
+        ok_count, len(results), fail_count, dict(results),
+    )
+    print_slot_status(states, title="SLOT STATUS AFTER PARALLEL JIT RETRY")
+
+
 def _env_bool(name: str, *, default: bool) -> bool:
     """Tiny helper: read ``name`` from env, accepting common true/false spellings."""
     raw = (os.environ.get(name, "") or "").strip().lower()
@@ -2142,10 +2305,16 @@ def _input_nonempty(prompt: str, *, what: str = "your answer") -> str:
     Wrapped in :class:`_quiet_console` so that proxy ``WARNING``/``INFO`` lines from
     background slots (e.g. post-login ``MAIN session ended ... clean-eof``) do not
     interrupt the prompt. The full traffic is still captured in ``log.txt``.
+
+    Raises ``SystemExit`` on ``EOFError`` (stdin is a closed pipe / non-interactive).
     """
     with _quiet_console():
         while True:
-            s = input(prompt).strip()
+            try:
+                s = input(prompt).strip()
+            except EOFError:
+                logger.info("stdin EOF — no interactive input available (piped / non-TTY).")
+                raise SystemExit(0)
             if s:
                 return s
             print(
@@ -2445,12 +2614,12 @@ def _show_and_pick_player(states: list[SlotState], room: str, cfg: object | None
         set_operator_phase("idle")
 
 
-def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
+def send_ban_to_all(states: list[SlotState], target_user: str, cfg, *, room: str = "") -> dict[str, object]:
     """
     /ban on every slot with a **live upstream write path** (MAIN or satellite).
 
     Transformice normally requires **several distinct /ban reports** in the room (default **11**;
-    configurable via ``BOT_BAN_QUORUM_REPORTS`` — see ``docs/BAN_QUORUM_TRANSFORMICE.md``). The bot
+    configurable via ``BOT_BAN_QUORUM_REPORTS`` — see https://github.com/stevewoz1234567890/Automated-Transformice-user-ban/issues/7). The bot
     warns when live slots or successful sends fall below that threshold.
 
     Default **burst** mode (``BOT_BAN_BURST_MODE``): with 2+ live slots, each ``send_ban_command``
@@ -2469,12 +2638,136 @@ def send_ban_to_all(states: list[SlotState], target_user: str, cfg) -> None:
     """
     set_operator_phase("ban")
     try:
-        return _send_ban_to_all_body(states, target_user, cfg)
+        return _send_ban_to_all_body(states, target_user, cfg, room=room)
     finally:
         set_operator_phase("idle")
 
 
-def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dict[str, object]:
+def _verify_ban_result(
+    states: list[SlotState],
+    target_user: str,
+    room: str,
+    cfg,
+) -> dict[str, object]:
+    """Re-join the target room from one slot and check if the target was removed.
+
+    Returns a dict with at minimum ``verified`` (bool) and, when verified,
+    ``target_present`` (bool) and ``player_count`` (int).
+    """
+    from .ban_audit import _emit, _wall_iso, _wall_local_iso
+
+    try:
+        delay = float(os.environ.get("BOT_BAN_VERIFY_DELAY_SEC", "3.0"))
+    except ValueError:
+        delay = 3.0
+    delay = max(0.0, min(delay, 30.0))
+
+    if delay > 0:
+        logger.info("BAN_VERIFY: waiting %.1fs before verification...", delay)
+        time.sleep(delay)
+
+    live = [s for s in states if _slot_status_label(s)[0] == "OK   "]
+    if not live:
+        result: dict[str, object] = {"verified": False, "reason": "no_live_slots"}
+        logger.warning("BAN_VERIFY: no live slots available — cannot verify ban result.")
+        _emit_verify_audit(target_user, room, result)
+        return result
+
+    verify_slot = live[0]
+    proxy = verify_slot.proxy
+    logger.info(
+        "BAN_VERIFY: using slot %s (%s) to verify target=%r in room=%r",
+        verify_slot.label, proxy._own_username or "?", target_user, room,
+    )
+
+    # Step 1: Leave the target room by joining a temp room.
+    try:
+        _run_coro_on_slot(verify_slot, proxy.send_room_command("*__botverify"))
+    except Exception:
+        logger.exception("BAN_VERIFY: failed to send /room *__botverify on slot %s", verify_slot.label)
+        result = {"verified": False, "reason": "send_leave_failed"}
+        _emit_verify_audit(target_user, room, result)
+        return result
+
+    if not proxy.wait_for_player_list_refresh(timeout=10.0):
+        logger.warning("BAN_VERIFY: timeout waiting for temp room player list on slot %s", verify_slot.label)
+        result = {"verified": False, "reason": "timeout_leave"}
+        _emit_verify_audit(target_user, room, result)
+        return result
+
+    # Step 2: Rejoin the target room to get a fresh player list.
+    try:
+        _run_coro_on_slot(verify_slot, proxy.send_room_command(room))
+    except Exception:
+        logger.exception("BAN_VERIFY: failed to send /room %r on slot %s", room, verify_slot.label)
+        result = {"verified": False, "reason": "send_rejoin_failed"}
+        _emit_verify_audit(target_user, room, result)
+        return result
+
+    if not proxy.wait_for_player_list_refresh(timeout=10.0):
+        logger.warning("BAN_VERIFY: timeout waiting for target room player list on slot %s", verify_slot.label)
+        result = {"verified": False, "reason": "timeout_rejoin"}
+        _emit_verify_audit(target_user, room, result)
+        return result
+
+    # Step 3: Check the refreshed player list.
+    target_present = target_user in proxy.known_players
+    player_count = len(proxy.known_players)
+
+    if target_present:
+        logger.warning(
+            "BAN_VERIFY target=%r room=%r result=STILL_PRESENT players=%d  "
+            "(target remains in room — quorum likely not met)",
+            target_user, room, player_count,
+        )
+    else:
+        logger.info(
+            "BAN_VERIFY target=%r room=%r result=BANNED players=%d  "
+            "(target no longer in room)",
+            target_user, room, player_count,
+        )
+
+    result = {
+        "verified": True,
+        "target_present": target_present,
+        "player_count": player_count,
+        "verify_slot": verify_slot.label,
+    }
+    _emit_verify_audit(target_user, room, result)
+    return result
+
+
+def _emit_verify_audit(target_user: str, room: str, result: dict[str, object]) -> None:
+    """Write a ``ban_verify`` event to the JSONL audit log."""
+    from .ban_audit import _emit, _wall_iso, _wall_local_iso
+
+    verified = result.get("verified", False)
+    if verified:
+        ban_result = "banned" if not result.get("target_present") else "still_present"
+    else:
+        ban_result = f"inconclusive:{result.get('reason', 'unknown')}"
+
+    entry = {
+        "event": "ban_verify",
+        "ts_utc": _wall_iso(),
+        "ts_local": _wall_local_iso(),
+        "target": target_user,
+        "room": room,
+        "result": ban_result,
+    }
+    if "player_count" in result:
+        entry["player_count"] = result["player_count"]
+    if "verify_slot" in result:
+        entry["verify_slot"] = result["verify_slot"]
+    if "reason" in result:
+        entry["reason"] = result["reason"]
+    _emit(entry)
+
+
+def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg, *, room: str = "") -> dict[str, object]:
+    from .ban_audit import audit_ban_send, audit_ban_round, audit_ban_skip
+
+    round_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     dmin = float(getattr(cfg, "BAN_DELAY_MIN_SEC", 1.0))
     dmax = float(getattr(cfg, "BAN_DELAY_MAX_SEC", 2.0))
     burst = bool(getattr(cfg, "BAN_BURST_MODE", True))
@@ -2532,7 +2825,7 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
         logger.warning(
             "Ban quorum: only %d live slot(s) can send /ban; typical in-room requirement is %d distinct "
             "reports (BOT_BAN_QUORUM_REPORTS). Target may remain unbanned until more mice /ban — see "
-            "docs/BAN_QUORUM_TRANSFORMICE.md.",
+            "https://github.com/stevewoz1234567890/Automated-Transformice-user-ban/issues/7",
             len(active),
             quorum,
         )
@@ -2540,32 +2833,55 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
     if active:
         order_h = ", ".join(s.label for s in active)
         logger.info(
-            "Ban round: send order %s — mode=%s",
+            "BAN_ROUND_BEGIN round=%s target=%r room=%r slots=[%s] mode=%s quorum=%d",
+            round_id,
+            target_user,
+            room,
             order_h,
-            "burst (schedule all, then await)" if burst and len(active) > 1 else "sequential",
+            "burst" if burst and len(active) > 1 else "sequential",
+            quorum,
         )
 
-    results: list[tuple[str, bool, str, float, str]] = []
+    # results: (slot_label, ok, reason, latency_ms, kind, account, wall_ts)
+    results: list[tuple[str, bool, str, float, str, str, str]] = []
+    slot_audit_records: list[dict] = []
     t_round = time.monotonic()
     live_at_send = len(active)
 
-    def _do_one_slot(s: SlotState) -> tuple[bool, str, float]:
-        t_slot = time.monotonic()
-        try:
-            ok = _run_coro_on_slot(s, s.proxy.send_ban_command(target_user))
-            reason = "sent" if ok else "send returned False"
-        except Exception as exc:
-            ok = False
-            reason = f"{type(exc).__name__}: {exc}"
-        dt_ms = (time.monotonic() - t_slot) * 1000.0
-        logger.debug(
-            "[slot %s] /ban %r -> %s (%.1fms)",
-            s.label, target_user, "sent" if ok else "FAILED", dt_ms,
+    def _process_ban_result(
+        s: SlotState, ban_info: dict, kind: str = "ok",
+    ) -> None:
+        ok = ban_info["ok"]
+        actual_kind = "ok" if ok else kind
+        account = ban_info.get("account", "?")
+        wall_ts = ban_info.get("wall_ts", "")
+        latency_ms = ban_info.get("latency_ms", 0.0)
+        error = ban_info.get("error", "")
+        reason = "sent" if ok else (error or "send returned False")
+        conn_type = ban_info.get("conn_type", "?")
+        results.append((s.label, ok, reason, latency_ms, actual_kind, account, wall_ts))
+        audit_ban_send(
+            target_user=target_user,
+            slot_label=s.label,
+            account_nick=account,
+            success=ok,
+            conn_type=conn_type,
+            latency_ms=latency_ms,
+            error=error,
+            round_id=round_id,
+            room=room,
         )
-        return ok, reason, dt_ms
+        slot_audit_records.append({
+            "slot": s.label,
+            "account": account,
+            "ok": ok,
+            "latency_ms": round(latency_ms, 1),
+            "conn": conn_type,
+            "error": error,
+            "wall_ts": wall_ts,
+        })
 
     if burst and len(active) > 1:
-        # Schedule every coroutine before awaiting any: avoids N×(1–2s) window where last slots' MAIN dies.
         scheduled: list[tuple[SlotState, concurrent.futures.Future]] = []
         for s in active:
             if not _can_ban(s):
@@ -2575,33 +2891,43 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
                     s.label, time.monotonic() - t_round,
                 )
                 results.append(
-                    (s.label, False, "upstream lost before schedule (burst)", 0.0, "fail")
+                    (s.label, False, "upstream lost before schedule (burst)", 0.0, "fail", "?", "")
+                )
+                audit_ban_skip(
+                    target_user=target_user,
+                    slot_label=s.label,
+                    reason="upstream lost before schedule (burst)",
+                    round_id=round_id,
                 )
                 continue
             if s.loop is None:
                 logger.error("Ban round: slot %s — no event loop", s.label)
                 results.append(
-                    (s.label, False, "event loop not ready", 0.0, "fail")
+                    (s.label, False, "event loop not ready", 0.0, "fail", "?", "")
+                )
+                audit_ban_skip(
+                    target_user=target_user,
+                    slot_label=s.label,
+                    reason="event loop not ready",
+                    round_id=round_id,
                 )
                 continue
             fut = asyncio.run_coroutine_threadsafe(
-                s.proxy.send_ban_command(target_user), s.loop
+                s.proxy.send_ban_command(target_user, round_id=round_id, room=room),
+                s.loop,
             )
             scheduled.append((s, fut))
         for s, fut in scheduled:
-            t_wait = time.monotonic()
             try:
-                ok = fut.result(timeout=30)
-                reason = "sent" if ok else "send returned False"
+                ban_info = fut.result(timeout=30)
+                if not isinstance(ban_info, dict):
+                    ban_info = {"ok": bool(ban_info), "account": "?", "wall_ts": "",
+                                "latency_ms": 0.0, "error": "", "conn_type": "?", "target": target_user}
             except Exception as exc:
-                ok = False
-                reason = f"{type(exc).__name__}: {exc}"
-            dt_ms = (time.monotonic() - t_wait) * 1000.0
-            results.append((s.label, bool(ok), reason, dt_ms, "ok" if ok else "fail"))
-            logger.debug(
-                "[slot %s] /ban %r -> %s (await %.1fms)",
-                s.label, target_user, "sent" if ok else "FAILED", dt_ms,
-            )
+                ban_info = {"ok": False, "account": "?", "wall_ts": "",
+                            "latency_ms": 0.0, "error": f"{type(exc).__name__}: {exc}",
+                            "conn_type": "?", "target": target_user}
+            _process_ban_result(s, ban_info, kind="fail")
     else:
         for i, s in enumerate(active):
             if not _can_ban(s):
@@ -2612,50 +2938,78 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
                     s.label, i + 1, len(active), time.monotonic() - t_round,
                 )
                 results.append(
-                    (s.label, False, "upstream lost before send (stagger)", 0.0, "fail")
+                    (s.label, False, "upstream lost before send (stagger)", 0.0, "fail", "?", "")
+                )
+                audit_ban_skip(
+                    target_user=target_user,
+                    slot_label=s.label,
+                    reason="upstream lost before send (stagger)",
+                    round_id=round_id,
                 )
                 continue
-            ok, reason, dt_ms = _do_one_slot(s)
-            results.append((s.label, bool(ok), reason, dt_ms, "ok" if ok else "fail"))
+            try:
+                ban_info = _run_coro_on_slot(s, s.proxy.send_ban_command(target_user, round_id=round_id, room=room))
+                if not isinstance(ban_info, dict):
+                    ban_info = {"ok": bool(ban_info), "account": "?", "wall_ts": "",
+                                "latency_ms": 0.0, "error": "", "conn_type": "?", "target": target_user}
+            except Exception as exc:
+                ban_info = {"ok": False, "account": "?", "wall_ts": "",
+                            "latency_ms": 0.0, "error": f"{type(exc).__name__}: {exc}",
+                            "conn_type": "?", "target": target_user}
+            _process_ban_result(s, ban_info, kind="fail")
             if i < len(active) - 1:
                 time.sleep(random.uniform(dmin, dmax))
 
     for s in skipped_no_conn:
-        results.append((s.label, False, "no upstream (skipped)", 0.0, "skip"))
+        results.append((s.label, False, "no upstream (skipped)", 0.0, "skip", "?", ""))
+        audit_ban_skip(
+            target_user=target_user,
+            slot_label=s.label,
+            reason="no upstream (PARTL)",
+            round_id=round_id,
+        )
     for s in inactive:
-        results.append((s.label, False, "proxy not started", 0.0, "skip"))
+        results.append((s.label, False, "proxy not started", 0.0, "skip", "?", ""))
+        audit_ban_skip(
+            target_user=target_user,
+            slot_label=s.label,
+            reason="proxy not started",
+            round_id=round_id,
+        )
 
-    ok_count = sum(1 for _, o, _, _, _ in results if o)
-    skip_count = sum(1 for *_, k in results if k == "skip")
-    fail_send = sum(1 for _, o, _, _, k in results if not o and k != "skip")
+    ok_count = sum(1 for _, o, *_ in results if o)
+    skip_count = sum(1 for r in results if r[4] == "skip")
+    fail_send = sum(1 for r in results if not r[1] and r[4] != "skip")
     total_dt = time.monotonic() - t_round
-    banner = "=" * 88
+    quorum_met = ok_count >= quorum
+    banner = "=" * 92
     lines = [
         banner,
-        f"  BAN RESULTS for {target_user!r}   (OK: {ok_count}  /  send failed: {fail_send}  /  "
-        f"skipped: {skip_count}  of {len(results)}; round {total_dt:.1f}s)",
-        f"  Quorum: typical in-room reports needed = {quorum} (BOT_BAN_QUORUM_REPORTS); "
-        f"this round OK sends = {ok_count} — {'meets' if ok_count >= quorum else 'below'} threshold — "
-        f"see docs/BAN_QUORUM_TRANSFORMICE.md",
+        f"  BAN RESULTS for {target_user!r}   room={room!r}   round={round_id}",
+        f"  OK: {ok_count}  /  send failed: {fail_send}  /  skipped: {skip_count}  of {len(results)}   "
+        f"round {total_dt:.1f}s",
+        f"  Quorum: need={quorum} (BOT_BAN_QUORUM_REPORTS)  sent={ok_count}  "
+        f"{'MEETS' if quorum_met else 'BELOW'} threshold",
         banner,
     ]
-    for label, ok, reason, dt_ms, kind in results:
+    for label, ok, reason, dt_ms, kind, account, wall_ts in results:
         if kind == "skip":
             mark = "[SKIP ]"
         else:
             mark = "[  OK  ]" if ok else "[ FAIL ]"
         lat = f"{dt_ms:6.1f}ms" if dt_ms else "      -"
-        lines.append(f"  {mark}  slot {label:>3s}  [{lat}]  -> {reason}")
+        acct = f" as={account}" if account and account != "?" else ""
+        ts_s = f" @{wall_ts}" if wall_ts else ""
+        lines.append(f"  {mark}  slot {label:>3s}  [{lat}]{acct}{ts_s}  -> {reason}")
     lines.append(banner)
     for line in lines:
         print(line, flush=True)
         logger.info(line)
     _flush_log_handlers()
-    quorum_met = ok_count >= quorum
     if ok_count > 0 and not quorum_met:
         logger.warning(
             "Ban quorum: only %d successful /ban send(s); typical in-room requirement is %d (BOT_BAN_QUORUM_REPORTS). "
-            "The sanction may still be pending until enough distinct mice contribute — docs/BAN_QUORUM_TRANSFORMICE.md.",
+            "The sanction may still be pending until enough distinct mice contribute — see https://github.com/stevewoz1234567890/Automated-Transformice-user-ban/issues/7",
             ok_count,
             quorum,
         )
@@ -2666,9 +3020,26 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
             quorum,
         )
     logger.info(
-        "Ban round complete: target=%r ok=%d send_fail=%d skipped=%d elapsed=%.1fs",
-        target_user, ok_count, fail_send, skip_count, total_dt,
+        "BAN_ROUND_END round=%s target=%r room=%r ok=%d fail=%d skip=%d elapsed=%.1fs quorum_met=%s",
+        round_id, target_user, room, ok_count, fail_send, skip_count, total_dt, quorum_met,
     )
+
+    audit_ban_round(
+        round_id=round_id,
+        target_user=target_user,
+        ok_count=ok_count,
+        fail_count=fail_send,
+        skip_count=skip_count,
+        total_slots=len(results),
+        live_at_send=live_at_send,
+        elapsed_sec=total_dt,
+        burst_mode=burst,
+        quorum=quorum,
+        quorum_met=quorum_met,
+        room=room,
+        slot_results=slot_audit_records if slot_audit_records else None,
+    )
+
     return {
         "target_user": target_user,
         "ok_count": ok_count,
@@ -2680,6 +3051,9 @@ def _send_ban_to_all_body(states: list[SlotState], target_user: str, cfg) -> dic
         "live_slots_at_send": live_at_send,
         "quorum_reports": quorum,
         "quorum_met": quorum_met,
+        "round_id": round_id,
+        "room": room,
+        "slot_details": slot_audit_records,
     }
 
 
@@ -3853,11 +4227,42 @@ def main(argv: list[str] | None = None) -> None:
                 logger.info("Empty user; try again.")
                 continue
 
-            ban_summaries.append(send_ban_to_all(states, target, cfg))
+            if auto_flash:
+                _partl_now = [s for s in states if _slot_status_label(s)[0] == "PARTL"]
+                if _partl_now:
+                    for _ps in _partl_now:
+                        _ps.attempts_used = 0
+                    logger.info(
+                        "JIT PARTL refresh: %d slot(s) dead — parallel relaunch before /ban.",
+                        len(_partl_now),
+                    )
+                    try:
+                        _parallel_retry_partl_slots(
+                            states,
+                            raw_accounts,
+                            cfg,
+                            args,
+                            shared_flash_policy_port=shared_flash_policy_port,
+                        )
+                    except Exception:
+                        logger.exception("JIT parallel retry raised; continuing with current slot states.")
+
+            ban_summaries.append(send_ban_to_all(states, target, cfg, room=room))
+
+            if _env_bool("BOT_BAN_VERIFY_ENABLED", default=True):
+                try:
+                    verify_result = _verify_ban_result(states, target, room, cfg)
+                    ban_summaries[-1]["verify"] = verify_result
+                except Exception:
+                    logger.exception("Ban verification raised — continuing.")
 
             _flush_log_handlers()
             with _quiet_console():
-                again = input('Ban someone else? (y/n): ').strip().lower()
+                try:
+                    again = input('Ban someone else? (y/n): ').strip().lower()
+                except EOFError:
+                    logger.info("stdin EOF at 'ban again?' prompt — treating as 'no'.")
+                    again = "n"
             logger.info("Ban someone else? answered: %r", again)
             if again not in ("y", "yes"):
                 break

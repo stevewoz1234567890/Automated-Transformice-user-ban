@@ -44,7 +44,7 @@ Or use the frozen build: `ban_bot.exe` (`.env` must be in the same folder).
 6. **You pick a room** by number or type a name directly (e.g. `*racing1`).
 7. **Player list fetched** — the bot joins the chosen room with all slots via `JoinRoomPacket` and prints every player currently there, numbered.
 8. **You pick a target** by number or type the nickname directly (e.g. `Zizao#0000`).
-9. **`/ban` sent** from every slot with a random 1–2 s gap between accounts (tunable in `.env`). In-game room bans normally need **[11 distinct `/ban` reports](docs/BAN_QUORUM_TRANSFORMICE.md)** (configurable via `BOT_BAN_QUORUM_REPORTS`). The CLI warns if too few slots succeed in one round.
+9. **`/ban` sent** from every slot with a random 1–2 s gap between accounts (tunable in `.env`). In-game room bans normally need **[11 distinct `/ban` reports](https://github.com/stevewoz1234567890/Automated-Transformice-user-ban/issues/7)** (configurable via `BOT_BAN_QUORUM_REPORTS`). The CLI warns if too few slots succeed in one round.
 10. **"Ban someone else? (y/n)"** — answer `y` to start a new room selection; `n` exits.
 
 ### What you see in the console
@@ -170,7 +170,7 @@ TFM_SECRETS_CLIENT_VERIFICATION_TEMPLATE=aabbccdd...
 | `BOT_BAN_DELAY_MIN_SEC` | `1.0` | Minimum random gap between `/ban` sends |
 | `BOT_BAN_DELAY_MAX_SEC` | `2.0` | Maximum random gap between `/ban` sends |
 | `BOT_ROOM_STAGGER_SEC` | `0.15` | Stagger between `JoinRoomPacket` sends across slots |
-| `BOT_BAN_QUORUM_REPORTS` | `11` | Typical in-room distinct reports needed for a ban — [docs](docs/BAN_QUORUM_TRANSFORMICE.md); used for warnings only |
+| `BOT_BAN_QUORUM_REPORTS` | `11` | Typical in-room distinct reports needed for a ban — [GitHub #7](https://github.com/stevewoz1234567890/Automated-Transformice-user-ban/issues/7); used for warnings only |
 
 ---
 
@@ -230,7 +230,7 @@ Writes `ban_bot.exe` to the repo root. Run it from that folder so `.env` is next
 | `bot/ban_proxy.py` | `BanBotProxy` — packet interception, auto-login, room list, player list |
 | `bot/env_config.py` | Loads `.env` → config namespace |
 | `bot/flash_launch.py` | Flash Player auto-launch and UI automation |
-| `docs/BAN_QUORUM_TRANSFORMICE.md` | How the ~11-report quorum relates to multi-slot `/ban` |
+| GitHub [#7](https://github.com/stevewoz1234567890/Automated-Transformice-user-ban/issues/7) | How the ~11-report quorum relates to multi-slot `/ban` |
 | `.env` | Your accounts + secrets + settings (gitignored) |
 | `flashplayer_32_sa_debug.exe` | Flash standalone debug projector |
 | `TFMProxyLoader.swf` | Patched loader SWF that connects Flash to the local proxy |

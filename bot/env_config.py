@@ -164,7 +164,7 @@ def load_config_from_env(repo_root: Path) -> object:
     F("BAN_DELAY_MIN_SEC", "BOT_BAN_DELAY_MIN_SEC", 1.0)
     F("BAN_DELAY_MAX_SEC", "BOT_BAN_DELAY_MAX_SEC", 2.0)
     # In-room ban mechanic: typical number of distinct /ban reports required (Transformice quorum).
-    # Used for warnings only — see docs/BAN_QUORUM_TRANSFORMICE.md
+    # Used for warnings only — see GitHub issue #7 (ban quorum)
     _bqr = (os.environ.get("BOT_BAN_QUORUM_REPORTS") or "").strip()
     try:
         ns.BAN_QUORUM_REPORTS = int(_bqr, 10) if _bqr else 11
